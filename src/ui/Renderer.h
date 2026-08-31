@@ -15,6 +15,14 @@ namespace audiomon::ui {
 
 class Renderer {
 public:
+    Renderer() = default;
+    // Belt and braces: the normal shutdown path calls destroy() explicitly,
+    // but an early return must not leak a D3D device and an ImGui context.
+    ~Renderer() { destroy(); }
+
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+
     bool ensureCreated(void* hwnd);   // idempotent
     void destroy();
     bool alive() const { return device_ != nullptr; }

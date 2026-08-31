@@ -17,6 +17,14 @@ enum TrayCommand : UINT {
 
 class TrayIcon {
 public:
+    TrayIcon() = default;
+    // Without this an abnormal exit leaves a dead icon in the notification
+    // area until the user hovers over it.
+    ~TrayIcon() { remove(); }
+
+    TrayIcon(const TrayIcon&) = delete;
+    TrayIcon& operator=(const TrayIcon&) = delete;
+
     bool add(HWND owner, HICON icon, const wchar_t* tooltip);
     void remove();
     void setTooltip(const wchar_t* tooltip);
