@@ -144,6 +144,11 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             ch.rate.reset();
             ch.resampler.reset();
             ch.priming = true;
+            // Everything buffered predates the break. Playing it out would be
+            // a burst of stale audio, and after a device restart it might not
+            // even be at the right sample rate. We are the consumer, so this
+            // is ours to drop.
+            ch.stream.ring().dropAllFromConsumer();
         }
 
         const bool live = ch.stream.state() == StreamState::Running && ch.stream.flowing();

@@ -50,6 +50,10 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
     stopLocked();
     devices_ = &devices;
+    // A restart is a timeline break: whatever is still sitting in the ring
+    // predates this device and may even be at a different sample rate. Bumping
+    // the epoch makes the mixer drop it and re-prime.
+    epoch_.fetch_add(1, std::memory_order_release);
     quit_.store(false, std::memory_order_relaxed);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual reset: a stop stays stopped
     state_.store(StreamState::Opening, std::memory_order_release);
