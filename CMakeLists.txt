@@ -53,6 +53,7 @@ add_library(audiomon_core STATIC
   src/audio/RenderStream.cpp
   src/audio/AudioEngine.cpp
   src/audio/WaveFormat.cpp
+  src/audio/Guids.cpp
   src/config/Config.cpp
   src/config/Json.cpp
   src/util/Log.cpp
