@@ -177,7 +177,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         return 0;
     }
 
-    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // MTA, deliberately, and it matters.
+    //
+    // AudioEngine::start runs on this thread and creates the
+    // IMMDeviceEnumerator here, but that enumerator is then used from the
+    // three capture threads, the render thread and the supervisor thread --
+    // all of which are MTA. An object created in an STA and called directly
+    // from another apartment is an illegal cross-apartment call: it needs
+    // marshalling through a proxy, and without one it may appear to work and
+    // then fail unpredictably. Putting every thread in the MTA makes sharing
+    // the raw pointer correct rather than lucky.
+    //
+    // Nothing in this UI needs an STA: Shell_NotifyIcon and TrackPopupMenu are
+    // plain Win32, SHGetKnownFolderPath is apartment-agnostic, and neither
+    // ImGui nor D3D11 touches COM.
+    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(coHr)) return 1;
 
     log::init(Config::appDataDir());
