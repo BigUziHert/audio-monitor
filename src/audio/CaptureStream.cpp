@@ -1,4 +1,5 @@
 #include "audio/CaptureStream.h"
+#include "audio/RealtimeThread.h"
 #include "util/Log.h"
 
 #include <audiosessiontypes.h>
@@ -240,13 +241,18 @@ void CaptureStream::threadMain(DeviceRef ref) {
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool needsUninit = SUCCEEDED(coHr);
 
+    // These threads convert samples, so they need denormal flushing too --
+    // MXCSR is per-thread and is not inherited from whoever spawned us.
+    enableDenormalFlush();
+
     // Capture is not as latency-critical as render, but it must not be starved
     // by a game either. "Audio" rather than "Pro Audio" leaves the tighter
     // class for the render thread.
-    DWORD  taskIndex = 0;
-    HANDLE mmcss     = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
-    if (!mmcss) LOG_WARN("%s: MMCSS registration failed (%lu); running at normal priority",
-                         label_.c_str(), GetLastError());
+    MmcssRegistration mmcss;
+    if (!mmcss.acquire(L"Audio")) {
+        LOG_WARN("%s: MMCSS unavailable (%lu); fell back to a plain priority bump",
+                 label_.c_str(), mmcss.lastError());
+    }
 
     if (!openDevice(ref)) {
         LOG_ERR("%s: open failed: %s", label_.c_str(), lastError().c_str());
@@ -281,7 +287,6 @@ void CaptureStream::threadMain(DeviceRef ref) {
     closeDevice();
     flowing_.store(false, std::memory_order_release);
 
-    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     if (needsUninit) CoUninitialize();
 }
 

@@ -1,4 +1,5 @@
 #include "audio/RenderStream.h"
+#include "audio/RealtimeThread.h"
 #include "util/Log.h"
 
 #include <audiosessiontypes.h>
@@ -18,22 +19,6 @@ namespace {
 REFERENCE_TIME framesToRefTime(UINT32 frames, uint32_t rate) {
     if (rate == 0) return 0;
     return static_cast<REFERENCE_TIME>((10000000ULL * frames + rate / 2) / rate);
-}
-
-// Denormals cost hundreds of cycles each and a mix path fed by decaying
-// silence produces them in quantity. Flush them to zero on this thread.
-void enableFlushToZero() {
-#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
-    unsigned int csr;
-  #if defined(_MSC_VER)
-    csr = _mm_getcsr();
-    _mm_setcsr(csr | 0x8040);          // FTZ | DAZ
-  #else
-    __asm__ __volatile__("stmxcsr %0" : "=m"(csr));
-    csr |= 0x8040;
-    __asm__ __volatile__("ldmxcsr %0" : : "m"(csr));
-  #endif
-#endif
 }
 
 } // namespace
@@ -336,16 +321,16 @@ void RenderStream::threadMain(DeviceRef ref) {
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool needsUninit = SUCCEEDED(coHr);
 
-    enableFlushToZero();
+    enableDenormalFlush();
 
-    // MMCSS characteristics are per-thread and must be registered from inside
-    // the thread being boosted. "Pro Audio" is the tightest class, which is
-    // what keeps a fullscreen game from starving this thread.
-    DWORD  taskIndex = 0;
-    HANDLE mmcss     = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-    if (mmcss) AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_CRITICAL);
-    else       LOG_WARN("render: MMCSS 'Pro Audio' registration failed (%lu); "
-                        "running at normal priority", GetLastError());
+    // Per-thread, and must be registered from inside the thread being boosted.
+    // "Pro Audio" is the tightest class, which is what keeps a fullscreen game
+    // from starving this thread.
+    MmcssRegistration mmcss;
+    if (!mmcss.acquire(L"Pro Audio", AVRT_PRIORITY_CRITICAL)) {
+        LOG_WARN("render: MMCSS 'Pro Audio' unavailable (%lu); fell back to "
+                 "THREAD_PRIORITY_TIME_CRITICAL", mmcss.lastError());
+    }
 
     if (!openDevice(ref)) {
         LOG_ERR("render: open failed: %s", lastError().c_str());
@@ -393,7 +378,6 @@ void RenderStream::threadMain(DeviceRef ref) {
         state_.store(StreamState::Stopped, std::memory_order_release);
     }
 
-    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
     if (needsUninit) CoUninitialize();
 }
 

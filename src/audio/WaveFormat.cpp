@@ -143,7 +143,7 @@ void FormatConverter::configure(const StreamFormat& fmt) noexcept {
     struct Slot { uint32_t bit; float l, r; };
     static constexpr float kM3dB = 0.7071068f;
     static constexpr float kSurr = 0.7071068f;
-    static const Slot kSlots[] = {
+    static constexpr Slot kSlots[] = {
         { SPEAKER_FRONT_LEFT,            1.0f,  0.0f  },
         { SPEAKER_FRONT_RIGHT,           0.0f,  1.0f  },
         { SPEAKER_FRONT_CENTER,          kM3dB, kM3dB },
