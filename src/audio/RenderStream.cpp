@@ -268,9 +268,14 @@ void RenderStream::closeDevice() {
 }
 
 void RenderStream::renderLoop() {
-    const uint16_t nch    = format_.channels;
-    const bool     excl   = exclusive_.load(std::memory_order_relaxed);
-    HANDLE         waits[2] = { stopEvent_, bufferEvent_ };
+    const bool excl     = exclusive_.load(std::memory_order_relaxed);
+    HANDLE     waits[2] = { stopEvent_, bufferEvent_ };
+
+    // A GetBuffer failure that is not DEVICE_INVALIDATED would otherwise spin
+    // here forever, once per event, counting underruns and never recovering.
+    // Give up after a run of them and let the supervisor rebuild the device.
+    int consecutiveFailures = 0;
+    constexpr int kMaxConsecutiveFailures = 100;
 
     while (!quit_.load(std::memory_order_relaxed)) {
         // Finite timeout: if the Elgato is unplugged the event simply stops
@@ -307,8 +312,14 @@ void RenderStream::renderLoop() {
         }
         if (FAILED(hr) || !out) {
             underruns_.fetch_add(1, std::memory_order_relaxed);
+            if (++consecutiveFailures >= kMaxConsecutiveFailures) {
+                setError("GetBuffer failed repeatedly", hr);
+                wantsRetry_.store(true, std::memory_order_release);
+                break;
+            }
             continue;
         }
+        consecutiveFailures = 0;
 
         mixer_->renderMix(mixBuffer_.data(), toWrite);
         converter_.fromStereoFloat(mixBuffer_.data(), out, toWrite);
@@ -319,7 +330,6 @@ void RenderStream::renderLoop() {
             wantsRetry_.store(true, std::memory_order_release);
             break;
         }
-        (void)nch;
     }
 }
 
