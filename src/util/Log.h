@@ -1,0 +1,24 @@
+#pragma once
+//
+// Diagnostic logging. NEVER call any of this from an audio thread -- it takes
+// a lock and touches a file. Audio threads report status by storing into
+// atomics that the UI or a worker thread picks up later.
+//
+#include <string>
+
+namespace audiomon::log {
+
+void init(const std::wstring& appDataDir);
+void shutdown();
+
+void write(const char* level, const char* fmt, ...);
+
+#define LOG_INFO(...)  ::audiomon::log::write("INFO",  __VA_ARGS__)
+#define LOG_WARN(...)  ::audiomon::log::write("WARN",  __VA_ARGS__)
+#define LOG_ERR(...)   ::audiomon::log::write("ERROR", __VA_ARGS__)
+
+// Formats an HRESULT as both the numeric code and, where we recognise it, the
+// WASAPI-specific name -- AUDCLNT_E_* codes are otherwise unreadable.
+std::string hrString(long hr);
+
+} // namespace audiomon::log
