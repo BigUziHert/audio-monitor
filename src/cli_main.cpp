@@ -15,7 +15,6 @@
 
 #include <windows.h>
 #include <cstdio>
-#include <clocale>
 #include <csignal>
 #include <thread>
 
@@ -24,6 +23,33 @@ using namespace audiomon;
 namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
+bool g_ansi = false;   // set once we know the console understands escapes
+
+// Windows consoles do not interpret ANSI escapes unless the mode is set
+// explicitly. Windows Terminal enables it, classic conhost often does not, so
+// probe rather than assume -- otherwise the "clear screen" redraw prints
+// literal escape sequences all over the output.
+void setupConsole() {
+    SetConsoleOutputCP(CP_UTF8);
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out == INVALID_HANDLE_VALUE) return;
+    DWORD mode = 0;
+    if (!GetConsoleMode(out, &mode)) return;
+    if (SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) g_ansi = true;
+}
+
+void clearScreen() {
+    if (g_ansi) { std::printf("\033[H\033[J"); return; }
+    // Fallback: scroll the previous frame away. Ugly but readable, and far
+    // better than a screen of escape sequences.
+    std::printf("\n\n");
+}
+
+// Console output is UTF-8 (set above), so wide strings are converted rather
+// than passed to %ls, whose behaviour depends on the C locale and mangles
+// anything outside ASCII -- device names routinely contain parentheses,
+// dashes and the occasional non-ASCII character.
+std::string u8(const std::wstring& w) { return audiomon::toUtf8(w); }
 
 BOOL WINAPI consoleHandler(DWORD) { g_stop = 1; return TRUE; }
 
@@ -43,13 +69,13 @@ void listDevices() {
 
     std::printf("\n--- Render endpoints (loopback sources and the output) ---\n");
     for (const auto& d : dm.list(eRender)) {
-        std::printf("  %-52ls %s\n    id: %ls\n", d.name.c_str(),
-                    d.isDefault ? "[system default]" : "", d.id.c_str());
+        std::printf("  %-52s %s\n    id: %s\n", u8(d.name).c_str(),
+                    d.isDefault ? "[system default]" : "", u8(d.id).c_str());
     }
     std::printf("\n--- Capture endpoints (microphones) ---\n");
     for (const auto& d : dm.list(eCapture)) {
-        std::printf("  %-52ls %s\n    id: %ls\n", d.name.c_str(),
-                    d.isDefault ? "[system default]" : "", d.id.c_str());
+        std::printf("  %-52s %s\n    id: %s\n", u8(d.name).c_str(),
+                    d.isDefault ? "[system default]" : "", u8(d.id).c_str());
     }
     std::printf("\n");
     dm.stop();
@@ -66,7 +92,7 @@ void printMeterBar(float db) {
 } // namespace
 
 int main(int argc, char** argv) {
-    std::setlocale(LC_ALL, "");
+    setupConsole();
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -83,11 +109,11 @@ int main(int argc, char** argv) {
 
     bool usedDefaults = false;
     Config cfg = Config::load(&usedDefaults);
-    std::printf("config: %ls%s\n", Config::configPath().c_str(),
+    std::printf("config: %s%s\n", u8(Config::configPath()).c_str(),
                 usedDefaults ? "  (not found -- using autodetected defaults)" : "");
-    std::printf("matching  game~\"%ls\"  chat~\"%ls\"  mic~\"%ls\"  out~\"%ls\"\n\n",
-                cfg.game.deviceNameMatch.c_str(), cfg.chat.deviceNameMatch.c_str(),
-                cfg.mic.deviceNameMatch.c_str(),  cfg.output.deviceNameMatch.c_str());
+    std::printf("matching  game~\"%s\"  chat~\"%s\"  mic~\"%s\"  out~\"%s\"\n\n",
+                u8(cfg.game.deviceNameMatch).c_str(), u8(cfg.chat.deviceNameMatch).c_str(),
+                u8(cfg.mic.deviceNameMatch).c_str(),  u8(cfg.output.deviceNameMatch).c_str());
 
     AudioEngine engine;
     if (!engine.start(cfg)) { std::printf("engine failed to start\n"); return 1; }
@@ -107,13 +133,14 @@ int main(int argc, char** argv) {
 
         const OutputStatus os = engine.outputStatus();
 
-        std::printf("\033[H\033[J");   // home + clear
+        clearScreen();
         std::printf("audio-monitor  --  Ctrl+C to stop\n\n");
         std::printf("OUTPUT  %-8s %s  %u Hz  %u frames  underruns=%llu\n",
                     stateName(os.state), os.exclusive ? "exclusive" : "shared   ",
                     os.sampleRate, os.blockFrames,
                     static_cast<unsigned long long>(os.underruns));
-        std::printf("        %ls\n", os.deviceName.empty() ? L"(unresolved)" : os.deviceName.c_str());
+        std::printf("        %s\n",
+                    os.deviceName.empty() ? "(unresolved)" : u8(os.deviceName).c_str());
         if (!os.error.empty() && os.state != StreamState::Running) {
             std::printf("        last error: %s\n", os.error.c_str());
         }
@@ -129,9 +156,9 @@ int main(int argc, char** argv) {
             printMeterBar(ball[i].levelDb());
             std::printf(" %6.1f dB  depth=%5u  ratio=%.6f  %uHz\n",
                         ball[i].levelDb(), cs.depth, cs.ratio, cs.sampleRate);
-            std::printf("     %ls\n", cs.deviceName.empty()
-                        ? (cs.error.empty() ? L"(unresolved)" : L"(see error below)")
-                        : cs.deviceName.c_str());
+            std::printf("     %s\n", cs.deviceName.empty()
+                        ? (cs.error.empty() ? "(unresolved)" : "(see error below)")
+                        : u8(cs.deviceName).c_str());
             if (!cs.error.empty() && cs.state != StreamState::Running) {
                 std::printf("     %s\n", cs.error.c_str());
             }
