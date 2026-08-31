@@ -335,6 +335,7 @@ bool MixerWindow::drawSettings() {
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderInt("Buffer (ms)", &buffer, 20, 250)) {
         config_->bufferMillis = static_cast<uint32_t>(buffer);
+        engine_->setBufferMillis(config_->bufferMillis);
         changed = true;
     }
     ImGui::SameLine();

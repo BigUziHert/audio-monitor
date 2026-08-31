@@ -67,6 +67,12 @@ public:
     void setMuted(int channel, bool muted) noexcept;
     void setOutputGain(float linearGain) noexcept;
 
+    // Applies at the next device open, which is when the rate controllers are
+    // reconfigured. Changing it live would step every controller's setpoint.
+    void setBufferMillis(uint32_t ms) noexcept {
+        bufferMillis_.store(ms < 20 ? 20 : (ms > 250 ? 250 : ms), std::memory_order_relaxed);
+    }
+
     // UI polling. Reads atomics only; never blocks the audio path.
     StereoPeak&   channelPeak(int channel) noexcept { return channels_[channel]->peak; }
     StereoPeak&   outputPeak() noexcept { return outputPeak_; }
@@ -135,6 +141,12 @@ private:
 
     std::atomic<uint32_t> renderRate_{0};
     std::atomic<uint32_t> renderBlock_{0};
+
+    // Held as an atomic rather than read from config_ under configMutex_:
+    // onRenderFormat runs on the render thread, and taking a lock there is
+    // both a real-time hazard and -- because a UI-thread device change joins
+    // that same thread -- a deadlock waiting to happen.
+    std::atomic<uint32_t> bufferMillis_{50};
 };
 
 } // namespace audiomon

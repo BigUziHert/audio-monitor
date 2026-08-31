@@ -54,6 +54,7 @@ bool AudioEngine::start(const Config& config) {
     channels_[kChat]->muted.store(config.chat.muted, std::memory_order_relaxed);
     channels_[kMic]->muted.store(config.mic.muted,  std::memory_order_relaxed);
     outputGain_.store(config.output.gain, std::memory_order_relaxed);
+    bufferMillis_.store(config.bufferMillis, std::memory_order_relaxed);
 
     channels_[kGame]->stream.start(devices_, { config.game.deviceId, config.game.deviceNameMatch });
     channels_[kChat]->stream.start(devices_, { config.chat.deviceId, config.chat.deviceNameMatch });
@@ -105,8 +106,8 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
     renderRate_.store(sampleRate, std::memory_order_release);
     renderBlock_.store(blockFrames, std::memory_order_release);
 
-    std::lock_guard<std::mutex> lock(configMutex_);
-    const double targetFrames = double(sampleRate) * double(config_.bufferMillis) / 1000.0;
+    const double targetFrames =
+        double(sampleRate) * double(bufferMillis_.load(std::memory_order_relaxed)) / 1000.0;
 
     for (auto& up : channels_) {
         Channel& ch = *up;
@@ -345,8 +346,12 @@ void AudioEngine::setChannelDevice(int channel, const DeviceRef& ref) {
     if (channel >= 0 && channel < kChannelCount) {
         channels_[channel]->stream.start(devices_, ref);
     } else {
-        std::lock_guard<std::mutex> lock(configMutex_);
-        render_.start(devices_, ref, this, config_.exclusiveOutput);
+        // Read the flag out from under the lock first. start() joins the
+        // render thread, and holding configMutex_ across that join would
+        // deadlock against onRenderFormat if it were to take the same lock.
+        bool exclusive;
+        { std::lock_guard<std::mutex> lock(configMutex_); exclusive = config_.exclusiveOutput; }
+        render_.start(devices_, ref, this, exclusive);
     }
 }
 
