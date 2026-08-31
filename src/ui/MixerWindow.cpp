@@ -312,6 +312,12 @@ bool MixerWindow::drawSettings() {
         if (startup::setEnabled(autostart)) { config_->startWithWindows = autostart; changed = true; }
     }
 
+    bool startMin = config_->startMinimized;
+    if (ImGui::Checkbox("Start hidden when launched manually", &startMin)) {
+        config_->startMinimized = startMin;
+        changed = true;
+    }
+
     bool excl = config_->exclusiveOutput;
     if (ImGui::Checkbox("Open the capture card in exclusive mode", &excl)) {
         config_->exclusiveOutput = excl;

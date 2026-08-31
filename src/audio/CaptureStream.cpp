@@ -47,7 +47,8 @@ void CaptureStream::setError(const char* what, HRESULT hr) {
 }
 
 void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
-    stop();
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    stopLocked();
     devices_ = &devices;
     quit_.store(false, std::memory_order_relaxed);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual reset: a stop stays stopped
@@ -56,6 +57,11 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
 }
 
 void CaptureStream::stop() {
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    stopLocked();
+}
+
+void CaptureStream::stopLocked() {
     quit_.store(true, std::memory_order_relaxed);
     if (stopEvent_) SetEvent(stopEvent_);
     if (thread_.joinable()) thread_.join();

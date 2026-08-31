@@ -135,7 +135,7 @@ whenever you change something in the UI.
   "output": { "deviceId": "",                       "deviceName": "Elgato", "gain": 1, "muted": false },
   "exclusiveOutput": true,
   "startWithWindows": false,
-  "startMinimized": true,
+  "startMinimized": false,
   "bufferMillis": 50
 }
 ```

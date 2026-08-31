@@ -70,6 +70,7 @@ public:
     std::string         lastError() const;
 
 private:
+    void stopLocked();          // caller holds lifecycleMutex_
     void threadMain(DeviceRef ref);
     bool openDevice(const DeviceRef& ref);
     void closeDevice();
@@ -82,6 +83,12 @@ private:
 
     StereoRing   ring_;
     DeviceManager* devices_ = nullptr;
+
+    // start() and stop() can both be reached from the UI thread (a device
+    // change in Settings) and from the supervisor thread (an automatic
+    // restart). Without this they would race on thread_ -- assigning over a
+    // joinable std::thread calls std::terminate.
+    std::mutex   lifecycleMutex_;
 
     std::thread  thread_;
     HANDLE       stopEvent_  = nullptr;

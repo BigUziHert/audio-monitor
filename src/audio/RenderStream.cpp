@@ -44,7 +44,8 @@ void RenderStream::setError(const char* what, HRESULT hr) {
 
 void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
                          IMixSource* mixer, bool preferExclusive) {
-    stop();
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    stopLocked();
     devices_         = &devices;
     mixer_           = mixer;
     preferExclusive_ = preferExclusive;
@@ -56,6 +57,11 @@ void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
 }
 
 void RenderStream::stop() {
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    stopLocked();
+}
+
+void RenderStream::stopLocked() {
     quit_.store(true, std::memory_order_relaxed);
     if (stopEvent_) SetEvent(stopEvent_);
     if (thread_.joinable()) thread_.join();

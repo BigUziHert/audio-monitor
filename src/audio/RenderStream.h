@@ -63,6 +63,7 @@ public:
     bool wantsRetry() const noexcept { return wantsRetry_.load(std::memory_order_acquire); }
 
 private:
+    void stopLocked();          // caller holds lifecycleMutex_
     void threadMain(DeviceRef ref);
     bool openDevice(const DeviceRef& ref);
     bool tryExclusive(IMMDevice* device);
@@ -74,6 +75,10 @@ private:
     DeviceManager* devices_ = nullptr;
     IMixSource*    mixer_   = nullptr;
     bool           preferExclusive_ = true;
+
+    // Reachable from both the UI thread and the supervisor thread; see the
+    // note in CaptureStream.
+    std::mutex  lifecycleMutex_;
 
     std::thread thread_;
     HANDLE      stopEvent_   = nullptr;

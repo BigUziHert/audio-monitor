@@ -29,7 +29,11 @@ struct Config {
 
     bool     exclusiveOutput  = true;
     bool     startWithWindows = false;
-    bool     startMinimized   = true;
+    // Only affects a MANUAL launch. The autostart entry passes --tray, so a
+    // boot launch goes to the notification area regardless -- defaulting this
+    // to true as well would make a first double-click look like it did
+    // nothing at all.
+    bool     startMinimized   = false;
     uint32_t bufferMillis     = 50;   // per-channel drift setpoint
 
     static Config defaults();
