@@ -1,0 +1,274 @@
+//
+// Tray-resident mixer application.
+//
+// Window behaviour, which is most of what makes this pleasant to live with:
+//
+//  * Minimise and close both HIDE the window rather than minimising or
+//    exiting. A hidden window is gone from the taskbar and from Alt-Tab
+//    entirely, which is what "in the tray, not alongside normal windows"
+//    means. Exit is only ever reached through the tray menu.
+//  * While hidden the process does no rendering at all -- no D3D device, no
+//    swapchain, no timer -- and blocks in GetMessage. That matters because
+//    this thing sits in the tray for hours while a game has the GPU.
+//  * While visible it runs a normal vsync-paced loop so the meters move.
+//
+#include "audio/AudioEngine.h"
+#include "config/Config.h"
+#include "ui/MixerWindow.h"
+#include "ui/Renderer.h"
+#include "ui/TrayIcon.h"
+#include "util/Log.h"
+#include "util/Startup.h"
+
+#include <windows.h>
+#include <imgui.h>
+#include <imgui_impl_win32.h>
+
+#include <chrono>
+#include <string>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
+using namespace audiomon;
+
+namespace {
+
+constexpr wchar_t kWindowClass[] = L"AudioMonitorWindow";
+constexpr wchar_t kWindowTitle[] = L"Audio Monitor";
+constexpr wchar_t kMutexName[]   = L"Local\\AudioMonitorSingleInstance";
+constexpr int     kWindowWidth   = 560;
+constexpr int     kWindowHeight  = 560;
+
+// Sent by a second instance to bring the running one to the front.
+UINT g_showMessage = 0;
+
+struct App {
+    AudioEngine      engine;
+    Config           config;
+    ui::MixerWindow  mixer;
+    ui::Renderer     renderer;
+    ui::TrayIcon     tray;
+    HWND             hwnd    = nullptr;
+    bool             visible = false;
+    bool             quitting = false;
+    bool             configDirty = false;
+    std::chrono::steady_clock::time_point lastFrame{};
+    std::chrono::steady_clock::time_point lastSave{};
+};
+
+App* g_app = nullptr;
+
+void showWindow(App& app) {
+    if (!app.renderer.ensureCreated(app.hwnd)) {
+        MessageBoxW(nullptr, L"Could not create a Direct3D 11 device for the mixer window.\n"
+                             L"Audio mixing is unaffected and continues in the background.",
+                    kWindowTitle, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    app.visible = true;
+    ShowWindow(app.hwnd, SW_SHOW);
+    SetForegroundWindow(app.hwnd);
+    app.lastFrame = std::chrono::steady_clock::now();
+}
+
+void hideWindow(App& app) {
+    app.visible = false;
+    ShowWindow(app.hwnd, SW_HIDE);
+    // Give the GPU memory back: the machine is probably running a game.
+    app.renderer.destroy();
+}
+
+void saveConfigIfDirty(App& app, bool force) {
+    if (!app.configDirty) return;
+    const auto now = std::chrono::steady_clock::now();
+    // Coalesce: dragging a fader would otherwise write the file every frame.
+    if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - app.lastSave).count() < 1500) {
+        return;
+    }
+    app.engine.updateConfigFromRuntime(app.config);
+    app.config.save();
+    app.configDirty = false;
+    app.lastSave    = now;
+}
+
+LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    App* app = g_app;
+
+    if (app && app->visible && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
+
+    if (msg == ui::TrayIcon::taskbarCreatedMessage() && app) {
+        // Explorer restarted and took the icon with it.
+        app->tray.add(hwnd, reinterpret_cast<HICON>(
+                          GetClassLongPtrW(hwnd, GCLP_HICONSM)), kWindowTitle);
+        return 0;
+    }
+    if (g_showMessage && msg == g_showMessage && app) { showWindow(*app); return 0; }
+
+    switch (msg) {
+        case ui::kTrayCallbackMessage: {
+            // Under NOTIFYICON_VERSION_4 the event is in the low word of lParam.
+            switch (LOWORD(lp)) {
+                case WM_LBUTTONUP:
+                case NIN_SELECT:
+                case NIN_KEYSELECT:
+                    if (app) { app->visible ? hideWindow(*app) : showWindow(*app); }
+                    return 0;
+                case WM_CONTEXTMENU:
+                case WM_RBUTTONUP: {
+                    if (!app) return 0;
+                    const UINT cmd = app->tray.showMenu(hwnd);
+                    if (cmd == ui::kTrayCmdRestore) showWindow(*app);
+                    else if (cmd == ui::kTrayCmdExit) { app->quitting = true; DestroyWindow(hwnd); }
+                    return 0;
+                }
+                default: return 0;
+            }
+        }
+
+        case WM_SYSCOMMAND:
+            // Minimise means "go to the tray", not "sit in the taskbar".
+            if ((wp & 0xFFF0) == SC_MINIMIZE) {
+                if (app) { saveConfigIfDirty(*app, true); hideWindow(*app); }
+                return 0;
+            }
+            break;
+
+        case WM_CLOSE:
+            // The close button hides. Exit is deliberate, via the tray menu.
+            if (app) { saveConfigIfDirty(*app, true); hideWindow(*app); }
+            return 0;
+
+        case WM_SIZE:
+            if (app && wp != SIZE_MINIMIZED) {
+                app->renderer.onResize(LOWORD(lp), HIWORD(lp));
+            }
+            return 0;
+
+        case WM_GETMINMAXINFO: {
+            auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
+            mmi->ptMinTrackSize.x = 460;
+            mmi->ptMinTrackSize.y = 420;
+            return 0;
+        }
+
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+
+        default: break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+bool commandLineHas(const wchar_t* flag) {
+    const wchar_t* cmd = GetCommandLineW();
+    return cmd && wcsstr(cmd, flag) != nullptr;
+}
+
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+    g_showMessage = RegisterWindowMessageW(L"AudioMonitorShowWindow");
+
+    // Single instance: a second launch just raises the first one's window.
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
+    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        PostMessageW(HWND_BROADCAST, g_showMessage, 0, 0);
+        return 0;
+    }
+
+    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(coHr)) return 1;
+
+    log::init(Config::appDataDir());
+    LOG_INFO("audio-monitor starting");
+
+    App app;
+    g_app = &app;
+    app.config = Config::load();
+    // Keep the checkbox honest if the user removed the Run entry by hand.
+    app.config.startWithWindows = startup::isEnabled();
+
+    HICON icon = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                               0, 0, LR_DEFAULTSIZE | LR_SHARED));
+    if (!icon) icon = LoadIconW(nullptr, IDI_APPLICATION);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = wndProc;
+    wc.hInstance     = hInstance;
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kWindowClass;
+    wc.hIcon         = icon;
+    wc.hIconSm       = icon;
+    RegisterClassExW(&wc);
+
+    app.hwnd = CreateWindowExW(0, kWindowClass, kWindowTitle,
+                               WS_OVERLAPPEDWINDOW,
+                               CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight,
+                               nullptr, nullptr, hInstance, nullptr);
+    if (!app.hwnd) { CoUninitialize(); return 1; }
+
+    app.tray.add(app.hwnd, icon, kWindowTitle);
+    app.mixer.init(&app.engine, &app.config);
+
+    if (!app.engine.start(app.config)) {
+        MessageBoxW(app.hwnd, L"Could not start the audio engine. See audio-monitor.log in "
+                              L"%APPDATA%\\audio-monitor for details.",
+                    kWindowTitle, MB_OK | MB_ICONERROR);
+    }
+
+    const bool startHidden = app.config.startMinimized || commandLineHas(L"--tray");
+    if (!startHidden) showWindow(app);
+
+    app.lastFrame = std::chrono::steady_clock::now();
+    app.lastSave  = app.lastFrame;
+
+    MSG msg{};
+    bool running = true;
+    while (running) {
+        if (app.visible) {
+            // Visible: drain messages without blocking, then draw a frame.
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) { running = false; break; }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (!running) break;
+            if (!app.visible || !app.renderer.alive()) continue;
+
+            const auto now = std::chrono::steady_clock::now();
+            const float dt = std::chrono::duration<float>(now - app.lastFrame).count();
+            app.lastFrame = now;
+
+            RECT rc{};
+            GetClientRect(app.hwnd, &rc);
+
+            app.renderer.beginFrame();
+            if (app.mixer.draw(dt, rc.right - rc.left, rc.bottom - rc.top)) app.configDirty = true;
+            app.renderer.endFrame(true);   // vsync paces the loop
+
+            saveConfigIfDirty(app, false);
+
+            if (app.mixer.exitRequested()) { app.quitting = true; DestroyWindow(app.hwnd); }
+        } else {
+            // Hidden: block. The process should be doing nothing at all here
+            // beyond the audio threads.
+            if (!GetMessageW(&msg, nullptr, 0, 0)) { running = false; break; }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    LOG_INFO("audio-monitor shutting down");
+    saveConfigIfDirty(app, true);
+    app.engine.stop();
+    app.renderer.destroy();
+    app.tray.remove();
+    log::shutdown();
+
+    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
+    CoUninitialize();
+    return 0;
+}

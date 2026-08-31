@@ -77,6 +77,14 @@ public:
     // reinstall is persisted rather than re-matched every launch.
     void updateConfigFromRuntime(Config& config) const;
 
+    // For the settings UI.
+    std::vector<DeviceInfo> listDevices(EDataFlow flow) const { return devices_.list(flow); }
+
+    // Re-points a channel at a different endpoint and restarts just that
+    // stream. channel < 0 means the output. Runs on the calling (UI) thread
+    // only far enough to hand the work to the stream's own worker.
+    void setChannelDevice(int channel, const DeviceRef& ref);
+
     // --- IMixSource, called on the render thread ---
     void renderMix(float* dst, uint32_t frames) noexcept override;
     void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept override;

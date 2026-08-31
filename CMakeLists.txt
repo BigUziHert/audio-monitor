@@ -18,13 +18,13 @@ endif()
 
 # ---------------------------------------------------------------- compiler ---
 add_library(audiomon_flags INTERFACE)
+# Deliberately NOT using the aggressive NOxxx trimming macros here. They save
+# a trivial amount of compile time and break third-party code that legitimately
+# uses the excluded APIs -- ImGui needs the clipboard, for one.
 target_compile_definitions(audiomon_flags INTERFACE
   UNICODE _UNICODE
   WIN32_LEAN_AND_MEAN
   NOMINMAX
-  NOGDICAPMASKS NOMENUS NOICONS NOKEYSTATES NORASTEROPS NOATOM NOCLIPBOARD
-  NOCOLOR NODRAWTEXT NOKERNEL NOMEMMGR NOMETAFILE NOOPENFILE NOSCROLL
-  NOSERVICE NOSOUND NOTEXTMETRIC NOWH NOCOMM NOKANJI NOHELP NOPROFILER NODEFERWINDOWPOS
   _WIN32_WINNT=0x0A00
 )
 
@@ -101,4 +101,12 @@ if(AUDIOMON_BUILD_GUI)
     res/app.rc
   )
   target_link_libraries(audio-monitor PRIVATE audiomon_core imgui)
+
+  # The entry point is wWinMain. MSVC resolves that from /SUBSYSTEM:WINDOWS
+  # with UNICODE defined; mingw needs -municode to select the wide runtime
+  # startup, or it looks for WinMain and fails to link.
+  if(NOT MSVC)
+    target_compile_options(audio-monitor PRIVATE -municode)
+    target_link_options(audio-monitor PRIVATE -municode)
+  endif()
 endif()

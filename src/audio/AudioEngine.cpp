@@ -323,6 +323,28 @@ OutputStatus AudioEngine::outputStatus() const {
     return s;
 }
 
+void AudioEngine::setChannelDevice(int channel, const DeviceRef& ref) {
+    {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        ChannelConfig* target = nullptr;
+        switch (channel) {
+            case kGame: target = &config_.game;   break;
+            case kChat: target = &config_.chat;   break;
+            case kMic:  target = &config_.mic;    break;
+            default:    target = &config_.output; break;
+        }
+        target->deviceId        = ref.id;
+        target->deviceNameMatch = ref.nameMatch;
+    }
+
+    if (channel >= 0 && channel < kChannelCount) {
+        channels_[channel]->stream.start(devices_, ref);
+    } else {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        render_.start(devices_, ref, this, config_.exclusiveOutput);
+    }
+}
+
 void AudioEngine::updateConfigFromRuntime(Config& config) const {
     // Persist any endpoint ID that was re-resolved by name, so the next launch
     // matches by ID again instead of re-scanning.
