@@ -1,0 +1,103 @@
+cmake_minimum_required(VERSION 3.21)
+project(audio-monitor VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(AUDIOMON_BUILD_GUI "Build the Dear ImGui tray application" ON)
+option(AUDIOMON_BUILD_CLI "Build the headless console bring-up tool" ON)
+
+if(NOT WIN32)
+  message(FATAL_ERROR "audio-monitor targets Windows only (WASAPI). Use cmake/mingw-w64-x86_64.cmake to cross-compile for portability checks.")
+endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+# ---------------------------------------------------------------- compiler ---
+add_library(audiomon_flags INTERFACE)
+target_compile_definitions(audiomon_flags INTERFACE
+  UNICODE _UNICODE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+  NOGDICAPMASKS NOMENUS NOICONS NOKEYSTATES NORASTEROPS NOATOM NOCLIPBOARD
+  NOCOLOR NODRAWTEXT NOKERNEL NOMEMMGR NOMETAFILE NOOPENFILE NOSCROLL
+  NOSERVICE NOSOUND NOTEXTMETRIC NOWH NOCOMM NOKANJI NOHELP NOPROFILER NODEFERWINDOWPOS
+  _WIN32_WINNT=0x0A00
+)
+
+if(MSVC)
+  target_compile_options(audiomon_flags INTERFACE
+    /W4 /permissive- /utf-8 /Zc:__cplusplus /EHsc
+    /fp:fast            # audio maths; we never rely on strict IEEE ordering
+    $<$<CONFIG:Release>:/O2 /GL /Gy /Gw>
+  )
+  target_link_options(audiomon_flags INTERFACE $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>)
+else()
+  # mingw-w64 portability path
+  target_compile_options(audiomon_flags INTERFACE
+    -Wall -Wextra -Wno-unknown-pragmas -Wno-cast-function-type
+    -ffast-math
+    $<$<CONFIG:Release>:-O2>
+  )
+endif()
+
+# -------------------------------------------------------------------- core ---
+# Everything that is not UI. Linked by both the GUI app and the CLI tool so the
+# audio path can be brought up and verified without any window existing.
+add_library(audiomon_core STATIC
+  src/audio/DeviceManager.cpp
+  src/audio/CaptureStream.cpp
+  src/audio/RenderStream.cpp
+  src/audio/AudioEngine.cpp
+  src/audio/WaveFormat.cpp
+  src/config/Config.cpp
+  src/config/Json.cpp
+  src/util/Log.cpp
+  src/util/Startup.cpp
+)
+target_include_directories(audiomon_core PUBLIC src)
+target_link_libraries(audiomon_core PUBLIC
+  audiomon_flags
+  ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32
+)
+
+# --------------------------------------------------------------------- cli ---
+if(AUDIOMON_BUILD_CLI)
+  add_executable(audiomon-cli src/cli_main.cpp)
+  target_link_libraries(audiomon-cli PRIVATE audiomon_core)
+endif()
+
+# --------------------------------------------------------------------- gui ---
+if(AUDIOMON_BUILD_GUI)
+  include(FetchContent)
+  FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.92.9
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(imgui)
+
+  add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+  )
+  target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+  target_link_libraries(imgui PUBLIC audiomon_flags d3d11 dxgi d3dcompiler dwmapi)
+
+  add_executable(audio-monitor WIN32
+    src/gui_main.cpp
+    src/ui/MixerWindow.cpp
+    src/ui/TrayIcon.cpp
+    src/ui/Renderer.cpp
+    src/ui/Theme.cpp
+    res/app.rc
+  )
+  target_link_libraries(audio-monitor PRIVATE audiomon_core imgui)
+endif()

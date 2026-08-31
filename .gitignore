@@ -1,0 +1,42 @@
+# Build output
+build/
+build-*/
+out/
+_deps/
+*.dir/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# MSVC / Visual Studio
+.vs/
+*.vcxproj*
+*.sln
+*.user
+*.suo
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.idb
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+
+# Binaries
+*.exe
+*.dll
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# ImGui runtime state (we disable it, but just in case)
+imgui.ini
