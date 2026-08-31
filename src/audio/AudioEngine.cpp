@@ -102,9 +102,19 @@ void AudioEngine::setOutputGain(float g) noexcept {
 // ---------------------------------------------------------------------------
 
 void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept {
-    // Called once before the stream starts, not from inside the callback loop.
+    // Runs on the render thread but BEFORE IAudioClient::Start, so no audio is
+    // flowing yet and the allocation below cannot cause a dropout. This is the
+    // only place the engine is allowed to allocate after construction.
     renderRate_.store(sampleRate, std::memory_order_release);
     renderBlock_.store(blockFrames, std::memory_order_release);
+
+    // kMaxBlockFrames covers every period a sane device reports, but a device
+    // that asks for a bigger block would otherwise silently get a short mix.
+    // Grow to fit rather than truncate.
+    const size_t needed = static_cast<size_t>(blockFrames) * 2;
+    for (auto& up : channels_) {
+        if (up->scratch.size() < needed) up->scratch.assign(needed, 0.0f);
+    }
 
     const double targetFrames =
         double(sampleRate) * double(bufferMillis_.load(std::memory_order_relaxed)) / 1000.0;
@@ -125,7 +135,12 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
 
 void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
     const uint32_t rate = renderRate_.load(std::memory_order_relaxed);
-    if (frames > kMaxBlockFrames) frames = kMaxBlockFrames;   // cannot allocate here
+
+    // Defensive backstop only. onRenderFormat sizes every scratch buffer to
+    // the render block, so this cannot trigger -- but truncating is the right
+    // failure if the invariant is ever broken, since overrunning is not.
+    const uint32_t capacity = static_cast<uint32_t>(channels_[0]->scratch.size() / 2);
+    if (frames > capacity) frames = capacity;
 
     std::fill_n(dst, static_cast<size_t>(frames) * 2, 0.0f);
 
