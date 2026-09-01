@@ -121,7 +121,10 @@ private:
         bool     priming      = true;
         uint32_t lastEpoch    = 0;
         double   baseRatio    = 1.0;     // captureRate / renderRate
+        // Denominated in CAPTURE frames, because that is what ring depth is
+        // measured in. Recomputed whenever the source rate changes.
         double   targetDepth  = 0.0;
+        uint32_t lastSrcRate  = 0;
     };
 
     void supervisorMain();

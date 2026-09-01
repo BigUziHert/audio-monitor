@@ -51,11 +51,17 @@ public:
     // bleed off.
     static constexpr double kIntegralAuthority = 0.002;
 
-    void configure(double sampleRate, double targetDepthFrames, double blockFrames = 480.0) noexcept {
-        fs_     = sampleRate  > 0.0 ? sampleRate  : 48000.0;
-        block_  = blockFrames > 0.0 ? blockFrames : 480.0;
+    // sampleRate must be the rate the MEASURED DEPTH is denominated in -- that
+    // is, the capture device's rate, not the render device's -- because the
+    // plant model below relates depth error to consumption in those units.
+    // updatePeriodSeconds is real elapsed time between update() calls, which is
+    // set by the render device and is unrelated to sampleRate when the two
+    // clocks run at different rates.
+    void configure(double sampleRate, double targetDepthFrames,
+                   double updatePeriodSeconds = 0.01) noexcept {
+        fs_     = sampleRate > 0.0 ? sampleRate : 48000.0;
         target_ = targetDepthFrames;
-        dt_     = block_ / fs_;                       // seconds per update
+        dt_     = updatePeriodSeconds > 0.0 ? updatePeriodSeconds : 0.01;
 
         kp_ = 1.0 / (fs_ * kProportionalSeconds);
         ki_ = 1.0 / (4.0 * fs_ * kProportionalSeconds * kProportionalSeconds);
@@ -122,7 +128,6 @@ private:
     static constexpr double kIntegralErrorLimit  = 2400.0;   // frames (50ms @ 48k)
 
     double fs_       = 48000.0;
-    double block_    = 480.0;
     double dt_       = 0.01;
     double target_   = 0.0;
     double kp_       = 0.0;

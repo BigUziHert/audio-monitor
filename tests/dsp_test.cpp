@@ -64,42 +64,90 @@ static void testRing() {
     }
 }
 
-// Feeds a sine through the resampler at ratio 1.0 and checks it survives.
-static void testResamplerFidelity() {
-    std::printf("resampler fidelity (ratio 1.0)\n");
+// At ratio 1.0 Catmull-Rom evaluates at t=0, which returns the sample itself,
+// so the output must be a bit-for-bit copy of the input delayed by the kernel's
+// one-frame priming latency.
+//
+// The previous version of this test compared the left channel against the right
+// and asserted they matched -- but both are fed identical samples, so it passed
+// for ANY resampler, including one returning zeros. It tested nothing. This one
+// compares against the analytic signal.
+static void testResamplerUnityIsExact() {
+    std::printf("resampler is exact at ratio 1.0\n");
     StereoRing r;
     r.init(8192);
     DriftResampler rs;
     rs.reset();
 
     const double freq = 440.0, fs = 48000.0;
-    double       phase = 0.0;
+    auto sample = [&](long n) { return float(std::sin(2.0 * M_PI * freq * double(n) / fs)); };
+
+    long inWritten = 0;      // next input frame index to generate
+    long outCount  = 0;      // total output frames produced
+    double maxErr = 0.0;
     std::vector<float> out(512 * 2);
 
-    double maxErr = 0.0;
-    long   n      = 0;
     for (int block = 0; block < 40; ++block) {
         const uint32_t space = r.beginWrite();
         uint32_t w = 0;
-        for (; w < space && w < 600; ++w) {
-            const float s = float(std::sin(2.0 * M_PI * freq * phase / fs));
-            r.writeFrame(w, s, s);
-            phase += 1.0;
-        }
+        for (; w < space && w < 600; ++w) r.writeFrame(w, sample(inWritten + w), sample(inWritten + w));
         r.endWrite(w);
+        inWritten += w;
 
         const uint32_t made = rs.produce(r, out.data(), 512, 1.0);
-        if (block < 2) continue;                     // let the kernel prime
         for (uint32_t i = 0; i < made; ++i) {
-            // At ratio 1.0 Catmull-Rom is an identity on the sample grid, so
-            // the only error is the fixed 1-sample kernel latency.
-            ++n;
-            const double err = std::fabs(double(out[i * 2]) - double(out[i * 2 + 1]));
-            if (err > maxErr) maxErr = err;
+            // Priming consumes 4 frames and leaves the read position on
+            // frame 1, so output k corresponds to input k+1.
+            const double expected = sample(outCount + 1);
+            maxErr = std::max(maxErr, std::fabs(double(out[i * 2]) - expected));
+            maxErr = std::max(maxErr, std::fabs(double(out[i * 2 + 1]) - expected));
+            ++outCount;
         }
     }
-    CHECK(n > 10000, "only produced %ld frames", n);
-    CHECK(maxErr < 1e-6, "L/R diverged, max err %g", maxErr);
+    std::printf("   %ld frames, max deviation from the analytic signal = %.3g\n", outCount, maxErr);
+    CHECK(outCount > 10000, "only produced %ld frames", outCount);
+    CHECK(maxErr < 1e-6, "not an identity at ratio 1.0: max error %g", maxErr);
+}
+
+// Exercises the interpolation kernel itself. A broken Catmull-Rom coefficient
+// shows up here but not in the unity test, where t is always 0.
+static void testResamplerInterpolates() {
+    std::printf("resampler interpolation accuracy (ratio 0.5)\n");
+    StereoRing r;
+    r.init(16384);
+    DriftResampler rs;
+    rs.reset();
+
+    const double freq = 440.0, fs = 48000.0, ratio = 0.5;
+    auto sample = [&](double n) { return std::sin(2.0 * M_PI * freq * n / fs); };
+
+    long inWritten = 0, outCount = 0;
+    double maxErr = 0.0;
+    std::vector<float> out(512 * 2);
+
+    for (int block = 0; block < 40; ++block) {
+        const uint32_t space = r.beginWrite();
+        uint32_t w = 0;
+        for (; w < space && w < 400; ++w) {
+            const float v = float(sample(double(inWritten + w)));
+            r.writeFrame(w, v, v);
+        }
+        r.endWrite(w);
+        inWritten += w;
+
+        const uint32_t made = rs.produce(r, out.data(), 512, ratio);
+        for (uint32_t i = 0; i < made; ++i) {
+            // Output k sits at input position 1 + k*ratio.
+            const double expected = sample(1.0 + double(outCount) * ratio);
+            maxErr = std::max(maxErr, std::fabs(double(out[i * 2]) - expected));
+            ++outCount;
+        }
+    }
+    std::printf("   %ld frames, max interpolation error = %.3g\n", outCount, maxErr);
+    CHECK(outCount > 5000, "only produced %ld frames", outCount);
+    // 440 Hz at 48 kHz is heavily oversampled, so a correct 4-point kernel is
+    // far better than this; a wrong coefficient blows straight past it.
+    CHECK(maxErr < 1e-4, "interpolation kernel is inaccurate: max error %g", maxErr);
 }
 
 // The important one: a producer clocked fast relative to the consumer must NOT
@@ -117,7 +165,7 @@ static void testDriftConvergence(double ppm, const char* label) {
     DriftResampler rs;
     rs.reset();
     RateController ctl;
-    ctl.configure(fs, target);
+    ctl.configure(fs, target, double(blockOut) / fs);
 
     // Prime the ring to the setpoint so we start at the operating point.
     r.beginWrite();
@@ -183,7 +231,7 @@ static void testDriftConvergence(double ppm, const char* label) {
 static void testControllerIsGentle() {
     std::printf("controller ramps rather than jumps\n");
     RateController ctl;
-    ctl.configure(48000.0, 2400.0);
+    ctl.configure(48000.0, 2400.0, 480.0 / 48000.0);
 
     // Slam the measured depth to a full ring and confirm the ratio creeps.
     double prev = ctl.ratio();
@@ -216,7 +264,7 @@ static void testDisturbanceRecovery() {
     DriftResampler rs;
     rs.reset();
     RateController ctl;
-    ctl.configure(fs, target, blockOut);
+    ctl.configure(fs, target, double(blockOut) / fs);
 
     r.beginWrite();
     for (uint32_t i = 0; i < uint32_t(target); ++i) r.writeFrame(i, 0.0f, 0.0f);
@@ -337,7 +385,8 @@ static void testJson() {
 int main() {
     std::printf("== audio-monitor DSP/config tests ==\n\n");
     testRing();
-    testResamplerFidelity();
+    testResamplerUnityIsExact();
+    testResamplerInterpolates();
     testDriftConvergence(+100.0, "producer fast");
     testDriftConvergence(-100.0, "producer slow");
     testDriftConvergence(+400.0, "extreme");

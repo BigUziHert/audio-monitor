@@ -16,6 +16,9 @@ constexpr uint32_t kMaxBlockFrames = 8192;
 constexpr int kRebuildDebounceMs = 750;
 constexpr int kSupervisorPollMs  = 2000;
 
+// Fade length for gain changes and for the edges of a silent gap.
+constexpr double kFadeSeconds = 0.005;
+
 float smoothingCoef(double seconds, uint32_t rate) {
     if (rate == 0) return 1.0f;
     return static_cast<float>(1.0 - std::exp(-1.0 / (seconds * double(rate))));
@@ -116,13 +119,15 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
         if (up->scratch.size() < needed) up->scratch.assign(needed, 0.0f);
     }
 
-    const double targetFrames =
-        double(sampleRate) * double(bufferMillis_.load(std::memory_order_relaxed)) / 1000.0;
-
+    // The setpoint is NOT computed here. Ring depth is measured in capture
+    // frames, and the capture device's rate is not known until it opens (and
+    // can differ per channel), so renderMix derives it once each source rate
+    // is known. Setting it from the render rate here would hold a 96 kHz
+    // source at half the intended depth.
     for (auto& up : channels_) {
         Channel& ch = *up;
-        ch.targetDepth = targetFrames;
-        ch.rate.configure(double(sampleRate), targetFrames, double(blockFrames));
+        ch.lastSrcRate = 0;              // force a recompute on the next block
+        ch.targetDepth = 0.0;
         ch.resampler.reset();
         ch.priming      = true;
         ch.presence     = 0.0f;
@@ -144,10 +149,9 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
 
     std::fill_n(dst, static_cast<size_t>(frames) * 2, 0.0f);
 
-    // ~5ms fades. Slow enough to be inaudible, fast enough that unmuting feels
+    // ~5ms. Slow enough to be inaudible, fast enough that unmuting feels
     // instant.
-    const float gainCoef     = smoothingCoef(0.005, rate);
-    const float presenceCoef = smoothingCoef(0.005, rate);
+    const float gainCoef = smoothingCoef(kFadeSeconds, rate);
 
     for (auto& up : channels_) {
         Channel& ch = *up;
@@ -176,6 +180,19 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
 
             const uint32_t srcRate = ch.stream.sampleRate();
             ch.baseRatio = (srcRate && rate) ? double(srcRate) / double(rate) : 1.0;
+
+            if (srcRate && srcRate != ch.lastSrcRate) {
+                // Setpoint and controller are denominated in capture frames,
+                // matching the ring. dt is real elapsed time, which the RENDER
+                // device sets -- the two rates are independent.
+                ch.lastSrcRate = srcRate;
+                ch.targetDepth = double(srcRate) *
+                                 double(bufferMillis_.load(std::memory_order_relaxed)) / 1000.0;
+                const double dt = rate ? double(frames) / double(rate) : 0.01;
+                ch.rate.configure(double(srcRate), ch.targetDepth, dt);
+                ch.priming = true;
+            }
+            if (ch.targetDepth <= 0.0) { ch.priming = true; }
 
             // Priming: wait for the ring to reach the setpoint before drawing
             // from it, so we do not immediately starve. This is also the path
@@ -208,12 +225,29 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                         static_cast<size_t>(frames - made) * 2, 0.0f);
         }
 
-        // Fade the channel in and out rather than switching. This is what
-        // stops a click at the edges of a silent gap.
-        const float presenceTarget = (made == frames) ? 1.0f : 0.0f;
-        const float gainTarget     = ch.muted.load(std::memory_order_relaxed)
-                                         ? 0.0f
-                                         : ch.gain.load(std::memory_order_relaxed);
+        // Fade the channel in and out rather than switching, so a silent gap
+        // does not click at either edge.
+        //
+        // The fade-OUT has to land exactly where the audio stops. produce()
+        // reports that it filled `made` frames, so the ramp is scheduled to
+        // reach zero at that index. Simply setting a target of 0 for the whole
+        // block and letting a smoother decay from frame 0 does not work: the
+        // envelope is still near 1.0 when the samples run out, so the cut is
+        // just as abrupt as no fade at all -- which defeats the entire point
+        // of having one.
+        const uint32_t fadeFrames = std::max<uint32_t>(1, uint32_t(rate * kFadeSeconds));
+        const float    riseStep   = 1.0f / float(fadeFrames);
+
+        const bool     starved   = (made < frames);
+        const uint32_t rampLen   = starved ? std::min(made, fadeFrames) : 0;
+        const uint32_t rampStart = starved ? (made - rampLen) : frames;
+        // Fall fast enough to reach zero by `made` even when the block starved
+        // earlier than a full fade would allow.
+        const float    fallStep  = 1.0f / float(std::max<uint32_t>(1, rampLen));
+
+        const float gainTarget = ch.muted.load(std::memory_order_relaxed)
+                                     ? 0.0f
+                                     : ch.gain.load(std::memory_order_relaxed);
 
         float g = ch.smoothedGain;
         float p = ch.presence;
@@ -221,7 +255,15 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
 
         for (uint32_t f = 0; f < frames; ++f) {
             g += (gainTarget - g) * gainCoef;
-            p += (presenceTarget - p) * presenceCoef;
+
+            float pTarget = 1.0f;
+            if (starved) {
+                if (f >= made)            pTarget = 0.0f;
+                else if (f >= rampStart)  pTarget = 1.0f - float(f - rampStart) / float(rampLen);
+            }
+            if (p < pTarget) p = std::min(pTarget, p + riseStep);
+            else             p = std::max(pTarget, p - fallStep);
+
             const float amp = g * p;
             const float l = ch.scratch[f * 2]     * amp;
             const float r = ch.scratch[f * 2 + 1] * amp;
