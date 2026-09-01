@@ -18,6 +18,7 @@
 #include "audio/RateController.h"
 #include "audio/Resampler.h"
 #include "audio/Meter.h"
+#include "audio/FadeEnvelope.h"
 #include "config/Config.h"
 
 #include <array>
@@ -117,7 +118,7 @@ private:
 
         // Audio-thread-only state.
         float    smoothedGain = 1.0f;
-        float    presence     = 0.0f;    // 0..1 fade, kills clicks at both edges
+        FadeEnvelope presence;           // kills clicks at both edges of a gap
         bool     priming      = true;
         uint32_t lastEpoch    = 0;
         double   baseRatio    = 1.0;     // captureRate / renderRate

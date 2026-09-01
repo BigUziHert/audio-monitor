@@ -8,6 +8,7 @@
 #include "audio/Resampler.h"
 #include "audio/RateController.h"
 #include "audio/Meter.h"
+#include "audio/FadeEnvelope.h"
 #include "config/Json.h"
 
 #include <cmath>
@@ -323,6 +324,58 @@ static void testDisturbanceRecovery() {
           "ratio %.6f drifted off the true clock error after the disturbance", ctl.ratio());
 }
 
+// The fade exists to stop a click when a loopback source runs dry mid-block.
+// That only works if the envelope reaches zero at the frame where the audio
+// actually stops -- an envelope merely aiming at zero for the whole block is
+// still near full amplitude when the samples run out, which is the bug this
+// replaced.
+static void testFadeLandsOnTheStarvePoint() {
+    std::printf("fade-out lands where the audio stops\n");
+    const uint32_t frames = 480, rate = 48000;
+
+    for (uint32_t made : { 300u, 100u, 20u }) {
+        FadeEnvelope env;
+        env.configure(uint32_t(rate * 0.005));
+        env.reset(1.0f);                       // channel was fully live
+        env.beginBlock(made, frames);
+
+        float atLastAudio = 1.0f;
+        for (uint32_t f = 0; f < frames; ++f) {
+            const float a = env.next(f);
+            if (f == made - 1) atLastAudio = a;
+            if (f >= made) CHECK(a <= 0.0001f, "made=%u: envelope %f is not silent past the audio", made, a);
+        }
+        std::printf("   made=%3u -> amplitude at the last real sample = %.4f\n", made, atLastAudio);
+        // The step into silence is what clicks, so it must be tiny.
+        CHECK(atLastAudio < 0.06f, "made=%u: steps to silence from %f", made, atLastAudio);
+    }
+
+    // A full block must not be attenuated at all.
+    FadeEnvelope full;
+    full.configure(uint32_t(rate * 0.005));
+    full.reset(1.0f);
+    full.beginBlock(frames, frames);
+    for (uint32_t f = 0; f < frames; ++f) {
+        CHECK(full.next(f) == 1.0f, "a full block must pass at unity");
+    }
+
+    // Coming back from silence must ramp, not jump.
+    FadeEnvelope rise;
+    rise.configure(uint32_t(rate * 0.005));
+    rise.reset(0.0f);
+    rise.beginBlock(frames, frames);
+    const float first = rise.next(0);
+    CHECK(first < 0.01f, "fade-in jumped straight to %f", first);
+    float prev = first, maxStep = 0.0f;
+    for (uint32_t f = 1; f < frames; ++f) {
+        const float v = rise.next(f);
+        maxStep = std::max(maxStep, v - prev);
+        prev = v;
+    }
+    std::printf("   fade-in reaches %.3f after one block, largest step %.5f\n", prev, maxStep);
+    CHECK(maxStep < 0.01f, "fade-in step %f is too abrupt", maxStep);
+}
+
 static void testMeter() {
     std::printf("meter\n");
     AtomicPeak p;
@@ -392,6 +445,7 @@ int main() {
     testDriftConvergence(+400.0, "extreme");
     testControllerIsGentle();
     testDisturbanceRecovery();
+    testFadeLandsOnTheStarvePoint();
     testMeter();
     testJson();
 

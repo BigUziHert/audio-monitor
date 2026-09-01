@@ -130,7 +130,8 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
         ch.targetDepth = 0.0;
         ch.resampler.reset();
         ch.priming      = true;
-        ch.presence     = 0.0f;
+        ch.presence.configure(uint32_t(double(sampleRate) * kFadeSeconds));
+        ch.presence.reset(0.0f);
         ch.smoothedGain = ch.gain.load(std::memory_order_relaxed);
         // Ring holds stale audio from before the rebuild; start clean.
         ch.stream.ring().dropAllFromConsumer();
@@ -235,36 +236,18 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
         // envelope is still near 1.0 when the samples run out, so the cut is
         // just as abrupt as no fade at all -- which defeats the entire point
         // of having one.
-        const uint32_t fadeFrames = std::max<uint32_t>(1, uint32_t(rate * kFadeSeconds));
-        const float    riseStep   = 1.0f / float(fadeFrames);
-
-        const bool     starved   = (made < frames);
-        const uint32_t rampLen   = starved ? std::min(made, fadeFrames) : 0;
-        const uint32_t rampStart = starved ? (made - rampLen) : frames;
-        // Fall fast enough to reach zero by `made` even when the block starved
-        // earlier than a full fade would allow.
-        const float    fallStep  = 1.0f / float(std::max<uint32_t>(1, rampLen));
+        ch.presence.beginBlock(made, frames);
 
         const float gainTarget = ch.muted.load(std::memory_order_relaxed)
                                      ? 0.0f
                                      : ch.gain.load(std::memory_order_relaxed);
 
         float g = ch.smoothedGain;
-        float p = ch.presence;
         float peakL = 0.0f, peakR = 0.0f;
 
         for (uint32_t f = 0; f < frames; ++f) {
             g += (gainTarget - g) * gainCoef;
-
-            float pTarget = 1.0f;
-            if (starved) {
-                if (f >= made)            pTarget = 0.0f;
-                else if (f >= rampStart)  pTarget = 1.0f - float(f - rampStart) / float(rampLen);
-            }
-            if (p < pTarget) p = std::min(pTarget, p + riseStep);
-            else             p = std::max(pTarget, p - fallStep);
-
-            const float amp = g * p;
+            const float amp = g * ch.presence.next(f);
             const float l = ch.scratch[f * 2]     * amp;
             const float r = ch.scratch[f * 2 + 1] * amp;
             dst[f * 2]     += l;
@@ -274,7 +257,6 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             if (ar > peakR) peakR = ar;
         }
         ch.smoothedGain = g;
-        ch.presence     = p;
 
         // Post-fader, post-mute, like the OBS mixer: muting drops the meter.
         ch.peak.l.publish(peakL);
