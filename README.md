@@ -84,6 +84,21 @@ workload, and **CMake 3.21+**. Dear ImGui is fetched automatically by CMake, so
 the first configure needs a network connection.
 
 ```powershell
+.\scripts\build.ps1
+```
+
+That script exists because of a specific papercut: Visual Studio ships its own
+CMake but only puts it on `PATH` inside the **Developer PowerShell for VS 2022**
+shell, so a normal PowerShell window reports `cmake is not recognized` on a
+machine that already has everything it needs. The script locates Visual Studio
+via `vswhere`, falls back to the bundled CMake, and tells you exactly what to
+install if something really is missing.
+
+If you would rather drive CMake yourself, either open **Developer PowerShell for
+VS 2022** from the Start menu, or install CMake standalone
+(`winget install Kitware.CMake`, then open a new terminal), and run:
+
+```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
