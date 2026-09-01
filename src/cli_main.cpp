@@ -8,6 +8,7 @@
 //
 //   audiomon-cli --list      enumerate endpoints and exit
 //   audiomon-cli             run the mixer, print meters until Ctrl+C
+//   audiomon-cli --verbose   also echo startup breadcrumbs to the console
 //
 #include "audio/AudioEngine.h"
 #include "config/Config.h"
@@ -126,12 +127,18 @@ int main(int argc, char** argv) {
     if (FAILED(coHr)) { std::printf("CoInitializeEx failed: 0x%08lX\n", coHr); return 1; }
 
     log::init(Config::appDataDir());
-    log::setEcho(true);   // bring-up: breadcrumbs must survive a hard crash
 
     bool listOnly = false;
+    bool verbose  = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--list") listOnly = true;
+        const std::string arg = argv[i];
+        if (arg == "--list")    listOnly = true;
+        if (arg == "--verbose") verbose  = true;
     }
+    // Startup breadcrumbs are off by default now that bring-up is done, but
+    // kept behind a flag: they are how the ucrtbase crash was finally located,
+    // and the next device-specific failure will want them too.
+    log::setEcho(verbose);
 
     if (listOnly) { listDevices(); log::shutdown(); CoUninitialize(); return 0; }
 
@@ -146,18 +153,18 @@ int main(int argc, char** argv) {
     // Raw, unbuffered breadcrumbs. Deliberately not going through the logging
     // subsystem: we already learned the hard way that a crash here leaves no
     // trace, and this narrows it to a single statement.
-    std::fputs("[bringup] constructing AudioEngine\n", stdout); std::fflush(stdout);
+    if (verbose) { std::fputs("[bringup] constructing AudioEngine\n", stdout); std::fflush(stdout); }
     AudioEngine engine;
-    std::fputs("[bringup] AudioEngine constructed\n", stdout); std::fflush(stdout);
+    if (verbose) { std::fputs("[bringup] AudioEngine constructed\n", stdout); std::fflush(stdout); }
 
-    std::fputs("[bringup] calling engine.start\n", stdout); std::fflush(stdout);
+    if (verbose) { std::fputs("[bringup] calling engine.start\n", stdout); std::fflush(stdout); }
     try {
         if (!engine.start(cfg)) { std::printf("engine failed to start\n"); return 1; }
     } catch (const std::exception& ex) {
         std::printf("\n*** engine.start threw: %s\n", ex.what());
         return 1;
     }
-    std::fputs("[bringup] engine.start returned\n", stdout); std::fflush(stdout);
+    if (verbose) { std::fputs("[bringup] engine.start returned\n", stdout); std::fflush(stdout); }
 
     // Give the worker threads a moment to resolve and open devices.
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
@@ -166,7 +173,6 @@ int main(int argc, char** argv) {
     // exactly what a device reconnect would do at the worst moment. The file
     // still receives everything.
     log::setEcho(false);
-    std::fputs("[bringup] entering meter loop\n", stdout); std::fflush(stdout);
 
     const char* names[kChannelCount] = { "Game", "Chat", "Mic " };
     MeterBallistics ball[kChannelCount + 1];

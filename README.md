@@ -121,6 +121,9 @@ isolates "is the audio path working" from "is the UI working".
 
 # Run the mixer and print live meters
 .\build\Release\audiomon-cli.exe
+
+# Same, plus startup breadcrumbs on the console (device open failures)
+.\build\Release\audiomon-cli.exe --verbose
 ```
 
 If the meters move and the capture card receives audio, everything that
