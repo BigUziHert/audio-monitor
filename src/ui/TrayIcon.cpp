@@ -1,7 +1,22 @@
 #include "ui/TrayIcon.h"
-#include <cwchar>
 
 namespace audiomon::ui {
+namespace {
+
+// Bounded copy that always null-terminates.
+//
+// wcsncpy would do here -- the existing use was correct -- but MSVC deprecates
+// it, and silencing that with _CRT_SECURE_NO_WARNINGS would switch off a whole
+// class of genuinely useful warnings across the project. Taking the array by
+// reference means the capacity comes from the type and cannot be passed wrong.
+template <size_t N>
+void copyBounded(wchar_t (&dst)[N], const wchar_t* src) {
+    size_t i = 0;
+    if (src) { for (; i + 1 < N && src[i]; ++i) dst[i] = src[i]; }
+    dst[i] = L'\0';
+}
+
+} // namespace
 
 UINT TrayIcon::taskbarCreatedMessage() {
     // Registered once per process; the same value comes back on repeat calls.
@@ -17,7 +32,7 @@ bool TrayIcon::add(HWND owner, HICON icon, const wchar_t* tooltip) {
     data_.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     data_.uCallbackMessage = kTrayCallbackMessage;
     data_.hIcon            = icon;
-    std::wcsncpy(data_.szTip, tooltip, (sizeof(data_.szTip) / sizeof(wchar_t)) - 1);
+    copyBounded(data_.szTip, tooltip);
 
     if (!Shell_NotifyIconW(NIM_ADD, &data_)) return false;
 
@@ -38,7 +53,7 @@ void TrayIcon::remove() {
 void TrayIcon::setTooltip(const wchar_t* tooltip) {
     if (!added_) return;
     data_.uFlags = NIF_TIP | NIF_SHOWTIP;
-    std::wcsncpy(data_.szTip, tooltip, (sizeof(data_.szTip) / sizeof(wchar_t)) - 1);
+    copyBounded(data_.szTip, tooltip);
     Shell_NotifyIconW(NIM_MODIFY, &data_);
 }
 
