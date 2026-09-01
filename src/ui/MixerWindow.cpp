@@ -379,10 +379,65 @@ bool MixerWindow::drawSettings() {
     ImGui::Dummy(ImVec2(0, 6));
     if (ImGui::Button("Close settings")) showSettings_ = false;
     ImGui::SameLine();
+    if (ImGui::Button("Restore defaults")) ImGui::OpenPopup("Restore defaults?");
+    ImGui::SameLine();
     if (ImGui::Button("Exit application")) exitRequested_ = true;
+
+    // Confirmed, because this discards a mix the user may have spent a while
+    // setting and there is no undo.
+    if (ImGui::BeginPopupModal("Restore defaults?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("This resets everything to first-run defaults:");
+        ImGui::BulletText("device selections back to auto-detect by name");
+        ImGui::BulletText("all faders to 0 dB and all channels unmuted");
+        ImGui::BulletText("exclusive mode on, buffer back to 50 ms");
+        ImGui::BulletText("start with Windows turned off");
+        ImGui::Dummy(ImVec2(0, 4));
+        ImGui::TextDisabled("Your Windows sound settings are not touched.");
+        ImGui::Dummy(ImVec2(0, 6));
+
+        if (ImGui::Button("Restore", ImVec2(120, 0))) {
+            restoreDefaults();
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 
     ImGui::EndChild();
     return changed;
+}
+
+void MixerWindow::restoreDefaults() {
+    *config_ = Config::defaults();
+
+    // Push every value through to the engine. Writing the config alone would
+    // leave the running streams and the registry out of step with what the UI
+    // now displays.
+    engine_->setGain(kGame, config_->game.gain);
+    engine_->setGain(kChat, config_->chat.gain);
+    engine_->setGain(kMic,  config_->mic.gain);
+    engine_->setOutputGain(config_->output.gain);
+    engine_->setMuted(kGame, config_->game.muted);
+    engine_->setMuted(kChat, config_->chat.muted);
+    engine_->setMuted(kMic,  config_->mic.muted);
+    engine_->setExclusiveOutput(config_->exclusiveOutput);
+    engine_->setBufferMillis(config_->bufferMillis);
+
+    // Defaults carry no endpoint IDs, so this re-resolves by name -- which is
+    // the point: it is how you recover from having pinned the wrong device.
+    engine_->setChannelDevice(kGame, { L"", config_->game.deviceNameMatch });
+    engine_->setChannelDevice(kChat, { L"", config_->chat.deviceNameMatch });
+    engine_->setChannelDevice(kMic,  { L"", config_->mic.deviceNameMatch });
+    engine_->setChannelDevice(-1,    { L"", config_->output.deviceNameMatch });
+
+    // Actually remove the Run entry rather than just unticking the box.
+    startup::setEnabled(false);
+    config_->startWithWindows = startup::isEnabled();
+
+    refreshDeviceLists();
 }
 
 bool MixerWindow::draw(float dt, int windowW, int windowH) {

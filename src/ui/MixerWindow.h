@@ -37,6 +37,7 @@ private:
     bool drawChannelStrip(Strip& strip, float dt);
     bool drawOutputSection(float dt);
     bool drawSettings();
+    void restoreDefaults();
     void refreshDeviceLists();
 
     AudioEngine* engine_ = nullptr;
