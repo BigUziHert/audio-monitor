@@ -229,6 +229,11 @@ bool RenderStream::openDevice(const DeviceRef& ref) {
     ComPtr<IMMDevice> device;
     std::wstring      gotId, gotName;
     const ResolveResult rr = devices_->resolve(ref, eRender, device, &gotId, &gotName);
+    if (rr == ResolveResult::Ambiguous) {
+        setError("output name matches more than one endpoint -- pick one in Settings", E_FAIL);
+        wantsRetry_.store(false, std::memory_order_release);   // retrying cannot help
+        return false;
+    }
     if (rr == ResolveResult::NotFound || !device) {
         setError("output device not found", E_FAIL);
         // The Elgato commonly enumerates after we do on a cold boot. This is

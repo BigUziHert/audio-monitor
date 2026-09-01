@@ -19,6 +19,10 @@ bool containsNoCase(const std::wstring& haystack, const std::wstring& needle) {
     return toLower(haystack).find(toLower(needle)) != std::wstring::npos;
 }
 
+bool equalsNoCase(const std::wstring& a, const std::wstring& b) {
+    return !b.empty() && toLower(a) == toLower(b);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -217,23 +221,48 @@ ResolveResult DeviceManager::resolve(const DeviceRef& ref, EDataFlow flow,
         UINT count = 0;
         coll->GetCount(&count);
 
-        // Prefer the shortest matching name: with "Game" configured and both
-        // "Game (Arctis)" and "Game Chat Mixer (Arctis)" present, the shorter
-        // is the more specific match rather than an arbitrary first hit.
-        ComPtr<IMMDevice> best;
-        std::wstring      bestName;
+        // An exact (case-insensitive) full-name match wins outright.
+        // Otherwise collect every substring match and require exactly one.
+        //
+        // This used to prefer the shortest matching name, which is a guess --
+        // and on a machine with Elgato's Wave Link installed, "Elgato" matches
+        // three endpoints and the shortest is its VIRTUAL device rather than
+        // the capture card. Silently attaching to the wrong endpoint is far
+        // worse than refusing: the audio goes somewhere plausible-looking and
+        // nothing reports an error.
+        ComPtr<IMMDevice>         exact;
+        std::wstring              exactName;
+        std::vector<ComPtr<IMMDevice>> partial;
+        std::vector<std::wstring>      partialNames;
+
         for (UINT i = 0; i < count; ++i) {
             ComPtr<IMMDevice> dev;
             if (FAILED(coll->Item(i, dev.put())) || !dev) continue;
             const std::wstring name = friendlyName(dev.get());
-            if (!containsNoCase(name, ref.nameMatch)) continue;
-            if (!best || name.size() < bestName.size()) { best = dev; bestName = name; }
+            if (equalsNoCase(name, ref.nameMatch)) { exact = dev; exactName = name; break; }
+            if (containsNoCase(name, ref.nameMatch)) {
+                partial.push_back(dev);
+                partialNames.push_back(name);
+            }
         }
-        if (best) {
-            if (outId)   *outId   = deviceId(best.get());
-            if (outName) *outName = bestName;
-            out = best;
+
+        if (exact) {
+            if (outId)   *outId   = deviceId(exact.get());
+            if (outName) *outName = exactName;
+            out = exact;
             return ResolveResult::MatchedByName;
+        }
+        if (partial.size() == 1) {
+            if (outId)   *outId   = deviceId(partial[0].get());
+            if (outName) *outName = partialNames[0];
+            out = partial[0];
+            return ResolveResult::MatchedByName;
+        }
+        if (partial.size() > 1) {
+            LOG_WARN("'%ls' matches %zu endpoints; refusing to guess. Choose one in Settings:",
+                     ref.nameMatch.c_str(), partial.size());
+            for (const auto& n : partialNames) LOG_WARN("    %ls", n.c_str());
+            return ResolveResult::Ambiguous;
         }
     }
 

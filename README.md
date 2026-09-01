@@ -146,10 +146,10 @@ whenever you change something in the UI.
 ```json
 {
   "version": 1,
-  "game":   { "deviceId": "{0.0.0.00000000}.{...}", "deviceName": "Game",   "gain": 1, "muted": false },
-  "chat":   { "deviceId": "",                       "deviceName": "Chat",   "gain": 1, "muted": false },
-  "mic":    { "deviceId": "",                       "deviceName": "Yeti",   "gain": 1, "muted": false },
-  "output": { "deviceId": "",                       "deviceName": "Elgato", "gain": 1, "muted": false },
+  "game":   { "deviceId": "{0.0.0.00000000}.{...}", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "muted": false },
+  "chat":   { "deviceId": "",                       "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "muted": false },
+  "mic":    { "deviceId": "",                       "deviceName": "USB Advanced Audio Device", "gain": 1, "muted": false },
+  "output": { "deviceId": "",                       "deviceName": "Elgato 4K", "gain": 1, "muted": false },
   "exclusiveOutput": true,
   "startWithWindows": false,
   "startMinimized": false,
@@ -164,9 +164,16 @@ reissues endpoint IDs — the name substring is used instead and the refreshed I
 is written back. That is what stops a driver update from silently orphaning
 your configuration.
 
-On first run there is no config file, and the defaults match `"Game"`,
-`"Chat"`, `"Yeti"` and `"Elgato"` by name. If those pick the wrong endpoint,
-open **Settings** in the app and choose explicitly.
+A name substring must match **exactly one** endpoint. If it matches several the
+app refuses to attach and logs the candidates rather than picking one, because
+guessing wrong means audio silently goes somewhere plausible-looking with no
+error. This is not hypothetical: on a machine with Elgato Wave Link installed,
+`"Elgato"` matches three render endpoints and the shortest is Wave Link'''s
+*virtual driver* rather than the capture card. The defaults are chosen to be
+unambiguous, not merely plausible.
+
+If a default picks nothing or is ambiguous on your machine, open **Settings**
+in the app and choose the endpoint explicitly; the exact ID is then persisted.
 
 `startWithWindows` registers `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 — per-user, so it needs no administrator rights — with a `--tray` flag so a

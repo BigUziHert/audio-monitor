@@ -46,7 +46,15 @@ struct DeviceInfo {
     bool         isDefault = false;
 };
 
-enum class ResolveResult { NotFound, MatchedById, MatchedByName };
+enum class ResolveResult {
+    NotFound,
+    MatchedById,
+    MatchedByName,
+    // More than one endpoint matched the name substring. Deliberately NOT
+    // resolved: picking one would be a guess, and guessing wrong here means
+    // silently routing audio into the wrong device.
+    Ambiguous,
+};
 
 class DeviceManager {
 public:

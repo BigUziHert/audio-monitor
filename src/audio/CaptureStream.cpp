@@ -89,6 +89,10 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
     ComPtr<IMMDevice> device;
     std::wstring      gotId, gotName;
     const ResolveResult rr = devices_->resolve(ref, flow, device, &gotId, &gotName);
+    if (rr == ResolveResult::Ambiguous) {
+        setError("device name matches more than one endpoint -- pick one in Settings", E_FAIL);
+        return false;
+    }
     if (rr == ResolveResult::NotFound || !device) {
         setError("device not found", E_FAIL);
         return false;

@@ -83,13 +83,25 @@ std::wstring toWide(const std::string& s) {
 
 Config Config::defaults() {
     Config c;
-    // First-run autodetection. The Arctis presents two render endpoints whose
-    // friendly names contain "Game" and "Chat"; the capture card's contains
-    // "Elgato". The mic is matched on the product name.
-    c.game.deviceNameMatch   = L"Game";
-    c.chat.deviceNameMatch   = L"Chat";
-    c.mic.deviceNameMatch    = L"Yeti";
-    c.output.deviceNameMatch = L"Elgato";
+    // First-run autodetection, chosen to be UNAMBIGUOUS on a real machine
+    // rather than merely plausible.
+    //
+    // "Elgato" alone is actively dangerous: with Wave Link installed it also
+    // matches "System (Elgato Virtual Audio)" and the mic mirror, and routing
+    // the mix into the virtual driver is exactly what this application exists
+    // to avoid. "Elgato 4K" matches only the capture card.
+    //
+    // The mic is matched on the USB Audio Class name it actually enumerates
+    // with; "Yeti" matched nothing, because the device reports itself
+    // generically rather than by product name.
+    //
+    // Anything ambiguous is refused outright at resolve time and reported, so
+    // a wrong guess here shows up as an error rather than as audio quietly
+    // going somewhere else.
+    c.game.deviceNameMatch   = L"Arctis Pro Wireless Game";
+    c.chat.deviceNameMatch   = L"Arctis Pro Wireless Chat";
+    c.mic.deviceNameMatch    = L"USB Advanced Audio Device";
+    c.output.deviceNameMatch = L"Elgato 4K";
 
     c.game.gain = c.chat.gain = c.mic.gain = c.output.gain = 1.0f;
     return c;
