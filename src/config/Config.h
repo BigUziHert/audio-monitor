@@ -8,6 +8,8 @@
 // lets the config survive that. On first run there is no config at all, so the
 // defaults autodetect by name.
 //
+#include "util/Text.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -49,9 +51,5 @@ struct Config {
     // leave a truncated config behind.
     bool save() const;
 };
-
-// UTF-8 <-> UTF-16 helpers. Windows APIs are wide; JSON is UTF-8.
-std::string  toUtf8(const std::wstring& w);
-std::wstring toWide(const std::string& s);
 
 } // namespace audiomon

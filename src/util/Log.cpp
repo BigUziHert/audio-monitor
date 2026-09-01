@@ -43,7 +43,17 @@ void init(const std::wstring& appDataDir) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file) return;
     std::wstring path = appDataDir + L"\\audio-monitor.log";
-    _wfopen_s(&g_file, path.c_str(), L"w, ccs=UTF-8");
+    // "wb", NOT "w, ccs=UTF-8".
+    //
+    // A ccs= encoding puts the stream into Unicode mode, and MSVC's CRT then
+    // treats a narrow fputs on it as an invalid parameter -- which calls
+    // __fastfail and kills the process on the very first log line, faulting
+    // inside ucrtbase with 0xC0000409. The file is opened, so it appears as an
+    // empty log and the crash looks like it came from somewhere else entirely.
+    //
+    // We already format UTF-8 bytes ourselves, so binary mode is exactly right:
+    // no encoding translation, and no CRLF rewriting either.
+    _wfopen_s(&g_file, path.c_str(), L"wb");
 }
 
 void setEcho(bool enabled) {

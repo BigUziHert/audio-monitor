@@ -1,6 +1,7 @@
 #include "audio/CaptureStream.h"
 #include "audio/RealtimeThread.h"
 #include "util/Log.h"
+#include "util/Text.h"
 
 #include <audiosessiontypes.h>
 #include <avrt.h>
@@ -103,11 +104,11 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
         resolvedName_ = gotName;
     }
     if (rr == ResolveResult::MatchedByName) {
-        LOG_INFO("%s: matched '%ls' by name; endpoint id has changed and will be re-saved",
-                 label_.c_str(), gotName.c_str());
+        LOG_INFO("%s: matched '%s' by name; endpoint id has changed and will be re-saved",
+                 label_.c_str(), toUtf8(gotName).c_str());
     }
 
-    LOG_INFO("%s: resolved '%ls'", label_.c_str(), gotName.c_str());
+    LOG_INFO("%s: resolved '%s'", label_.c_str(), toUtf8(gotName).c_str());
 
     HRESULT hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client_.putVoid());
     if (FAILED(hr)) { setError("Activate(IAudioClient)", hr); return false; }
@@ -178,7 +179,7 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
                          nullptr, nullptr, FALSE);
     }
 
-    LOG_INFO("%s: open on '%ls' (%s, %s)", label_.c_str(), resolvedName().c_str(),
+    LOG_INFO("%s: open on '%s' (%s, %s)", label_.c_str(), toUtf8(resolvedName()).c_str(),
              mode_ == CaptureMode::Loopback ? "loopback" : "microphone",
              format_.describe().c_str());
     return true;

@@ -57,6 +57,7 @@ add_library(audiomon_core STATIC
   src/config/Config.cpp
   src/config/Json.cpp
   src/util/Log.cpp
+  src/util/Text.cpp
   src/util/Startup.cpp
 )
 target_include_directories(audiomon_core PUBLIC src)

@@ -1,5 +1,6 @@
 #include "audio/DeviceManager.h"
 #include "util/Log.h"
+#include "util/Text.h"
 
 #include <functiondiscoverykeys_devpkey.h>
 #include <algorithm>
@@ -259,9 +260,9 @@ ResolveResult DeviceManager::resolve(const DeviceRef& ref, EDataFlow flow,
             return ResolveResult::MatchedByName;
         }
         if (partial.size() > 1) {
-            LOG_WARN("'%ls' matches %zu endpoints; refusing to guess. Choose one in Settings:",
-                     ref.nameMatch.c_str(), partial.size());
-            for (const auto& n : partialNames) LOG_WARN("    %ls", n.c_str());
+            LOG_WARN("'%s' matches %zu endpoints; refusing to guess. Choose one in Settings:",
+                     toUtf8(ref.nameMatch).c_str(), partial.size());
+            for (const auto& n : partialNames) LOG_WARN("    %s", toUtf8(n).c_str());
             return ResolveResult::Ambiguous;
         }
     }

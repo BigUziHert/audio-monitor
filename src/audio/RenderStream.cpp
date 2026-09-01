@@ -1,6 +1,7 @@
 #include "audio/RenderStream.h"
 #include "audio/RealtimeThread.h"
 #include "util/Log.h"
+#include "util/Text.h"
 
 #include <audiosessiontypes.h>
 #include <functiondiscoverykeys_devpkey.h>
@@ -262,8 +263,8 @@ bool RenderStream::openDevice(const DeviceRef& ref) {
     // which is precisely what this app exists to avoid.
     bool allowExclusive = preferExclusive_;
     if (allowExclusive && devices_->isDefaultForAnyRole(gotId)) {
-        LOG_WARN("render: '%ls' is a system default endpoint; refusing exclusive mode and "
-                 "using shared instead", gotName.c_str());
+        LOG_WARN("render: '%s' is a system default endpoint; refusing exclusive mode and "
+                 "using shared instead", toUtf8(gotName).c_str());
         allowExclusive = false;
     }
 
