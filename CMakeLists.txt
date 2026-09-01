@@ -71,6 +71,14 @@ if(AUDIOMON_BUILD_CLI)
   target_link_libraries(audiomon-cli PRIVATE audiomon_core)
 endif()
 
+# Bring-up diagnostic: logs one line on the first mix block so a crash can be
+# localised to before/inside/after it. This logs from the render thread, which
+# is NOT real-time safe, so it is opt-in and off by default.
+option(AUDIOMON_TRACE_FIRST_MIX "Log the first mix block (bring-up only)" OFF)
+if(AUDIOMON_TRACE_FIRST_MIX)
+  target_compile_definitions(audiomon_core PUBLIC AUDIOMON_TRACE_FIRST_MIX)
+endif()
+
 # --------------------------------------------------------------------- gui ---
 if(AUDIOMON_BUILD_GUI)
   include(FetchContent)

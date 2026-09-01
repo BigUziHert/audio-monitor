@@ -125,7 +125,11 @@ bool RenderStream::tryExclusive(IMMDevice* device) {
         if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client.putVoid()))) {
             continue;
         }
+        LOG_INFO("render: probing %u Hz %u ch %u-bit tag=0x%X cbSize=%u",
+                 wfx->nSamplesPerSec, wfx->nChannels, wfx->wBitsPerSample,
+                 wfx->wFormatTag, wfx->cbSize);
         if (client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wfx, nullptr) != S_OK) continue;
+        LOG_INFO("render: format accepted by IsFormatSupported");
 
         REFERENCE_TIME hnsDefault = 0, hnsMin = 0;
         client->GetDevicePeriod(&hnsDefault, &hnsMin);
@@ -173,7 +177,13 @@ bool RenderStream::tryExclusive(IMMDevice* device) {
         }
         if (FAILED(hr)) continue;   // format rejected; try the next candidate
 
-        if (!parseWaveFormat(wfx, format_)) { continue; }
+        LOG_INFO("render: exclusive Initialize succeeded");
+        if (!parseWaveFormat(wfx, format_)) {
+            LOG_WARN("render: negotiated format could not be parsed; trying next candidate");
+            continue;
+        }
+        LOG_INFO("render: parsed %s (blockAlign=%u, mask=0x%X)",
+                 format_.describe().c_str(), format_.blockAlign, format_.channelMask);
 
         if (FAILED(client->GetBufferSize(&bufferFrames_)) || bufferFrames_ == 0) continue;
         if (FAILED(client->GetService(__uuidof(IAudioRenderClient), render_.putVoid()))) continue;
@@ -365,10 +375,13 @@ void RenderStream::threadMain(DeviceRef ref) {
         LOG_ERR("render: open failed: %s", lastError().c_str());
         state_.store(StreamState::Failed, std::memory_order_release);
     } else {
+        LOG_INFO("render: configuring converter for %s, %u frames/block",
+                 format_.describe().c_str(), bufferFrames_);
         converter_.configure(format_);
         sampleRate_.store(format_.sampleRate, std::memory_order_release);
         blockFrames_.store(bufferFrames_, std::memory_order_release);
         mixBuffer_.assign(static_cast<size_t>(bufferFrames_) * 2, 0.0f);
+        LOG_INFO("render: mixBuffer %zu floats", mixBuffer_.size());
 
         // Auto-reset. A manual-reset event stays signalled and turns the
         // render loop into a 100%-CPU spin.
@@ -376,7 +389,9 @@ void RenderStream::threadMain(DeviceRef ref) {
         HRESULT hr = bufferEvent_ ? client_->SetEventHandle(bufferEvent_) : E_FAIL;
 
         if (SUCCEEDED(hr)) {
+            LOG_INFO("render: notifying mixer of format");
             mixer_->onRenderFormat(format_.sampleRate, bufferFrames_);
+            LOG_INFO("render: mixer configured; pre-rolling silence");
 
             // Pre-roll one silent buffer: exclusive mode starts the DMA
             // immediately and an unfilled first buffer is an audible glitch.
@@ -387,8 +402,10 @@ void RenderStream::threadMain(DeviceRef ref) {
 
             hr = client_->Start();
             if (SUCCEEDED(hr)) {
+                LOG_INFO("render: started; entering render loop");
                 state_.store(StreamState::Running, std::memory_order_release);
                 renderLoop();
+                LOG_INFO("render: loop exited");
             } else {
                 setError("IAudioClient::Start", hr);
             }

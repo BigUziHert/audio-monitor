@@ -107,8 +107,11 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
                  label_.c_str(), gotName.c_str());
     }
 
+    LOG_INFO("%s: resolved '%ls'", label_.c_str(), gotName.c_str());
+
     HRESULT hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client_.putVoid());
     if (FAILED(hr)) { setError("Activate(IAudioClient)", hr); return false; }
+    LOG_INFO("%s: activated", label_.c_str());
 
     // Loopback and shared capture both accept only the engine's mix format.
     WAVEFORMATEX* mix = nullptr;
@@ -121,6 +124,8 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
         setError("unsupported mix format (compressed passthrough?)", E_FAIL);
         return false;
     }
+    LOG_INFO("%s: mix format %s (blockAlign=%u, mask=0x%X)", label_.c_str(),
+             format_.describe().c_str(), format_.blockAlign, format_.channelMask);
     converter_.configure(format_);
     sampleRate_.store(format_.sampleRate, std::memory_order_release);
 
@@ -140,9 +145,13 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
     CoTaskMemFree(mix);
     if (FAILED(hr)) { setError("IAudioClient::Initialize", hr); return false; }
 
+    LOG_INFO("%s: initialized", label_.c_str());
+
     UINT32 bufferFrames = 0;
     hr = client_->GetBufferSize(&bufferFrames);
     if (FAILED(hr)) { setError("GetBufferSize", hr); return false; }
+    LOG_INFO("%s: buffer %u frames, scratch %zu floats", label_.c_str(),
+             bufferFrames, static_cast<size_t>(bufferFrames) * 2);
 
     // Preallocate the conversion scratch for a worst-case packet. Nothing in
     // the drain loop may allocate.
@@ -153,6 +162,7 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
 
     hr = client_->Start();
     if (FAILED(hr)) { setError("IAudioClient::Start", hr); return false; }
+    LOG_INFO("%s: started", label_.c_str());
 
     // Poll at roughly half the device period so we never sit on a full packet.
     LONG period100ns = static_cast<LONG>(hnsDefault ? hnsDefault / 2 : 50000);

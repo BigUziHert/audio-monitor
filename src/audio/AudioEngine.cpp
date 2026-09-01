@@ -66,6 +66,7 @@ bool AudioEngine::start(const Config& config) {
     render_.start(devices_, { config.output.deviceId, config.output.deviceNameMatch },
                   this, config.exclusiveOutput);
 
+    LOG_INFO("engine: all streams requested; starting supervisor");
     quit_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
     supervisor_ = std::thread(&AudioEngine::supervisorMain, this);
@@ -140,6 +141,12 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
 }
 
 void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
+#if defined(AUDIOMON_TRACE_FIRST_MIX)
+    // One-shot breadcrumb: proves the first mix block ran to completion.
+    static std::atomic<bool> traced{false};
+    const bool firstMix = !traced.exchange(true, std::memory_order_relaxed);
+    if (firstMix) LOG_INFO("mix: first block, %u frames", frames);
+#endif
     const uint32_t rate = renderRate_.load(std::memory_order_relaxed);
 
     // Defensive backstop only. onRenderFormat sizes every scratch buffer to
@@ -280,6 +287,10 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
     smoothedOutputGain_ = og;
     outputPeak_.l.publish(opl);
     outputPeak_.r.publish(opr);
+
+#if defined(AUDIOMON_TRACE_FIRST_MIX)
+    if (firstMix) LOG_INFO("mix: first block completed");
+#endif
 }
 
 // ---------------------------------------------------------------------------
