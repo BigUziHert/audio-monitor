@@ -36,8 +36,10 @@ public:
     CaptureStream(const CaptureStream&) = delete;
     CaptureStream& operator=(const CaptureStream&) = delete;
 
-    // Allocates the ring once. ringMillis sizes the drift/jitter headroom.
-    void configure(const char* label, CaptureMode mode, uint32_t ringMillis = 400);
+    // Allocates the ring once, at startup. It cannot be resized later: the
+    // render thread reads the ring even while a stream is down (for the depth
+    // readout and to drop stale audio), so reallocating under it would race.
+    void configure(const char* label, CaptureMode mode, uint32_t ringMillis = 250);
 
     // Starts (or restarts) the poll thread against the given endpoint.
     // Non-blocking: resolution and device setup happen on the worker.

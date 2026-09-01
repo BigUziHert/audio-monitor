@@ -222,7 +222,14 @@ void FormatConverter::fromStereoFloat(const float* src, void* dst, uint32_t fram
     const uint16_t stride = fmt_.blockAlign;
 
     if (fmt_.type == SampleType::Float32 && nch == 2) {
-        std::memcpy(bytes, src, static_cast<size_t>(frames) * 2 * sizeof(float));
+        // Clamp rather than memcpy. Three channels summed can exceed full
+        // scale even with every fader at unity, and the integer paths below
+        // all clamp -- letting the float path alone pass >1.0 through to the
+        // hardware would make the same overload sound different depending on
+        // which format the endpoint negotiated.
+        float* out = reinterpret_cast<float*>(bytes);
+        const size_t n = static_cast<size_t>(frames) * 2;
+        for (size_t i = 0; i < n; ++i) out[i] = std::clamp(src[i], -1.0f, 1.0f);
         return;
     }
 

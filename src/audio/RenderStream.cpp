@@ -294,7 +294,16 @@ void RenderStream::renderLoop() {
         if (!excl) {
             // Shared mode only: the engine may still hold part of the buffer.
             UINT32 padding = 0;
-            if (FAILED(client_->GetCurrentPadding(&padding))) break;
+            const HRESULT phr = client_->GetCurrentPadding(&padding);
+            if (FAILED(phr)) {
+                // This is how an unplug surfaces in shared mode. Breaking
+                // without flagging a retry would leave the render thread dead
+                // and the supervisor with no reason to rebuild it -- silent,
+                // permanent loss of output.
+                setError("GetCurrentPadding", phr);
+                wantsRetry_.store(true, std::memory_order_release);
+                break;
+            }
             toWrite = (padding < bufferFrames_) ? (bufferFrames_ - padding) : 0;
             if (toWrite == 0) continue;
         }

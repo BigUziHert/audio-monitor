@@ -15,6 +15,9 @@ namespace {
 // before telling the mixer to emit silence for the channel.
 constexpr double kIdleAfterSeconds = 0.10;
 
+// Ring capacity is derived from this, in frames per millisecond.
+constexpr uint32_t kMaxSupportedRateKHz = 192;
+
 } // namespace
 
 CaptureStream::~CaptureStream() { stop(); }
@@ -24,7 +27,13 @@ void CaptureStream::configure(const char* label, CaptureMode mode, uint32_t ring
     mode_       = mode;
     ringMillis_ = ringMillis;
     // Sized at the internal rate; the ring holds post-conversion stereo frames.
-    ring_.init(48 * ringMillis_);
+    // Sized for the highest rate any endpoint might report, not for 48 kHz:
+    // the ring stores frames at the source's NATIVE rate (resampling happens
+    // downstream), so a headset switched to 96 or 192 kHz in the Sound control
+    // panel would otherwise overflow a ring built for 48. At 250 ms this is
+    // 64K frames, half a megabyte per channel -- and 1.3 seconds of headroom
+    // in the ordinary 48 kHz case.
+    ring_.init(kMaxSupportedRateKHz * ringMillis_);
     QueryPerformanceFrequency(&qpcFreq_);
 }
 
