@@ -36,8 +36,10 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"AudioMonitorWindow";
 constexpr wchar_t kWindowTitle[] = L"Audio Monitor";
 constexpr wchar_t kMutexName[]   = L"Local\\AudioMonitorSingleInstance";
-constexpr int     kWindowWidth   = 560;
-constexpr int     kWindowHeight  = 560;
+// Fits the four strips with a little breathing room; the settings panel
+// expands past this and the window scrolls or can be resized.
+constexpr int     kWindowWidth   = 1000;
+constexpr int     kWindowHeight  = 620;
 
 // Sent by a second instance to bring the running one to the front.
 UINT g_showMessage = 0;

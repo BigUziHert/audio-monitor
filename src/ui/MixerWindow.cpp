@@ -10,8 +10,15 @@
 namespace audiomon::ui {
 namespace {
 
-constexpr float kMeterHeight  = 9.0f;
+constexpr float kMeterHeight  = 13.0f;
 constexpr float kMeterGap     = 3.0f;
+
+// A mixer strip stops being readable long before it is 2000px wide: the meter
+// becomes a thin ribbon and the dB scale turns into scattered ticks. Cap the
+// content and centre it, so maximising the window gives margins rather than
+// stretching everything.
+constexpr float kMaxContentWidth = 940.0f;
+constexpr float kStripHeight     = 126.0f;
 constexpr float kFaderMinDb   = -60.0f;
 // +12 dB matches the ceiling Config accepts. Without the headroom a config
 // holding a boosted gain would display pinned at 0 dB while actually applying
@@ -124,7 +131,8 @@ bool MixerWindow::drawChannelStrip(Strip& strip, float dt) {
     const auto st = engine_->channelStatus(i);
 
     ImGui::PushID(i);
-    ImGui::BeginChild("strip", ImVec2(0, 118), true, ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild("strip", ImVec2(contentWidth_, kStripHeight), true,
+                      ImGuiWindowFlags_NoScrollbar);
 
     // --- header: name, state, device ---
     ImGui::TextUnformatted(strip.title.c_str());
@@ -205,7 +213,8 @@ bool MixerWindow::drawOutputSection(float dt) {
     const OutputStatus os = engine_->outputStatus();
 
     ImGui::PushID("out");
-    ImGui::BeginChild("outstrip", ImVec2(0, 118), true, ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild("outstrip", ImVec2(contentWidth_, kStripHeight), true,
+                      ImGuiWindowFlags_NoScrollbar);
 
     ImGui::TextUnformatted("Output to capture card");
     ImGui::SameLine();
@@ -261,7 +270,9 @@ bool MixerWindow::drawSettings() {
     bool changed = false;
     if (!deviceListsLoaded_) refreshDeviceLists();
 
-    ImGui::BeginChild("settings", ImVec2(0, 0), true);
+    // Sized to its content rather than filling the window: a tall window left
+    // an enormous empty panel below the controls.
+    ImGui::BeginChild("settings", ImVec2(contentWidth_, 330.0f), true);
     ImGui::TextUnformatted("Devices");
     ImGui::Separator();
 
@@ -387,12 +398,18 @@ bool MixerWindow::draw(float dt, int windowW, int windowH) {
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus);
 
+    const float avail = ImGui::GetContentRegionAvail().x;
+    contentWidth_ = std::min(avail, kMaxContentWidth);
+    const float margin = (avail - contentWidth_) * 0.5f;
+    if (margin > 1.0f) ImGui::Indent(margin);
+
     for (auto& s : strips_) changed |= drawChannelStrip(s, dt);
     ImGui::Dummy(ImVec2(0, 2));
     changed |= drawOutputSection(dt);
 
     if (showSettings_) changed |= drawSettings();
 
+    if (margin > 1.0f) ImGui::Unindent(margin);
     ImGui::End();
     return changed;
 }

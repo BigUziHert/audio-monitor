@@ -48,6 +48,7 @@ private:
     std::vector<DeviceInfo> renderDevices_;
     std::vector<DeviceInfo> captureDevices_;
     bool  deviceListsLoaded_ = false;
+    float contentWidth_      = 0.0f;   // capped and centred; set each frame
     bool  showSettings_      = false;
     bool  exitRequested_     = false;
     float deviceRefreshTimer_ = 0.0f;
