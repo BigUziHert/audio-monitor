@@ -123,10 +123,22 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ui::kTrayCallbackMessage: {
             // Under NOTIFYICON_VERSION_4 the event is in the low word of lParam.
             switch (LOWORD(lp)) {
-                case WM_LBUTTONUP:
+                // A click SHOWS the window; it never toggles. This used to
+                // toggle, which flashed the window open and shut: under
+                // NOTIFYICON_VERSION_4 a single left click delivers BOTH
+                // WM_LBUTTONUP and NIN_SELECT, so a toggle flips twice, and a
+                // double-click adds WM_LBUTTONDBLCLK and another WM_LBUTTONUP
+                // on top. showWindow is idempotent, so however many of these
+                // arrive the result is one visible, foregrounded window.
+                // Hiding is the close button's job.
                 case NIN_SELECT:
                 case NIN_KEYSELECT:
-                    if (app) { app->visible ? hideWindow(*app) : showWindow(*app); }
+                case WM_LBUTTONDBLCLK:
+                    if (app) showWindow(*app);
+                    return 0;
+                case WM_LBUTTONUP:
+                    // Redundant with the NIN_SELECT that follows it under
+                    // VERSION_4; acting on both is exactly what caused the flash.
                     return 0;
                 case WM_CONTEXTMENU:
                 case WM_RBUTTONUP: {
