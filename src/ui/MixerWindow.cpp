@@ -277,10 +277,20 @@ bool MixerWindow::drawSettings() {
         ImGui::PushID(row.label);
         ImGui::SetNextItemWidth(-90.0f);
 
-        // Show what is actually open, so a name-matched fallback is visible.
-        std::string current = "(auto: matches \"" + toUtf8(row.cfg->deviceNameMatch) + "\")";
-        for (const auto& d : *row.list) {
-            if (!row.cfg->deviceId.empty() && d.id == row.cfg->deviceId) { current = narrow(d.name); break; }
+        // Show the endpoint that is actually OPEN, not just what was configured.
+        // Reporting the name pattern instead is useless precisely when it
+        // matters -- when you want to confirm an auto-match landed on the
+        // device you meant rather than a similarly named one.
+        const std::wstring live = (row.channel >= 0)
+            ? engine_->channelStatus(row.channel).deviceName
+            : engine_->outputStatus().deviceName;
+
+        std::string current;
+        if (!live.empty()) {
+            current = narrow(live);
+            if (row.cfg->deviceId.empty()) current += "   (auto)";
+        } else {
+            current = "(nothing matched \"" + toUtf8(row.cfg->deviceNameMatch) + "\")";
         }
 
         if (ImGui::BeginCombo(row.label, current.c_str())) {
