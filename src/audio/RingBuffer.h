@@ -16,6 +16,14 @@
 
 namespace audiomon {
 
+#if defined(_MSC_VER)
+#  pragma warning(push)
+// C4324: "structure was padded due to alignment specifier". That padding is
+// the entire point of the alignas below -- keeping the two cursors off each
+// other's cache line -- so the warning is noise here.
+#  pragma warning(disable : 4324)
+#endif
+
 class StereoRing {
 public:
     StereoRing() = default;
@@ -109,5 +117,9 @@ private:
     alignas(64) std::atomic<uint32_t> write_{0};
     alignas(64) std::atomic<uint32_t> read_{0};
 };
+
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
 
 } // namespace audiomon

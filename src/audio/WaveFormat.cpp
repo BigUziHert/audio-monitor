@@ -1,7 +1,10 @@
 #include "audio/WaveFormat.h"
 #include "audio/AudioGuids.h"
 
-#include <ksmedia.h>
+// SPEAKER_* channel-mask bits come from <mmreg.h>, pulled in by WaveFormat.h.
+// Deliberately NOT <ksmedia.h>: the Windows SDK's copy hard-errors unless
+// <ks.h> was included first, and it has nothing this file needs.
+
 #include <algorithm>
 #include <cstring>
 #include <cstdio>

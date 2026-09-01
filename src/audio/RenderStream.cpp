@@ -5,7 +5,6 @@
 #include <audiosessiontypes.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <avrt.h>
-#include <ksmedia.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
