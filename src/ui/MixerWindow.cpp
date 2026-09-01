@@ -373,7 +373,8 @@ bool MixerWindow::drawSettings() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Target depth for each channel's buffer. Lower is less delay to the\n"
                           "stream PC; higher tolerates more scheduling jitter under game load.\n"
-                          "Takes effect the next time the output device is opened.");
+                          "Applies immediately -- the buffer migrates to the new depth over a\n"
+                          "few seconds without interrupting audio.");
     }
 
     ImGui::Dummy(ImVec2(0, 6));

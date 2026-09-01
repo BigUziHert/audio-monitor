@@ -136,8 +136,9 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
     // source at half the intended depth.
     for (auto& up : channels_) {
         Channel& ch = *up;
-        ch.lastSrcRate = 0;              // force a recompute on the next block
-        ch.targetDepth = 0.0;
+        ch.lastSrcRate  = 0;             // force a recompute on the next block
+        ch.lastBufferMs = 0;
+        ch.targetDepth  = 0.0;
         ch.resampler.reset();
         ch.priming      = true;
         ch.presence.configure(uint32_t(double(sampleRate) * kFadeSeconds));
@@ -198,16 +199,28 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             const uint32_t srcRate = ch.stream.sampleRate();
             ch.baseRatio = (srcRate && rate) ? double(srcRate) / double(rate) : 1.0;
 
+            const uint32_t bufMs = bufferMillis_.load(std::memory_order_relaxed);
+
             if (srcRate && srcRate != ch.lastSrcRate) {
-                // Setpoint and controller are denominated in capture frames,
-                // matching the ring. dt is real elapsed time, which the RENDER
-                // device sets -- the two rates are independent.
-                ch.lastSrcRate = srcRate;
-                ch.targetDepth = double(srcRate) *
-                                 double(bufferMillis_.load(std::memory_order_relaxed)) / 1000.0;
+                // New clock: full reconfigure. Setpoint and controller are
+                // denominated in capture frames, matching the ring. dt is real
+                // elapsed time, which the RENDER device sets -- the two rates
+                // are independent.
+                ch.lastSrcRate  = srcRate;
+                ch.lastBufferMs = bufMs;
+                ch.targetDepth  = double(srcRate) * double(bufMs) / 1000.0;
                 const double dt = rate ? double(frames) / double(rate) : 0.01;
                 ch.rate.configure(double(srcRate), ch.targetDepth, dt);
                 ch.priming = true;
+            } else if (srcRate && bufMs != ch.lastBufferMs) {
+                // Same clock, new setpoint: the user moved the buffer slider.
+                // setTarget rather than configure -- a reconfigure resets the
+                // controller and re-primes, which would drop audio for a
+                // setting the user is likely to nudge repeatedly. The depth
+                // migrates under the existing slew limit instead.
+                ch.lastBufferMs = bufMs;
+                ch.targetDepth  = double(srcRate) * double(bufMs) / 1000.0;
+                ch.rate.setTarget(ch.targetDepth);
             }
             if (ch.targetDepth <= 0.0) { ch.priming = true; }
 

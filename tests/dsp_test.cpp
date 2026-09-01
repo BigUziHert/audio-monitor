@@ -329,6 +329,89 @@ static void testDisturbanceRecovery() {
 // actually stops -- an envelope merely aiming at zero for the whole block is
 // still near full amplitude when the samples run out, which is the bug this
 // replaced.
+// Moving the buffer setpoint on a LIVE stream, which is what the settings
+// slider now does. The requirement is that the depth migrates to the new value
+// without the channel ever starving -- a reconfigure() would reset the
+// controller and re-prime, dropping audio, which is why setTarget exists.
+static void testLiveSetpointChange(double fromMs, double toMs, const char* label) {
+    std::printf("live buffer change %s (%.0fms -> %.0fms)\n", label, fromMs, toMs);
+
+    const double   fs       = 48000.0;
+    const uint32_t blockOut = 480;
+    const double   ppm      = 90.0;
+
+    auto depthFor = [&](double ms) { return fs * ms / 1000.0; };
+
+    StereoRing r;
+    r.init(65536);
+    DriftResampler rs;
+    rs.reset();
+    RateController ctl;
+    ctl.configure(fs, depthFor(fromMs), double(blockOut) / fs);
+
+    r.beginWrite();
+    for (uint32_t i = 0; i < uint32_t(depthFor(fromMs)); ++i) r.writeFrame(i, 0.0f, 0.0f);
+    r.endWrite(uint32_t(depthFor(fromMs)));
+
+    std::vector<float> out(blockOut * 2);
+    double credit = 0.0, phase = 0.0;
+    const double perBlock = blockOut * (1.0 + ppm * 1e-6);
+
+    const int settle  = int(150 * fs / blockOut);   // reach steady state first
+    const int changeAt = settle;
+    const int total   = settle + int(400 * fs / blockOut);
+
+    uint32_t underrunsAfterChange = 0;
+    double   maxRatioStep = 0.0, prevRatio = 1.0;
+    bool     arrived = false;
+    int      arriveBlocks = 0;
+
+    for (int b = 0; b < total; ++b) {
+        credit += perBlock;
+        uint32_t n = uint32_t(credit);
+        credit -= n;
+        const uint32_t space = r.beginWrite();
+        if (n > space) n = space;
+        for (uint32_t i = 0; i < n; ++i) {
+            const float v = float(std::sin(2.0 * M_PI * 220.0 * phase / fs));
+            r.writeFrame(i, v, v);
+            phase += 1.0;
+        }
+        r.endWrite(n);
+
+        if (b == changeAt) ctl.setTarget(depthFor(toMs));
+
+        const double ratio = ctl.update(double(r.depth()));
+        const uint32_t made = rs.produce(r, out.data(), blockOut, ratio);
+
+        if (b > changeAt) {
+            if (made < blockOut) ++underrunsAfterChange;
+            maxRatioStep = std::max(maxRatioStep, std::fabs(ratio - prevRatio));
+            if (!arrived) {
+                ++arriveBlocks;
+                if (std::fabs(ctl.smoothed() - depthFor(toMs)) < depthFor(toMs) * 0.05) arrived = true;
+            }
+        }
+        prevRatio = ratio;
+    }
+
+    const double arriveSeconds = arriveBlocks * double(blockOut) / fs;
+    std::printf("   arrived in %.1fs, depth=%.0f (target %.0f), ratio=%.6f, largest step=%.2e\n",
+                arriveSeconds, ctl.smoothed(), depthFor(toMs), ctl.ratio(), maxRatioStep);
+
+    // The whole point: no dropout while the setpoint moves.
+    CHECK(underrunsAfterChange == 0, "%u underruns during the migration", underrunsAfterChange);
+    CHECK(arrived, "never reached the new setpoint");
+    CHECK(arriveSeconds < 120.0, "migration took %.1fs", arriveSeconds);
+    // Gentleness must survive a setpoint step, not just steady state.
+    CHECK(maxRatioStep <= RateController::kMaxRatioStep + 1e-12,
+          "ratio jumped by %.2e during the change", maxRatioStep);
+    // And the integrator must not have wound up: once settled the ratio has to
+    // come back to the true clock error, not sit offset from it.
+    CHECK(std::fabs(ctl.ratio() - (1.0 + ppm * 1e-6)) < 30e-6,
+          "ratio %.6f drifted off the true clock error after the change", ctl.ratio());
+}
+
 static void testFadeLandsOnTheStarvePoint() {
     std::printf("fade-out lands where the audio stops\n");
     const uint32_t frames = 480, rate = 48000;
@@ -445,6 +528,8 @@ int main() {
     testDriftConvergence(+400.0, "extreme");
     testControllerIsGentle();
     testDisturbanceRecovery();
+    testLiveSetpointChange(50.0, 150.0, "increase");
+    testLiveSetpointChange(150.0, 40.0, "decrease");
     testFadeLandsOnTheStarvePoint();
     testMeter();
     testJson();

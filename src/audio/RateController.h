@@ -74,6 +74,17 @@ public:
         reset();
     }
 
+    // Move the setpoint WITHOUT disturbing convergence state.
+    //
+    // Distinct from configure(): that resets, which re-primes the channel and
+    // drops audio. A user moving the buffer slider wants the depth to migrate
+    // to a new value, not a dropout -- so smoothed depth, the integrator (which
+    // holds the converged clock-drift correction) and the current ratio all
+    // survive. The loop simply sees a step in error and walks there under its
+    // slew limit, which for the full 20..250ms range takes tens of seconds and
+    // is inaudible.
+    void setTarget(double targetDepthFrames) noexcept { target_ = targetDepthFrames; }
+
     // Call after any discontinuity: device reconnect, DATA_DISCONTINUITY, a
     // genuine starve, or an overflow drop. A loop this slow would otherwise
     // spend minutes chasing a step that was not really drift.
@@ -102,10 +113,18 @@ public:
         const bool saturated = (raw != clamped);
         const bool unwinding = (clamped >= kMaxRatio && error < 0.0) ||
                                (clamped <= kMinRatio && error > 0.0);
+        // Conditional integration. Freeze the integrator while saturated, but
+        // still allow it to unwind in the direction that leaves saturation --
+        // plain "freeze when clamped" would trap it at the rail forever.
+        //
+        // This also covers a deliberate setpoint move. It looked like it might
+        // wind the integrator up over the tens of seconds the depth takes to
+        // migrate, but it cannot: kIntegralErrorLimit * kp_ is exactly the
+        // clamp width (2400 / (48000*10) = 0.005), so an error large enough to
+        // matter is by definition already saturating, and saturation freezes
+        // the integrator. Measured both ways -- a live 50<->150ms change
+        // settles back to the true clock error either way.
         if (!saturated || unwinding) {
-            // Clamp the error the integrator sees. A huge error is the
-            // proportional term's job; letting it charge the integrator too
-            // just buys overshoot later.
             integral_ += std::clamp(error, -kIntegralErrorLimit, kIntegralErrorLimit) * dt_;
             const double bound = kIntegralAuthority / ki_;
             integral_ = std::clamp(integral_, -bound, bound);

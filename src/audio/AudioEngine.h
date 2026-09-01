@@ -68,14 +68,16 @@ public:
     void setMuted(int channel, bool muted) noexcept;
     void setOutputGain(float linearGain) noexcept;
 
-    // Applies at the next device open, which is when the rate controllers are
-    // reconfigured. Changing it live would step every controller's setpoint.
-    // Applies at the next device open, like setBufferMillis.
+    // Applies at the next device open: exclusive vs shared is decided during
+    // IAudioClient::Initialize and cannot be changed on a live stream.
     void setExclusiveOutput(bool exclusive) {
         std::lock_guard<std::mutex> lock(configMutex_);
         config_.exclusiveOutput = exclusive;
     }
 
+    // Takes effect immediately. The mixer notices the change on its next block
+    // and moves each channel's setpoint without resetting anything, so the
+    // buffer migrates to the new depth over some seconds with no dropout.
     void setBufferMillis(uint32_t ms) noexcept {
         bufferMillis_.store(ms < 20 ? 20 : (ms > 250 ? 250 : ms), std::memory_order_relaxed);
     }
@@ -126,6 +128,7 @@ private:
         // measured in. Recomputed whenever the source rate changes.
         double   targetDepth  = 0.0;
         uint32_t lastSrcRate  = 0;
+        uint32_t lastBufferMs = 0;   // so a slider move retargets live
     };
 
     void supervisorMain();
