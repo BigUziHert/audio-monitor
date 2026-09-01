@@ -391,7 +391,7 @@ bool MixerWindow::drawSettings() {
         ImGui::BulletText("device selections back to auto-detect by name");
         ImGui::BulletText("all faders to 0 dB and all channels unmuted");
         ImGui::BulletText("exclusive mode on, buffer back to 50 ms");
-        ImGui::BulletText("start with Windows turned off");
+        ImGui::BulletText("start with Windows and start-hidden both turned off");
         ImGui::Dummy(ImVec2(0, 4));
         ImGui::TextDisabled("Your Windows sound settings are not touched.");
         ImGui::Dummy(ImVec2(0, 6));

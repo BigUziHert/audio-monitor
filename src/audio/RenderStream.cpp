@@ -49,6 +49,15 @@ void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
     devices_         = &devices;
     mixer_           = mixer;
     preferExclusive_ = preferExclusive;
+
+    // See the note in CaptureStream::start: the previous device's identity
+    // must not survive into the window before the new one resolves.
+    {
+        std::lock_guard<std::mutex> info(infoMutex_);
+        resolvedId_.clear();
+        resolvedName_.clear();
+        lastError_.clear();
+    }
     quit_.store(false, std::memory_order_relaxed);
     wantsRetry_.store(false, std::memory_order_release);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);

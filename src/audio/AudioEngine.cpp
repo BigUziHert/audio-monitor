@@ -334,17 +334,30 @@ void AudioEngine::supervisorMain() {
         }
         if (quit_.load(std::memory_order_relaxed)) break;
 
-        Config cfg;
-        { std::lock_guard<std::mutex> lock(configMutex_); cfg = config_; }
+        // Each ref is read from config_ IMMEDIATELY before the restart that
+        // uses it, not from a snapshot taken at the top of the pass. A snapshot
+        // goes stale the moment the UI changes a device -- and Restore
+        // defaults changes four at once -- so a channel that failed fast on
+        // its new name would have been reopened on its OLD pinned device.
+        auto captureRef = [this](int i) {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            const ChannelConfig& c = (i == kGame) ? config_.game
+                                   : (i == kChat) ? config_.chat
+                                                  : config_.mic;
+            return DeviceRef{ c.deviceId, c.deviceNameMatch };
+        };
+        auto outputRef = [this](bool& exclusive) {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            exclusive = config_.exclusiveOutput;
+            return DeviceRef{ config_.output.deviceId, config_.output.deviceNameMatch };
+        };
 
-        const ChannelConfig* cc[kChannelCount] = { &cfg.game, &cfg.chat, &cfg.mic };
         for (int i = 0; i < kChannelCount; ++i) {
             auto& ch = *channels_[i];
-            if (ch.stream.state() == StreamState::Failed) {
-                LOG_INFO("supervisor: restarting capture '%s' (%s)",
-                         ch.stream.label().c_str(), ch.stream.lastError().c_str());
-                ch.stream.start(devices_, { cc[i]->deviceId, cc[i]->deviceNameMatch });
-            }
+            if (ch.stream.state() != StreamState::Failed) continue;
+            LOG_INFO("supervisor: restarting capture '%s' (%s)",
+                     ch.stream.label().c_str(), ch.stream.lastError().c_str());
+            ch.stream.start(devices_, captureRef(i));
         }
 
         // Passivity check. If the endpoint we hold exclusively has since become
@@ -357,16 +370,18 @@ void AudioEngine::supervisorMain() {
             devices_.isDefaultForAnyRole(render_.resolvedId())) {
             LOG_WARN("supervisor: output endpoint became a system default; "
                      "releasing exclusive mode and reopening shared");
-            render_.start(devices_, { cfg.output.deviceId, cfg.output.deviceNameMatch },
-                          this, cfg.exclusiveOutput);
+            bool exclusive;
+            const DeviceRef ref = outputRef(exclusive);
+            render_.start(devices_, ref, this, exclusive);
         }
 
         // The Elgato commonly enumerates late on a cold boot, so a failed
         // output is a normal startup state that resolves itself.
         if (render_.state() == StreamState::Failed || render_.wantsRetry()) {
             LOG_INFO("supervisor: restarting output (%s)", render_.lastError().c_str());
-            render_.start(devices_, { cfg.output.deviceId, cfg.output.deviceNameMatch },
-                          this, cfg.exclusiveOutput);
+            bool exclusive;
+            const DeviceRef ref = outputRef(exclusive);
+            render_.start(devices_, ref, this, exclusive);
         }
     }
 

@@ -60,6 +60,21 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
     stopLocked();
     devices_ = &devices;
+
+    // Forget the previous device's identity NOW, not when the new one resolves.
+    // These are only ever written on a successful open, so without this a
+    // restart leaves the old endpoint's ID visible for the milliseconds the
+    // worker needs to resolve -- and a config save in that window (Restore
+    // defaults triggers one in the same frame) would persist the OLD pin back
+    // to disk, silently undoing the very change that caused the restart. The
+    // UI would also keep showing the old device's name next to 'unavailable'
+    // if the new resolve failed.
+    {
+        std::lock_guard<std::mutex> info(infoMutex_);
+        resolvedId_.clear();
+        resolvedName_.clear();
+        lastError_.clear();
+    }
     // A restart is a timeline break: whatever is still sitting in the ring
     // predates this device and may even be at a different sample rate. Bumping
     // the epoch makes the mixer drop it and re-prime.
