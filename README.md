@@ -72,7 +72,9 @@ Passivity is enforced structurally rather than by good intentions:
   bound by endpoint ID, with a friendly-name fallback.
 - Exclusive mode on the output is **refused automatically** if that endpoint is
   a system default for any role, because taking exclusive control of the
-  default output would break every other application on the machine.
+  default output would break every other application on the machine. If it
+  *becomes* a default later, the app notices and reopens in shared mode --
+  yielding control, never following the default.
 - No endpoint volume, mute, or default-device state is ever written.
 
 ## Building

@@ -13,7 +13,10 @@ namespace {
 constexpr float kMeterHeight  = 9.0f;
 constexpr float kMeterGap     = 3.0f;
 constexpr float kFaderMinDb   = -60.0f;
-constexpr float kFaderMaxDb   = 0.0f;
+// +12 dB matches the ceiling Config accepts. Without the headroom a config
+// holding a boosted gain would display pinned at 0 dB while actually applying
+// more, and a quiet microphone could not be brought up at all.
+constexpr float kFaderMaxDb   = 12.0f;
 
 ImU32 zoneColour(float db) {
     if (db >= kMeterRedDb)    return IM_COL32(220,  70,  60, 255);
@@ -291,8 +294,13 @@ bool MixerWindow::drawSettings() {
                 std::string label = narrow(d.name);
                 if (d.isDefault) label += "  [system default]";
                 if (ImGui::Selectable(label.c_str(), sel)) {
-                    row.cfg->deviceId = d.id;
-                    engine_->setChannelDevice(row.channel, { d.id, row.cfg->deviceNameMatch });
+                    // Narrow the name fallback to what was actually chosen.
+                    // Leaving the old broad substring in place means that if
+                    // this ID stops resolving, the fallback could silently
+                    // pick a different endpoint than the one selected here.
+                    row.cfg->deviceId        = d.id;
+                    row.cfg->deviceNameMatch = d.name;
+                    engine_->setChannelDevice(row.channel, { d.id, d.name });
                     changed = true;
                 }
             }
@@ -321,6 +329,7 @@ bool MixerWindow::drawSettings() {
     bool excl = config_->exclusiveOutput;
     if (ImGui::Checkbox("Open the capture card in exclusive mode", &excl)) {
         config_->exclusiveOutput = excl;
+        engine_->setExclusiveOutput(excl);   // the engine holds its own copy
         changed = true;
     }
     ImGui::SameLine();

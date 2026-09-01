@@ -62,10 +62,14 @@ public:
         return S_OK;
     }
 
-    // Deliberately inert. We observe the default changing and do nothing: this
-    // application must never follow the system default, or it would silently
-    // re-target when the user plugs in a monitor with speakers.
+    // We never FOLLOW the default -- doing so would silently re-target when the
+    // user plugs in a monitor with speakers, which is exactly the behaviour
+    // this application exists to avoid. But we do need to know it changed, for
+    // the opposite reason: if the endpoint we hold exclusively has just become
+    // a system default, we must give exclusive control back so we do not break
+    // every other application. The supervisor decides; this only wakes it.
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow, ERole, LPCWSTR) override {
+        fire();
         return S_OK;
     }
 
@@ -191,7 +195,10 @@ ResolveResult DeviceManager::resolve(const DeviceRef& ref, EDataFlow flow,
                 EDataFlow actual = eRender;
                 if (SUCCEEDED(dev->QueryInterface(__uuidof(IMMEndpoint), ep.putVoid())) && ep &&
                     SUCCEEDED(ep->GetDataFlow(&actual)) && actual == flow) {
-                    if (outId)   *outId   = ref.id;
+                    // Report what the device says its ID is, not the string we
+                    // were handed -- they can differ in case, and persisting
+                    // the canonical form keeps later comparisons honest.
+                    if (outId)   *outId   = deviceId(dev.get());
                     if (outName) *outName = friendlyName(dev.get());
                     out = dev;
                     return ResolveResult::MatchedById;

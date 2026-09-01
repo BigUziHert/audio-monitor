@@ -303,6 +303,20 @@ void AudioEngine::supervisorMain() {
             }
         }
 
+        // Passivity check. If the endpoint we hold exclusively has since become
+        // a system default -- the user changed it in the Sound control panel,
+        // or a driver reinstall reassigned it -- we must hand exclusive control
+        // back, or every other application on the machine loses its output.
+        // Restarting is enough: openDevice re-runs the same gate and will come
+        // back up in shared mode.
+        if (render_.state() == StreamState::Running && render_.exclusive() &&
+            devices_.isDefaultForAnyRole(render_.resolvedId())) {
+            LOG_WARN("supervisor: output endpoint became a system default; "
+                     "releasing exclusive mode and reopening shared");
+            render_.start(devices_, { cfg.output.deviceId, cfg.output.deviceNameMatch },
+                          this, cfg.exclusiveOutput);
+        }
+
         // The Elgato commonly enumerates late on a cold boot, so a failed
         // output is a normal startup state that resolves itself.
         if (render_.state() == StreamState::Failed || render_.wantsRetry()) {

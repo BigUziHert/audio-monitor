@@ -69,6 +69,12 @@ public:
 
     // Applies at the next device open, which is when the rate controllers are
     // reconfigured. Changing it live would step every controller's setpoint.
+    // Applies at the next device open, like setBufferMillis.
+    void setExclusiveOutput(bool exclusive) {
+        std::lock_guard<std::mutex> lock(configMutex_);
+        config_.exclusiveOutput = exclusive;
+    }
+
     void setBufferMillis(uint32_t ms) noexcept {
         bufferMillis_.store(ms < 20 ? 20 : (ms > 250 ? 250 : ms), std::memory_order_relaxed);
     }
