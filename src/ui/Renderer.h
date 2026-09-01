@@ -30,7 +30,16 @@ public:
     void onResize(uint32_t width, uint32_t height);
 
     void beginFrame();
-    void endFrame(bool vsync);
+
+    // Returns true if the swapchain is occluded (the window is covered, the
+    // workstation is locked, or a fullscreen app owns the output). Present
+    // stops blocking on vsync in that state, so the caller must throttle
+    // itself or the render loop becomes a spin.
+    bool endFrame(bool vsync);
+
+    // Cheap poll used while occluded, to notice when the window is visible
+    // again without drawing anything.
+    bool stillOccluded();
 
 private:
     bool createDeviceObjects(void* hwnd);

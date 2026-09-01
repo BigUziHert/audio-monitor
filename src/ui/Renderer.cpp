@@ -17,7 +17,7 @@ bool Renderer::createDeviceObjects(void* hwnd) {
     sd.BufferDesc.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferDesc.RefreshRate.Numerator   = 60;
     sd.BufferDesc.RefreshRate.Denominator = 1;
-    sd.Flags                              = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.Flags                              = 0;   // see MakeWindowAssociation below
     sd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow                       = static_cast<HWND>(hwnd);
     sd.SampleDesc.Count                   = 1;
@@ -42,6 +42,19 @@ bool Renderer::createDeviceObjects(void* hwnd) {
     if (FAILED(hr)) {
         LOG_ERR("ui: D3D11 device creation failed: 0x%08lX", static_cast<unsigned long>(hr));
         return false;
+    }
+
+    // DXGI installs a hook on the output window and acts on Alt+Enter by
+    // default. Alt+Enter is reflex for anyone who plays games, and a mixer
+    // panel has no business going fullscreen-exclusive -- worse, this window
+    // gets hidden to the tray, and hiding a window that owns a fullscreen
+    // swapchain can leave the display mode changed.
+    {
+        IDXGIFactory* factory = nullptr;
+        if (SUCCEEDED(swapChain_->GetParent(IID_PPV_ARGS(&factory))) && factory) {
+            factory->MakeWindowAssociation(static_cast<HWND>(hwnd), DXGI_MWA_NO_ALT_ENTER);
+            factory->Release();
+        }
     }
 
     createRenderTarget();
@@ -113,13 +126,23 @@ void Renderer::beginFrame() {
     ImGui::NewFrame();
 }
 
-void Renderer::endFrame(bool vsync) {
+bool Renderer::endFrame(bool vsync) {
     ImGui::Render();
     const float clear[4] = { kColBackground[0], kColBackground[1], kColBackground[2], 1.0f };
     context_->OMSetRenderTargets(1, &rtv_, nullptr);
     context_->ClearRenderTargetView(rtv_, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-    swapChain_->Present(vsync ? 1 : 0, 0);
+
+    // Present is the only thing pacing the visible loop, so its return value
+    // is load-bearing: while occluded it returns immediately instead of
+    // waiting for vsync.
+    const HRESULT hr = swapChain_->Present(vsync ? 1 : 0, 0);
+    return hr == DXGI_STATUS_OCCLUDED;
+}
+
+bool Renderer::stillOccluded() {
+    if (!swapChain_) return false;
+    return swapChain_->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED;
 }
 
 } // namespace audiomon::ui

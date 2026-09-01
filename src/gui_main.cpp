@@ -50,6 +50,8 @@ struct App {
     ui::TrayIcon     tray;
     HWND             hwnd    = nullptr;
     bool             visible = false;
+    bool             engineRunning = false;
+    bool             occluded = false;
     bool             quitting = false;
     bool             configDirty = false;
     std::chrono::steady_clock::time_point lastFrame{};
@@ -71,7 +73,13 @@ void showWindow(App& app) {
     app.lastFrame = std::chrono::steady_clock::now();
 }
 
+void saveConfigIfDirty(App& app, bool force);
+
 void hideWindow(App& app) {
+    // Every path into the tray flushes first. Putting it here rather than at
+    // each call site means a future hide path cannot forget -- the tray-icon
+    // toggle already had.
+    saveConfigIfDirty(app, true);
     app.visible = false;
     ShowWindow(app.hwnd, SW_HIDE);
     // Give the GPU memory back: the machine is probably running a game.
@@ -85,7 +93,11 @@ void saveConfigIfDirty(App& app, bool force) {
     if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - app.lastSave).count() < 1500) {
         return;
     }
-    app.engine.updateConfigFromRuntime(app.config);
+    // Only fold runtime state back when the engine actually came up. If it
+    // failed to start, its atomics still hold construction defaults, and
+    // copying those over the loaded config would silently reset every fader
+    // and mute the user had saved.
+    if (app.engineRunning) app.engine.updateConfigFromRuntime(app.config);
     app.config.save();
     app.configDirty = false;
     app.lastSave    = now;
@@ -128,14 +140,14 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SYSCOMMAND:
             // Minimise means "go to the tray", not "sit in the taskbar".
             if ((wp & 0xFFF0) == SC_MINIMIZE) {
-                if (app) { saveConfigIfDirty(*app, true); hideWindow(*app); }
+                if (app) hideWindow(*app);
                 return 0;
             }
             break;
 
         case WM_CLOSE:
             // The close button hides. Exit is deliberate, via the tray menu.
-            if (app) { saveConfigIfDirty(*app, true); hideWindow(*app); }
+            if (app) hideWindow(*app);
             return 0;
 
         case WM_SIZE:
@@ -152,6 +164,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_DESTROY:
+            // Delete the icon while the owning HWND is still alive; a
+            // NIM_DELETE against a dead window leaves a ghost icon in the
+            // notification area until the user hovers over it.
+            if (app) app->tray.remove();
             PostQuitMessage(0);
             return 0;
 
@@ -227,7 +243,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     app.tray.add(app.hwnd, icon, kWindowTitle);
     app.mixer.init(&app.engine, &app.config);
 
-    if (!app.engine.start(app.config)) {
+    app.engineRunning = app.engine.start(app.config);
+    if (!app.engineRunning) {
         MessageBoxW(app.hwnd, L"Could not start the audio engine. See audio-monitor.log in "
                               L"%APPDATA%\\audio-monitor for details.",
                     kWindowTitle, MB_OK | MB_ICONERROR);
@@ -252,6 +269,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             if (!running) break;
             if (!app.visible || !app.renderer.alive()) continue;
 
+            // Present does not wait for vsync while the window is occluded --
+            // covered by a fullscreen game, or the workstation locked -- so
+            // without this the loop would spin a core flat out on a machine
+            // that is busy doing something the user actually cares about.
+            if (app.occluded) {
+                if (app.renderer.stillOccluded()) { Sleep(16); continue; }
+                app.occluded = false;
+            }
+
             const auto now = std::chrono::steady_clock::now();
             const float dt = std::chrono::duration<float>(now - app.lastFrame).count();
             app.lastFrame = now;
@@ -261,7 +287,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
             app.renderer.beginFrame();
             if (app.mixer.draw(dt, rc.right - rc.left, rc.bottom - rc.top)) app.configDirty = true;
-            app.renderer.endFrame(true);   // vsync paces the loop
+            app.occluded = app.renderer.endFrame(true);   // vsync paces the loop
 
             saveConfigIfDirty(app, false);
 
