@@ -16,6 +16,8 @@
 #include <windows.h>
 #include <cstdio>
 #include <csignal>
+#include <exception>
+#include <stdexcept>
 #include <thread>
 
 using namespace audiomon;
@@ -24,6 +26,30 @@ namespace {
 
 volatile std::sig_atomic_t g_stop = 0;
 bool g_ansi = false;   // set once we know the console understands escapes
+
+// MSVC's abort() calls __fastfail(FAST_FAIL_FATAL_APP_EXIT), which reports the
+// same 0xC0000409 status as a stack-buffer overrun -- so a bare exit code
+// cannot distinguish "memory corruption" from "std::terminate". This handler
+// makes the difference visible: an uncaught exception prints its what(), while
+// terminate with no active exception points at a noexcept function throwing or
+// a joinable std::thread being destroyed.
+[[noreturn]] void onTerminate() {
+    std::fputs("\n*** FATAL: std::terminate ***\n", stdout);
+    if (std::exception_ptr e = std::current_exception()) {
+        try { std::rethrow_exception(e); }
+        catch (const std::exception& ex) {
+            std::printf("    uncaught exception: %s\n", ex.what());
+        }
+        catch (...) {
+            std::fputs("    uncaught exception of non-standard type\n", stdout);
+        }
+    } else {
+        std::fputs("    no active exception -- a noexcept function threw, or a\n"
+                   "    joinable std::thread was destroyed/assigned over\n", stdout);
+    }
+    std::fflush(stdout);
+    std::_Exit(3);
+}
 
 // Windows consoles do not interpret ANSI escapes unless the mode is set
 // explicitly. Windows Terminal enables it, classic conhost often does not, so
@@ -93,12 +119,14 @@ void printMeterBar(float db) {
 
 int main(int argc, char** argv) {
     setupConsole();
+    std::set_terminate(onTerminate);
     SetConsoleCtrlHandler(consoleHandler, TRUE);
 
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(coHr)) { std::printf("CoInitializeEx failed: 0x%08lX\n", coHr); return 1; }
 
     log::init(Config::appDataDir());
+    log::setEcho(true);   // bring-up: breadcrumbs must survive a hard crash
 
     bool listOnly = false;
     for (int i = 1; i < argc; ++i) {
@@ -116,7 +144,12 @@ int main(int argc, char** argv) {
                 u8(cfg.mic.deviceNameMatch).c_str(),  u8(cfg.output.deviceNameMatch).c_str());
 
     AudioEngine engine;
-    if (!engine.start(cfg)) { std::printf("engine failed to start\n"); return 1; }
+    try {
+        if (!engine.start(cfg)) { std::printf("engine failed to start\n"); return 1; }
+    } catch (const std::exception& ex) {
+        std::printf("\n*** engine.start threw: %s\n", ex.what());
+        return 1;
+    }
 
     // Give the worker threads a moment to resolve and open devices.
     std::this_thread::sleep_for(std::chrono::milliseconds(600));

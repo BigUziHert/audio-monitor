@@ -36,19 +36,24 @@ AudioEngine::AudioEngine() {
 AudioEngine::~AudioEngine() { stop(); }
 
 bool AudioEngine::start(const Config& config) {
+    LOG_INFO("engine: start");
     {
         std::lock_guard<std::mutex> lock(configMutex_);
         config_ = config;
     }
+    LOG_INFO("engine: config copied");
 
     if (!devices_.start([this] { requestRebuild(); })) {
         LOG_ERR("engine: device enumerator unavailable");
         return false;
     }
 
+    LOG_INFO("engine: device manager up");
+
     channels_[kGame]->stream.configure("game", CaptureMode::Loopback);
     channels_[kChat]->stream.configure("chat", CaptureMode::Loopback);
     channels_[kMic]->stream.configure("mic",  CaptureMode::Microphone);
+    LOG_INFO("engine: rings allocated");
 
     channels_[kGame]->gain.store(config.game.gain, std::memory_order_relaxed);
     channels_[kChat]->gain.store(config.chat.gain, std::memory_order_relaxed);
@@ -59,10 +64,14 @@ bool AudioEngine::start(const Config& config) {
     outputGain_.store(config.output.gain, std::memory_order_relaxed);
     bufferMillis_.store(config.bufferMillis, std::memory_order_relaxed);
 
+    LOG_INFO("engine: starting game capture");
     channels_[kGame]->stream.start(devices_, { config.game.deviceId, config.game.deviceNameMatch });
+    LOG_INFO("engine: starting chat capture");
     channels_[kChat]->stream.start(devices_, { config.chat.deviceId, config.chat.deviceNameMatch });
+    LOG_INFO("engine: starting mic capture");
     channels_[kMic]->stream.start(devices_,  { config.mic.deviceId,  config.mic.deviceNameMatch });
 
+    LOG_INFO("engine: starting render");
     render_.start(devices_, { config.output.deviceId, config.output.deviceNameMatch },
                   this, config.exclusiveOutput);
 

@@ -11,6 +11,11 @@ namespace audiomon::log {
 void init(const std::wstring& appDataDir);
 void shutdown();
 
+// Also echo every line to stdout, flushed immediately. The console survives a
+// __fastfail termination that can otherwise leave buffered file output lost,
+// and it works even when the log file could not be opened at all.
+void setEcho(bool enabled);
+
 void write(const char* level, const char* fmt, ...);
 
 #define LOG_INFO(...)  ::audiomon::log::write("INFO",  __VA_ARGS__)

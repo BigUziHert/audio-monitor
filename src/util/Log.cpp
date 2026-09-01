@@ -11,6 +11,7 @@ namespace {
 
 std::mutex  g_mutex;
 FILE*       g_file = nullptr;
+bool        g_echo = false;
 
 const char* wasapiName(long hr) {
     switch (hr) {
@@ -45,6 +46,11 @@ void init(const std::wstring& appDataDir) {
     _wfopen_s(&g_file, path.c_str(), L"w, ccs=UTF-8");
 }
 
+void setEcho(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_echo = enabled;
+}
+
 void shutdown() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file) { fclose(g_file); g_file = nullptr; }
@@ -68,6 +74,7 @@ void write(const char* level, const char* fmt, ...) {
 
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_file) { fputs(line, g_file); fflush(g_file); }
+    if (g_echo) { fputs(line, stdout); fflush(stdout); }
 }
 
 std::string hrString(long hr) {
