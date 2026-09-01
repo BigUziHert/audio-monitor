@@ -161,6 +161,11 @@ int main(int argc, char** argv) {
 
     // Give the worker threads a moment to resolve and open devices.
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    // Stop echoing to the console before the meter display takes over the
+    // screen: a log line arriving mid-redraw tears the display, which is
+    // exactly what a device reconnect would do at the worst moment. The file
+    // still receives everything.
+    log::setEcho(false);
     std::fputs("[bringup] entering meter loop\n", stdout); std::fflush(stdout);
 
     const char* names[kChannelCount] = { "Game", "Chat", "Mic " };

@@ -104,8 +104,11 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
         resolvedName_ = gotName;
     }
     if (rr == ResolveResult::MatchedByName) {
-        LOG_INFO("%s: matched '%s' by name; endpoint id has changed and will be re-saved",
-                 label_.c_str(), toUtf8(gotName).c_str());
+        // Distinguish first run from a driver reinstall: saying the id
+        // "changed" when there never was one reads as a problem.
+        LOG_INFO("%s: matched '%s' by name (%s); id will be saved",
+                 label_.c_str(), toUtf8(gotName).c_str(),
+                 ref.id.empty() ? "no id configured yet" : "configured id no longer resolves");
     }
 
     LOG_INFO("%s: resolved '%s'", label_.c_str(), toUtf8(gotName).c_str());
