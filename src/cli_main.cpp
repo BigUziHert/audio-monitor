@@ -143,16 +143,25 @@ int main(int argc, char** argv) {
                 u8(cfg.game.deviceNameMatch).c_str(), u8(cfg.chat.deviceNameMatch).c_str(),
                 u8(cfg.mic.deviceNameMatch).c_str(),  u8(cfg.output.deviceNameMatch).c_str());
 
+    // Raw, unbuffered breadcrumbs. Deliberately not going through the logging
+    // subsystem: we already learned the hard way that a crash here leaves no
+    // trace, and this narrows it to a single statement.
+    std::fputs("[bringup] constructing AudioEngine\n", stdout); std::fflush(stdout);
     AudioEngine engine;
+    std::fputs("[bringup] AudioEngine constructed\n", stdout); std::fflush(stdout);
+
+    std::fputs("[bringup] calling engine.start\n", stdout); std::fflush(stdout);
     try {
         if (!engine.start(cfg)) { std::printf("engine failed to start\n"); return 1; }
     } catch (const std::exception& ex) {
         std::printf("\n*** engine.start threw: %s\n", ex.what());
         return 1;
     }
+    std::fputs("[bringup] engine.start returned\n", stdout); std::fflush(stdout);
 
     // Give the worker threads a moment to resolve and open devices.
     std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    std::fputs("[bringup] entering meter loop\n", stdout); std::fflush(stdout);
 
     const char* names[kChannelCount] = { "Game", "Chat", "Mic " };
     MeterBallistics ball[kChannelCount + 1];
