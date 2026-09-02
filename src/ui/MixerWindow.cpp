@@ -2,6 +2,7 @@
 #include "util/Startup.h"
 #include <imgui.h>
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 
@@ -36,7 +37,8 @@ enum Icon {
     Play,
     Minus,
     Maximize,
-    Close
+    Close,
+    Dot
 };
 struct Canvas {
     ImDrawList *dl;
@@ -54,14 +56,31 @@ struct Canvas {
     void line(float x, float y, float xx, float yy, ImU32 color, float thickness = 2) const {
         dl->AddLine(p(x, y), p(xx, yy), color, thickness * s);
     }
+    ImFont *fontFor(bool bold) const {
+        auto &fonts = ImGui::GetIO().Fonts->Fonts;
+        return bold && fonts.Size > 1 ? fonts[1] : ImGui::GetFont();
+    }
+    ImVec2 textSize(const std::string &label, float size, bool bold) const {
+        const auto measured = fontFor(bold)->CalcTextSizeA(size * s, FLT_MAX, 0, label.c_str());
+        return {measured.x / s, measured.y / s};
+    }
     void text(float x, float y, const std::string &label, float size = 21, ImU32 color = white,
               bool bold = false, float maxWidth = 0) const {
-        auto &fonts = ImGui::GetIO().Fonts->Fonts;
-        ImFont *font = bold && fonts.Size > 1 ? fonts[1] : ImGui::GetFont();
         ImVec4 clip(origin.x + x * s, origin.y + y * s, origin.x + (x + maxWidth) * s,
                     origin.y + (y + size + 8) * s);
-        dl->AddText(font, size * s, p(x, y), color, label.c_str(), nullptr, 0,
+        dl->AddText(fontFor(bold), size * s, p(x, y), color, label.c_str(), nullptr, 0,
                     maxWidth > 0 ? &clip : nullptr);
+    }
+    void centeredText(float x, float y, const std::string &label, float size, ImU32 color) const {
+        const auto measured = textSize(label, size, false);
+        text(x - measured.x / 2, y - measured.y / 2, label, size, color);
+    }
+    void centeredIconLabel(Icon type, float x, float y, const std::string &label, float size,
+                           float iconSize, ImU32 iconColor, ImU32 textColor = white) const {
+        const auto measured = textSize(label, size, true);
+        const float gap = 18, left = x - (iconSize + gap + measured.x) / 2;
+        icon(type, left + iconSize / 2, y, iconColor, iconSize);
+        text(left + iconSize + gap, y - measured.y / 2, label, size, textColor, true);
     }
     bool hit(const char *id, float x, float y, float w, float h, const char *tooltip = nullptr) const {
         ImGui::SetCursorScreenPos(p(x, y));
@@ -106,9 +125,10 @@ struct Canvas {
             l(10, 31, 22, 31);
             break;
         case Speaker:
-        case Muted:
-            c.rect(2, 12, 6, 9, color, 1, false);
-            dl->AddTriangleFilled(c.p(7, 12), c.p(16, 5), c.p(16, 28), color);
+        case Muted: {
+            const ImVec2 speaker[] = {c.p(2, 12), c.p(7, 12), c.p(16, 5),
+                                      c.p(16, 27), c.p(7, 20), c.p(2, 20)};
+            dl->AddConcavePolyFilled(speaker, IM_ARRAYSIZE(speaker), color);
             if (kind == Muted) {
                 l(21, 12, 30, 22);
                 l(30, 12, 21, 22);
@@ -119,6 +139,7 @@ struct Canvas {
                 dl->PathStroke(color, 0, 2 * c.s);
             }
             break;
+        }
         case Arrow:
             l(12, 7, 21, 16);
             l(21, 16, 12, 25);
@@ -187,6 +208,9 @@ struct Canvas {
         case Close:
             l(8, 8, 24, 24, 2);
             l(24, 8, 8, 24, 2);
+            break;
+        case Dot:
+            dl->AddCircleFilled(c.p(16, 16), 16 * c.s, color, 24);
             break;
         }
     }
@@ -476,8 +500,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
         ImGui::TextWrapped("Add a playback device, microphone, or app to begin your mix.");
     ImGui::PopStyleVar();
     ImGui::EndChild();
-    c.icon(Plus, 176, h - 78, purple, 29);
-    c.text(205, h - 95, "Add Device", 25, purple, true);
+    c.centeredIconLabel(Plus, 261.5f, h - 76.5f, "Add Device", 25, 29, purple, purple);
     if (c.hit("Add Device", 74, h - 111, 375, 69, "Add a playback device, microphone, or application")) {
         if (config_->sources.size() < kMaxSources) {
             editSource_ = -1;
@@ -500,7 +523,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
     spectrum_.update(engine_->visualSamples(), out.sampleRate, dt,
                      engine_->running() && out.state == StreamState::Running);
     refreshStatus(dt);
-    const ImU32 statusColor = severity_ >= 2 ? red : severity_ ? amber : engine_->running() ? green : gray;
+    const ImU32 statusColor = !engine_->running() || severity_ >= 2 ? red : severity_ ? amber : green;
     c.rect(rightX, 105, rightW, liveH, panel, 19);
     c.icon(Wave, rightX + 48, 151, white, 31);
     c.text(rightX + 85, 134, "Live Mix", 25, white, true);
@@ -520,8 +543,6 @@ bool MixerWindow::draw(float dt, int width, int height) {
                                       value > .01f ? top : border, value > .01f ? bottom : border,
                                       value > .01f ? bottom : border);
     }
-    c.hit("Frequency spectrum", graphX, graphY, graphW, graphH,
-          "Live frequency spectrum: 30 Hz to 20 kHz, left to right. Level in dBFS.");
     const float levelY = graphY + graphH + 23;
     c.text(graphX, levelY, "Total Output Level", 23, gray);
     char level[32];
@@ -532,7 +553,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
     c.text(graphX + graphW - 132, levelY, level, 22, peak >= 1 ? red : green, true);
     const float tileY = 105 + liveH - 132, tileW = (rightW - 90) / 4;
     const Icon tileIcons[] = {Wave, Clock, Link, Bars};
-    const ImU32 tileColors[] = {green, cyan, purple, amber};
+    const ImU32 tileColors[] = {green, cyan, purple, statusColor};
     const char *titles[] = {"Sample Rate", "Buffer", "Channels", "Status"};
     std::string rate =
         engine_->running() && out.state == StreamState::Running ? std::to_string(out.sampleRate) : "--";
@@ -598,7 +619,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
     bool active = engine_->running() && out.state == StreamState::Running;
     c.rect(rightX + rightW - 197, outputY + 102, 97, 46,
            active ? IM_COL32(20, 53, 31, 255) : IM_COL32(49, 42, 29, 255), 24, false);
-    c.text(rightX + rightW - 176, outputY + 112, active ? "Active" : "Idle", 20, active ? green : amber);
+    c.centeredText(rightX + rightW - 148.5f, outputY + 125, active ? "Active" : "Idle", 20,
+                   active ? green : amber);
     c.rect(rightX + rightW - 83, outputY + 101, 46, 46, IM_COL32(40, 46, 53, 255), 11, false);
     c.icon(Down, rightX + rightW - 60, outputY + 124, white, 28);
     if (c.hit("Select output device", rightX + rightW - 86, outputY + 98, 52, 52,
@@ -637,14 +659,13 @@ bool MixerWindow::draw(float dt, int width, int height) {
     const float settingsW = rightW * .238f, stopW = rightW * .35f, stateW = rightW * .325f,
                 stopX = rightX + settingsW + (rightW - settingsW - stopW - stateW) * .5f;
     c.rect(rightX, footerY, settingsW, 73, card, 18);
-    c.icon(Gear, rightX + 70, footerY + 36, gray, 34);
-    c.text(rightX + 106, footerY + 21, "Settings", 25, white, true);
+    c.centeredIconLabel(Gear, rightX + settingsW / 2, footerY + 36.5f, "Settings", 25, 34, gray);
     if (c.hit("Settings", rightX, footerY, settingsW, 73))
         openSettings_ = true;
     bool running = engine_->running();
     c.rect(stopX, footerY - 1, stopW, 76, running ? red : IM_COL32(109, 71, 231, 255), 17, false);
-    c.icon(running ? Stop : Play, stopX + 69, footerY + 36, white, 34);
-    c.text(stopX + 108, footerY + 19, running ? "Stop Monitoring" : "Start Monitoring", 28, white, true);
+    c.centeredIconLabel(running ? Stop : Play, stopX + stopW / 2, footerY + 37,
+                        running ? "Stop Monitoring" : "Start Monitoring", 28, 34, white);
     if (c.hit("Toggle monitoring", stopX, footerY, stopW, 74,
               running ? "Stop capturing and sending audio" : "Resume saved mix")) {
         if (running) {
@@ -660,8 +681,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
     }
     float stateX = rightX + rightW - stateW;
     c.rect(stateX, footerY, stateW, 73, card, 18);
-    c.dl->AddCircleFilled(c.p(stateX + 64, footerY + 36), 8 * scale_, running ? green : gray, 24);
-    c.text(stateX + 91, footerY + 21, running ? "Monitoring Active" : "Monitoring Stopped", 24, white, true);
+    c.centeredIconLabel(Dot, stateX + stateW / 2, footerY + 36.5f,
+                        running ? "Monitoring Active" : "Monitoring Stopped", 24, 16, running ? green : gray);
     changed |= drawDialogs();
     ImGui::End();
     ImGui::PopFont();
