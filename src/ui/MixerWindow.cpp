@@ -442,8 +442,6 @@ bool MixerWindow::draw(float dt, int width, int height) {
     // A mouse drag region, not a focusable control with the shared purple outline.
     ImGui::SetCursorScreenPos(c.p(320, 12));
     ImGui::InvisibleButton("Move window", {(w - 590) * scale_, 75 * scale_});
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Drag to move the window");
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ReleaseCapture();
         PostMessageW(static_cast<HWND>(window_), WM_NCLBUTTONDOWN, HTCAPTION, 0);
