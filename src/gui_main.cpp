@@ -124,14 +124,23 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case WM_NCHITTEST: {
-            if (IsZoomed(hwnd)) return HTCLIENT;
-            POINT pt{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt);
-            RECT rc{}; GetClientRect(hwnd,&rc);
-            const int edge=7;
-            const bool left=pt.x<edge,right=pt.x>=rc.right-edge,top=pt.y<edge,bottom=pt.y>=rc.bottom-edge;
-            if(top)return left?HTTOPLEFT:right?HTTOPRIGHT:HTTOP;
-            if(bottom)return left?HTBOTTOMLEFT:right?HTBOTTOMRIGHT:HTBOTTOM;
-            if(left)return HTLEFT; if(right)return HTRIGHT;
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            if (!IsZoomed(hwnd)) {
+                const int edge = 7;
+                const bool left = pt.x < edge, right = pt.x >= rc.right - edge,
+                           top = pt.y < edge, bottom = pt.y >= rc.bottom - edge;
+                if (top) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
+                if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
+                if (left) return HTLEFT;
+                if (right) return HTRIGHT;
+            }
+            // Give Windows the press as well as the release. Starting a native
+            // move from an active ImGui button left that button stuck down.
+            if (app && app->visible && app->mixer.hitTitleBar(pt.x, pt.y, rc.right, rc.bottom))
+                return HTCAPTION;
             return HTCLIENT;
         }
         case WM_DPICHANGED: {

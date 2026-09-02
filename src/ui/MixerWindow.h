@@ -10,6 +10,7 @@ class MixerWindow {
   public:
     void init(AudioEngine *engine, Config *config, void *window);
     bool draw(float dt, int width, int height);
+    bool hitTitleBar(int x, int y, int width, int height) const;
     bool exitRequested() const {
         return exitRequested_;
     }

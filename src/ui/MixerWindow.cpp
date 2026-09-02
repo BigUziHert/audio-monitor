@@ -439,13 +439,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
     c.rect(1, 1, w - 2, h - 2, background, 22);
     c.icon(Wave, 65, 54, purple, 40);
     c.text(109, 36, "Audio Monitor", 31, white, true);
-    // A mouse drag region, not a focusable control with the shared purple outline.
-    ImGui::SetCursorScreenPos(c.p(320, 12));
-    ImGui::InvisibleButton("Move window", {(w - 590) * scale_, 75 * scale_});
-    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-        ReleaseCapture();
-        PostMessageW(static_cast<HWND>(window_), WM_NCLBUTTONDOWN, HTCAPTION, 0);
-    }
+    // The native WM_NCHITTEST handler owns title-bar dragging. An ImGui button
+    // here would retain its pressed state when Windows consumes the release.
     const Icon controls[] = {Minus, Maximize, Close};
     const char *tips[] = {"Minimize to tray", "Maximize / restore",
                           config_->closeToTray ? "Close to tray" : "Exit Audio Monitor"};
@@ -672,6 +667,15 @@ bool MixerWindow::draw(float dt, int width, int height) {
     ImGui::PopFont();
     ImGui::PopStyleVar(2);
     return changed;
+}
+
+bool MixerWindow::hitTitleBar(int x, int y, int width, int height) const {
+    // Let clicks dismiss menus, and keep modal dialogs in charge of input.
+    if (!ImGui::GetCurrentContext() ||
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        return false;
+    const float scale = std::min(float(width) / 1600.f, float(height) / 986.f);
+    return x >= 320 * scale && x < width - 270 * scale && y >= 12 * scale && y < 87 * scale;
 }
 
 bool MixerWindow::drawDialogs() {
