@@ -146,10 +146,6 @@ int main(int argc, char** argv) {
     Config cfg = Config::load(&usedDefaults);
     std::printf("config: %s%s\n", u8(Config::configPath()).c_str(),
                 usedDefaults ? "  (not found -- using autodetected defaults)" : "");
-    std::printf("matching  game~\"%s\"  chat~\"%s\"  mic~\"%s\"  out~\"%s\"\n\n",
-                u8(cfg.game.deviceNameMatch).c_str(), u8(cfg.chat.deviceNameMatch).c_str(),
-                u8(cfg.mic.deviceNameMatch).c_str(),  u8(cfg.output.deviceNameMatch).c_str());
-
     // Raw, unbuffered breadcrumbs. Deliberately not going through the logging
     // subsystem: we already learned the hard way that a crash here leaves no
     // trace, and this narrows it to a single statement.
@@ -174,8 +170,7 @@ int main(int argc, char** argv) {
     // still receives everything.
     log::setEcho(false);
 
-    const char* names[kChannelCount] = { "Game", "Chat", "Mic " };
-    MeterBallistics ball[kChannelCount + 1];
+    std::vector<MeterBallistics> ball(cfg.sources.size() + 1);
 
     auto last = std::chrono::steady_clock::now();
     while (!g_stop) {
@@ -199,12 +194,12 @@ int main(int argc, char** argv) {
         }
         std::printf("\n");
 
-        for (int i = 0; i < kChannelCount; ++i) {
+        for (int i = 0; i < static_cast<int>(cfg.sources.size()); ++i) {
             const ChannelStatus cs = engine.channelStatus(i);
             ball[i].update(std::max(engine.channelPeak(i).l.take(),
                                     engine.channelPeak(i).r.take()), dt);
 
-            std::printf("%s %-7s %-7s ", names[i], stateName(cs.state),
+            std::printf("%s %-7s %-7s ", cfg.sources[i].label.c_str(), stateName(cs.state),
                         cs.flowing ? "flowing" : "quiet");
             printMeterBar(ball[i].levelDb());
             std::printf(" %6.1f dB  depth=%5u  ratio=%.6f  %uHz\n",
@@ -217,11 +212,11 @@ int main(int argc, char** argv) {
             }
         }
 
-        ball[kChannelCount].update(std::max(engine.outputPeak().l.take(),
+        ball[cfg.sources.size()].update(std::max(engine.outputPeak().l.take(),
                                             engine.outputPeak().r.take()), dt);
         std::printf("\nMIX  ");
-        printMeterBar(ball[kChannelCount].levelDb());
-        std::printf(" %6.1f dB\n", ball[kChannelCount].levelDb());
+        printMeterBar(ball[cfg.sources.size()].levelDb());
+        std::printf(" %6.1f dB\n", ball[cfg.sources.size()].levelDb());
     }
 
     std::printf("\nstopping...\n");

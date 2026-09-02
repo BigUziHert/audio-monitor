@@ -59,6 +59,7 @@ void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
         lastError_.clear();
     }
     quit_.store(false, std::memory_order_relaxed);
+    underruns_.store(0, std::memory_order_relaxed);
     wantsRetry_.store(false, std::memory_order_release);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     state_.store(StreamState::Opening, std::memory_order_release);

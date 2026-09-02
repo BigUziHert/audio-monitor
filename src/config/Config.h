@@ -15,8 +15,16 @@
 #include <vector>
 
 namespace audiomon {
+class JsonValue;
+
+inline constexpr int kMaxSources = 16;
+enum class SourceKind { Playback, Microphone, Application };
 
 struct ChannelConfig {
+    std::string  label;
+    SourceKind   kind = SourceKind::Playback;
+    bool         enabled = true;
+    std::wstring processPath;      // stable identity; never persist a process ID
     std::wstring deviceId;         // exact endpoint id, if known
     std::wstring deviceNameMatch;  // case-insensitive substring fallback
     float        gain  = 1.0f;     // linear, 0..1
@@ -24,10 +32,11 @@ struct ChannelConfig {
 };
 
 struct Config {
-    ChannelConfig game;
-    ChannelConfig chat;
-    ChannelConfig mic;
+    std::vector<ChannelConfig> sources;
     ChannelConfig output;
+
+    bool     mono             = false;
+    bool     closeToTray      = false;
 
     bool     exclusiveOutput  = true;
     bool     startWithWindows = false;
@@ -39,6 +48,8 @@ struct Config {
     uint32_t bufferMillis     = 50;   // per-channel drift setpoint
 
     static Config defaults();
+    static Config fromJson(const JsonValue& root);
+    JsonValue toJson() const;
 
     // %APPDATA%\audio-monitor, created if absent. Empty on failure.
     static std::wstring appDataDir();

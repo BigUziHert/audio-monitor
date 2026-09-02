@@ -11,10 +11,15 @@
 namespace audiomon {
 namespace {
 
-constexpr int kConfigVersion = 1;
+constexpr int kConfigVersion = 2;
 
 JsonValue channelToJson(const ChannelConfig& c) {
     JsonValue v = JsonValue::object();
+    v.set("label", JsonValue(c.label));
+    v.set("kind", JsonValue(c.kind == SourceKind::Application ? "application" :
+                            c.kind == SourceKind::Microphone ? "microphone" : "playback"));
+    v.set("enabled", JsonValue(c.enabled));
+    v.set("processPath", JsonValue(toUtf8(c.processPath)));
     v.set("deviceId",   JsonValue(toUtf8(c.deviceId)));
     v.set("deviceName", JsonValue(toUtf8(c.deviceNameMatch)));
     v.set("gain",       JsonValue(static_cast<double>(c.gain)));
@@ -24,7 +29,15 @@ JsonValue channelToJson(const ChannelConfig& c) {
 
 ChannelConfig channelFromJson(const JsonValue* v, const ChannelConfig& fallback) {
     if (!v || !v->isObject()) return fallback;
-    ChannelConfig c;
+    ChannelConfig c = fallback;
+    if (auto x = v->find("label")) c.label = x->asString(c.label);
+    if (auto x = v->find("enabled")) c.enabled = x->asBool(c.enabled);
+    if (auto x = v->find("processPath")) c.processPath = toWide(x->asString(""));
+    if (auto x = v->find("kind")) {
+        auto kind = x->asString("playback");
+        c.kind = kind == "application" ? SourceKind::Application :
+                 kind == "microphone" ? SourceKind::Microphone : SourceKind::Playback;
+    }
     const JsonValue* id   = v->find("deviceId");
     const JsonValue* name = v->find("deviceName");
     const JsonValue* gain = v->find("gain");
@@ -79,12 +92,16 @@ Config Config::defaults() {
     // Anything ambiguous is refused outright at resolve time and reported, so
     // a wrong guess here shows up as an error rather than as audio quietly
     // going somewhere else.
-    c.game.deviceNameMatch   = L"Arctis Pro Wireless Game";
-    c.chat.deviceNameMatch   = L"Arctis Pro Wireless Chat";
-    c.mic.deviceNameMatch    = L"USB Advanced Audio Device";
+    ChannelConfig game, chat, mic;
+    game.label = "Headphones";
+    chat.label = "Chat Audio";
+    mic.label = "Microphone";
+    mic.kind = SourceKind::Microphone;
+    game.deviceNameMatch = L"Arctis Pro Wireless Game";
+    chat.deviceNameMatch = L"Arctis Pro Wireless Chat";
+    mic.deviceNameMatch = L"USB Advanced Audio Device";
+    c.sources = {game, chat, mic};
     c.output.deviceNameMatch = L"Elgato 4K";
-
-    c.game.gain = c.chat.gain = c.mic.gain = c.output.gain = 1.0f;
     return c;
 }
 
@@ -123,11 +140,29 @@ Config Config::load(bool* usedDefaults) {
         return def;
     }
 
-    Config c;
-    c.game   = channelFromJson(root.find("game"),   def.game);
-    c.chat   = channelFromJson(root.find("chat"),   def.chat);
-    c.mic    = channelFromJson(root.find("mic"),    def.mic);
+    if (usedDefaults) *usedDefaults = false;
+    return fromJson(root);
+}
+
+Config Config::fromJson(const JsonValue& root) {
+    const Config def = defaults();
+    Config c = def;
+    if (const auto* sources = root.find("sources"); sources && sources->isArray()) {
+        c.sources.clear();
+        for (const auto& source : sources->items()) {
+            if (!source.isObject()) continue;
+            c.sources.push_back(channelFromJson(&source, ChannelConfig{}));
+            if (c.sources.size() == kMaxSources) break;
+        }
+    } else {
+        // Migrate the original three-source configuration without losing pins or gains.
+        c.sources[0] = channelFromJson(root.find("game"), def.sources[0]);
+        c.sources[1] = channelFromJson(root.find("chat"), def.sources[1]);
+        c.sources[2] = channelFromJson(root.find("mic"), def.sources[2]);
+    }
     c.output = channelFromJson(root.find("output"), def.output);
+    if (auto v = root.find("mono")) c.mono = v->asBool(false);
+    if (auto v = root.find("closeToTray")) c.closeToTray = v->asBool(false);
 
     if (const JsonValue* v = root.find("exclusiveOutput"))  c.exclusiveOutput  = v->asBool(def.exclusiveOutput);
     if (const JsonValue* v = root.find("startWithWindows")) c.startWithWindows = v->asBool(def.startWithWindows);
@@ -137,27 +172,43 @@ Config Config::load(bool* usedDefaults) {
         c.bufferMillis = static_cast<uint32_t>(m < 20 ? 20 : (m > 250 ? 250 : m));
     }
 
-    if (usedDefaults) *usedDefaults = false;
     return c;
 }
 
-bool Config::save() const {
-    const std::wstring path = configPath();
-    if (path.empty()) return false;
-
+JsonValue Config::toJson() const {
     JsonValue root = JsonValue::object();
     root.set("version",          JsonValue(kConfigVersion));
-    root.set("game",             channelToJson(game));
-    root.set("chat",             channelToJson(chat));
-    root.set("mic",              channelToJson(mic));
+    JsonValue sourcesJson = JsonValue::array();
+    for (const auto& source : sources) sourcesJson.push(channelToJson(source));
+    root.set("sources", sourcesJson);
+    root.set("mono", JsonValue(mono));
+    root.set("closeToTray", JsonValue(closeToTray));
     root.set("output",           channelToJson(output));
     root.set("exclusiveOutput",  JsonValue(exclusiveOutput));
     root.set("startWithWindows", JsonValue(startWithWindows));
     root.set("startMinimized",   JsonValue(startMinimized));
     root.set("bufferMillis",     JsonValue(static_cast<double>(bufferMillis)));
 
-    const std::string text = root.dump(2);
+    return root;
+}
 
+bool Config::save() const {
+    const std::wstring path = configPath();
+    if (path.empty()) return false;
+    const std::string text = toJson().dump(2);
+    // Keep the original settings when migrating the three-input app. This also
+    // provides a way back if the user tests this branch then runs an older build.
+    std::string previous;
+    if (readWholeFile(path, previous)) {
+        const auto old = JsonValue::parse(previous);
+        if (old.isObject() && !old.find("sources")) {
+            if (!CopyFileW(path.c_str(), (path + L".v1.bak").c_str(), TRUE) &&
+                GetLastError() != ERROR_FILE_EXISTS) {
+                LOG_WARN("config: could not preserve version 1 settings; save deferred");
+                return false;
+            }
+        }
+    }
     // Write to a sibling temp file, then swap it in. A crash part-way through
     // leaves the previous config intact rather than a truncated one.
     const std::wstring tmp = path + L".tmp";

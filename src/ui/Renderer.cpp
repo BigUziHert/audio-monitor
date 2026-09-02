@@ -1,6 +1,7 @@
 #include "ui/Renderer.h"
 #include "ui/Theme.h"
 #include "util/Log.h"
+#include "util/Text.h"
 
 #include <windows.h>
 #include <imgui.h>
@@ -85,6 +86,11 @@ bool Renderer::ensureCreated(void* hwnd) {
     // No imgui.ini: window geometry is ours to manage, and writing a settings
     // file on every move is pointless churn for a fixed-layout panel.
     io.IniFilename = nullptr;
+    wchar_t windowsDir[MAX_PATH]{};
+    GetWindowsDirectoryW(windowsDir, MAX_PATH);
+    const auto fonts = toUtf8(std::wstring(windowsDir) + L"\\Fonts\\");
+    io.Fonts->AddFontFromFileTTF((fonts + "segoeui.ttf").c_str(), 20.0f);
+    io.Fonts->AddFontFromFileTTF((fonts + "seguisb.ttf").c_str(), 24.0f);
 
     applyTheme();
 

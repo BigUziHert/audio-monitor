@@ -27,6 +27,7 @@ float smoothingCoef(double seconds, uint32_t rate) {
 } // namespace
 
 AudioEngine::AudioEngine() {
+    visualSamples_.init(8192);
     for (auto& ch : channels_) {
         ch = std::make_unique<Channel>();
         ch->scratch.assign(static_cast<size_t>(kMaxBlockFrames) * 2, 0.0f);
@@ -36,6 +37,8 @@ AudioEngine::AudioEngine() {
 AudioEngine::~AudioEngine() { stop(); }
 
 bool AudioEngine::start(const Config& config) {
+    stop();
+    sourceCount_ = std::min(config.sources.size(), size_t(kMaxSources));
     LOG_INFO("engine: start");
     {
         std::lock_guard<std::mutex> lock(configMutex_);
@@ -50,26 +53,25 @@ bool AudioEngine::start(const Config& config) {
 
     LOG_INFO("engine: device manager up");
 
-    channels_[kGame]->stream.configure("game", CaptureMode::Loopback);
-    channels_[kChat]->stream.configure("chat", CaptureMode::Loopback);
-    channels_[kMic]->stream.configure("mic",  CaptureMode::Microphone);
-    LOG_INFO("engine: rings allocated");
-
-    channels_[kGame]->gain.store(config.game.gain, std::memory_order_relaxed);
-    channels_[kChat]->gain.store(config.chat.gain, std::memory_order_relaxed);
-    channels_[kMic]->gain.store(config.mic.gain,  std::memory_order_relaxed);
-    channels_[kGame]->muted.store(config.game.muted, std::memory_order_relaxed);
-    channels_[kChat]->muted.store(config.chat.muted, std::memory_order_relaxed);
-    channels_[kMic]->muted.store(config.mic.muted,  std::memory_order_relaxed);
-    outputGain_.store(config.output.gain, std::memory_order_relaxed);
-    bufferMillis_.store(config.bufferMillis, std::memory_order_relaxed);
-
-    LOG_INFO("engine: starting game capture");
-    channels_[kGame]->stream.start(devices_, { config.game.deviceId, config.game.deviceNameMatch });
-    LOG_INFO("engine: starting chat capture");
-    channels_[kChat]->stream.start(devices_, { config.chat.deviceId, config.chat.deviceNameMatch });
-    LOG_INFO("engine: starting mic capture");
-    channels_[kMic]->stream.start(devices_,  { config.mic.deviceId,  config.mic.deviceNameMatch });
+    for (size_t i = 0; i < sourceCount_; ++i) {
+        const auto& source = config.sources[i];
+        auto& channel = *channels_[i];
+        auto mode = source.kind == SourceKind::Application ? CaptureMode::Application :
+                    source.kind == SourceKind::Microphone ? CaptureMode::Microphone : CaptureMode::Loopback;
+        channel.stream.configure(source.label.c_str(), mode);
+        channel.gain.store(source.gain);
+        channel.muted.store(source.muted || !source.enabled);
+        channel.peak.l.take(); channel.peak.r.take();
+        if (source.enabled) channel.stream.start(devices_, source.kind == SourceKind::Application
+            ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
+    }
+    outputGain_.store(config.output.gain);
+    outputMuted_.store(config.output.muted);
+    mono_.store(config.mono);
+    mixMode_.reset(config.mono);
+    outputPeak_.l.take(); outputPeak_.r.take();
+    visualSamples_.dropAllFromConsumer();
+    bufferMillis_.store(config.bufferMillis);
 
     LOG_INFO("engine: starting render");
     render_.start(devices_, { config.output.deviceId, config.output.deviceNameMatch },
@@ -96,13 +98,27 @@ void AudioEngine::stop() {
 }
 
 void AudioEngine::setGain(int channel, float g) noexcept {
-    if (channel < 0 || channel >= kChannelCount) return;
+    if (channel < 0 || size_t(channel) >= sourceCount_) return;
     channels_[channel]->gain.store(std::clamp(g, 0.0f, 4.0f), std::memory_order_relaxed);
 }
 
 void AudioEngine::setMuted(int channel, bool m) noexcept {
-    if (channel < 0 || channel >= kChannelCount) return;
-    channels_[channel]->muted.store(m, std::memory_order_relaxed);
+    if (channel < 0 || size_t(channel) >= sourceCount_) return;
+    std::lock_guard<std::mutex> lock(configMutex_);
+    config_.sources[channel].muted = m;
+    channels_[channel]->muted.store(m || !config_.sources[channel].enabled, std::memory_order_relaxed);
+}
+
+void AudioEngine::setEnabled(int channel, bool enabled) {
+    if (channel < 0 || size_t(channel) >= sourceCount_) return;
+    std::lock_guard<std::mutex> lock(configMutex_);
+    auto& source = config_.sources[channel];
+    source.enabled = enabled;
+    channels_[channel]->muted.store(source.muted || !enabled);
+    if (!running()) return;
+    if (enabled) channels_[channel]->stream.start(devices_, source.kind == SourceKind::Application
+        ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
+    else channels_[channel]->stream.stop();
 }
 
 void AudioEngine::setOutputGain(float g) noexcept {
@@ -134,8 +150,8 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
     // can differ per channel), so renderMix derives it once each source rate
     // is known. Setting it from the render rate here would hold a 96 kHz
     // source at half the intended depth.
-    for (auto& up : channels_) {
-        Channel& ch = *up;
+    for (size_t i = 0; i < sourceCount_; ++i) {
+        Channel& ch = *channels_[i];
         ch.lastSrcRate  = 0;             // force a recompute on the next block
         ch.lastBufferMs = 0;
         ch.targetDepth  = 0.0;
@@ -143,11 +159,11 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
         ch.priming      = true;
         ch.presence.configure(uint32_t(double(sampleRate) * kFadeSeconds));
         ch.presence.reset(0.0f);
-        ch.smoothedGain = ch.gain.load(std::memory_order_relaxed);
+        ch.smoothedGain = ch.muted.load(std::memory_order_relaxed) ? 0.0f : ch.gain.load(std::memory_order_relaxed);
         // Ring holds stale audio from before the rebuild; start clean.
         ch.stream.ring().dropAllFromConsumer();
     }
-    smoothedOutputGain_ = outputGain_.load(std::memory_order_relaxed);
+    smoothedOutputGain_ = outputMuted_.load(std::memory_order_relaxed) ? 0.0f : outputGain_.load(std::memory_order_relaxed);
 }
 
 void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
@@ -171,8 +187,8 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
     // instant.
     const float gainCoef = smoothingCoef(kFadeSeconds, rate);
 
-    for (auto& up : channels_) {
-        Channel& ch = *up;
+    for (size_t i = 0; i < sourceCount_; ++i) {
+        Channel& ch = *channels_[i];
 
         // A timeline break (discontinuity, reconnect, overflow drop) makes the
         // controller's history meaningless.
@@ -293,13 +309,16 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
     }
 
     // Output trim and master meter.
-    const float outTarget = outputGain_.load(std::memory_order_relaxed);
+    const float outTarget = outputMuted_.load(std::memory_order_relaxed) ? 0.0f : outputGain_.load(std::memory_order_relaxed);
+    const bool mono = mono_.load(std::memory_order_relaxed);
+    const float modeStep = 1.0f / std::max(1.0f, float(rate) * 0.005f);
     float og = smoothedOutputGain_;
     float opl = 0.0f, opr = 0.0f;
     for (uint32_t f = 0; f < frames; ++f) {
         og += (outTarget - og) * gainCoef;
-        const float l = dst[f * 2]     * og;
-        const float r = dst[f * 2 + 1] * og;
+        float l = dst[f * 2]     * og;
+        float r = dst[f * 2 + 1] * og;
+        mixMode_.process(l, r, mono, modeStep);
         dst[f * 2]     = l;
         dst[f * 2 + 1] = r;
         const float al = std::fabs(l), ar = std::fabs(r);
@@ -309,6 +328,9 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
     smoothedOutputGain_ = og;
     outputPeak_.l.publish(opl);
     outputPeak_.r.publish(opr);
+    const uint32_t visualCount = std::min(frames, visualSamples_.beginWrite());
+    for (uint32_t f = 0; f < visualCount; ++f) visualSamples_.writeFrame(f, dst[f * 2], dst[f * 2 + 1]);
+    visualSamples_.endWrite(visualCount);
 
 #if defined(AUDIOMON_TRACE_FIRST_MIX)
     if (firstMix) LOG_INFO("mix: first block completed");
@@ -352,25 +374,19 @@ void AudioEngine::supervisorMain() {
         // goes stale the moment the UI changes a device -- and Restore
         // defaults changes four at once -- so a channel that failed fast on
         // its new name would have been reopened on its OLD pinned device.
-        auto captureRef = [this](int i) {
-            std::lock_guard<std::mutex> lock(configMutex_);
-            const ChannelConfig& c = (i == kGame) ? config_.game
-                                   : (i == kChat) ? config_.chat
-                                                  : config_.mic;
-            return DeviceRef{ c.deviceId, c.deviceNameMatch };
-        };
         auto outputRef = [this](bool& exclusive) {
             std::lock_guard<std::mutex> lock(configMutex_);
             exclusive = config_.exclusiveOutput;
             return DeviceRef{ config_.output.deviceId, config_.output.deviceNameMatch };
         };
 
-        for (int i = 0; i < kChannelCount; ++i) {
+        for (size_t i = 0; i < sourceCount_; ++i) {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            const auto& source = config_.sources[i];
             auto& ch = *channels_[i];
-            if (ch.stream.state() != StreamState::Failed) continue;
-            LOG_INFO("supervisor: restarting capture '%s' (%s)",
-                     ch.stream.label().c_str(), ch.stream.lastError().c_str());
-            ch.stream.start(devices_, captureRef(i));
+            if (!source.enabled || ch.stream.state() != StreamState::Failed) continue;
+            ch.stream.start(devices_, source.kind == SourceKind::Application
+                ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
         }
 
         // Passivity check. If the endpoint we hold exclusively has since become
@@ -405,7 +421,7 @@ void AudioEngine::supervisorMain() {
 
 ChannelStatus AudioEngine::channelStatus(int channel) const {
     ChannelStatus s;
-    if (channel < 0 || channel >= kChannelCount) return s;
+    if (channel < 0 || size_t(channel) >= sourceCount_) return s;
     const Channel& ch = *channels_[channel];
     s.state      = ch.stream.state();
     s.flowing    = ch.stream.flowing();
@@ -413,6 +429,8 @@ ChannelStatus AudioEngine::channelStatus(int channel) const {
     s.sampleRate = ch.stream.sampleRate();
     s.ratio      = ch.ratioOut.load(std::memory_order_relaxed);
     s.dropped    = ch.stream.droppedFrames();
+    s.deviceId   = ch.stream.resolvedId();
+    s.processId  = ch.stream.processId();
     s.deviceName = ch.stream.resolvedName();
     s.error      = ch.stream.lastError();
     return s;
@@ -425,6 +443,7 @@ OutputStatus AudioEngine::outputStatus() const {
     s.sampleRate  = render_.sampleRate();
     s.blockFrames = render_.blockFrames();
     s.underruns   = render_.underruns();
+    s.deviceId    = render_.resolvedId();
     s.deviceName  = render_.resolvedName();
     s.error       = render_.lastError();
     return s;
@@ -433,18 +452,14 @@ OutputStatus AudioEngine::outputStatus() const {
 void AudioEngine::setChannelDevice(int channel, const DeviceRef& ref) {
     {
         std::lock_guard<std::mutex> lock(configMutex_);
-        ChannelConfig* target = nullptr;
-        switch (channel) {
-            case kGame: target = &config_.game;   break;
-            case kChat: target = &config_.chat;   break;
-            case kMic:  target = &config_.mic;    break;
-            default:    target = &config_.output; break;
-        }
+        ChannelConfig* target = channel >= 0 && size_t(channel) < config_.sources.size()
+            ? &config_.sources[channel] : &config_.output;
         target->deviceId        = ref.id;
         target->deviceNameMatch = ref.nameMatch;
     }
 
-    if (channel >= 0 && channel < kChannelCount) {
+    if (!running()) return;
+    if (channel >= 0 && size_t(channel) < sourceCount_) {
         channels_[channel]->stream.start(devices_, ref);
     } else {
         // Read the flag out from under the lock first. start() joins the
@@ -462,18 +477,13 @@ void AudioEngine::updateConfigFromRuntime(Config& config) const {
     auto refresh = [](ChannelConfig& c, const std::wstring& id) {
         if (!id.empty()) c.deviceId = id;
     };
-    refresh(config.game,   channels_[kGame]->stream.resolvedId());
-    refresh(config.chat,   channels_[kChat]->stream.resolvedId());
-    refresh(config.mic,    channels_[kMic]->stream.resolvedId());
+    for (size_t i = 0; i < std::min(sourceCount_, config.sources.size()); ++i) {
+        if (config.sources[i].kind != SourceKind::Application)
+            refresh(config.sources[i], channels_[i]->stream.resolvedId());
+    }
     refresh(config.output, render_.resolvedId());
+    // UI owns faders and toggles, including edits made while monitoring is stopped.
 
-    config.game.gain    = channels_[kGame]->gain.load(std::memory_order_relaxed);
-    config.chat.gain    = channels_[kChat]->gain.load(std::memory_order_relaxed);
-    config.mic.gain     = channels_[kMic]->gain.load(std::memory_order_relaxed);
-    config.output.gain  = outputGain_.load(std::memory_order_relaxed);
-    config.game.muted   = channels_[kGame]->muted.load(std::memory_order_relaxed);
-    config.chat.muted   = channels_[kChat]->muted.load(std::memory_order_relaxed);
-    config.mic.muted    = channels_[kMic]->muted.load(std::memory_order_relaxed);
 }
 
 } // namespace audiomon

@@ -1,3 +1,7 @@
+#include <numbers>
+#include "audio/MixMode.h"
+#include "audio/Overlap.h"
+#include "audio/Spectrum.h"
 // Host-native tests for the parts of the mixer that are not Windows-specific:
 // the SPSC ring, the drift resampler, the rate controller and the config JSON.
 //
@@ -81,7 +85,7 @@ static void testResamplerUnityIsExact() {
     rs.reset();
 
     const double freq = 440.0, fs = 48000.0;
-    auto sample = [&](long n) { return float(std::sin(2.0 * M_PI * freq * double(n) / fs)); };
+    auto sample = [&](long n) { return float(std::sin(2.0 * std::numbers::pi * freq * double(n) / fs)); };
 
     long inWritten = 0;      // next input frame index to generate
     long outCount  = 0;      // total output frames produced
@@ -120,7 +124,7 @@ static void testResamplerInterpolates() {
     rs.reset();
 
     const double freq = 440.0, fs = 48000.0, ratio = 0.5;
-    auto sample = [&](double n) { return std::sin(2.0 * M_PI * freq * n / fs); };
+    auto sample = [&](double n) { return std::sin(2.0 * std::numbers::pi * freq * n / fs); };
 
     long inWritten = 0, outCount = 0;
     double maxErr = 0.0;
@@ -193,7 +197,7 @@ static void testDriftConvergence(double ppm, const char* label) {
         const uint32_t space = r.beginWrite();
         if (toWrite > space) { overflows++; toWrite = space; }
         for (uint32_t i = 0; i < toWrite; ++i) {
-            const float s = float(std::sin(2.0 * M_PI * 220.0 * phase / fs));
+            const float s = float(std::sin(2.0 * std::numbers::pi * 220.0 * phase / fs));
             r.writeFrame(i, s, s);
             phase += 1.0;
         }
@@ -293,7 +297,7 @@ static void testDisturbanceRecovery() {
             const uint32_t space = r.beginWrite();
             if (n > space) n = space;
             for (uint32_t i = 0; i < n; ++i) {
-                const float s = float(std::sin(2.0 * M_PI * 220.0 * phase / fs));
+                const float s = float(std::sin(2.0 * std::numbers::pi * 220.0 * phase / fs));
                 r.writeFrame(i, s, s);
                 phase += 1.0;
             }
@@ -373,7 +377,7 @@ static void testLiveSetpointChange(double fromMs, double toMs, const char* label
         const uint32_t space = r.beginWrite();
         if (n > space) n = space;
         for (uint32_t i = 0; i < n; ++i) {
-            const float v = float(std::sin(2.0 * M_PI * 220.0 * phase / fs));
+            const float v = float(std::sin(2.0 * std::numbers::pi * 220.0 * phase / fs));
             r.writeFrame(i, v, v);
             phase += 1.0;
         }
@@ -518,6 +522,37 @@ static void testJson() {
     CHECK(u.find("k")->asString("") == "\xc3\xa9" "A", "utf8 decode");
 }
 
+static void testMixModeAndRouting() {
+    MixMode mode;
+    float l=.8f,r=.2f;
+    mode.process(l,r,false,1.0f);
+    CHECK(std::fabs(l-.8f)<1e-6 && std::fabs(r-.2f)<1e-6,"stereo retains left/right");
+    mode.process(l,r,true,1.0f);
+    CHECK(std::fabs(l-.5f)<1e-6 && l==r,"mono averages, does not double gain");
+    l=1;r=-1;mode.process(l,r,true,1.0f);
+    CHECK(l==0 && r==0,"mono cancels opposite polarity");
+    mode.reset(false);float previous=1;
+    for(int i=0;i<240;++i){l=1;r=0;mode.process(l,r,true,1.f/240);CHECK(std::fabs(l-previous)<.003f,"mode switch ramps smoothly");previous=l;}
+    CHECK(std::fabs(l-r)<.0001f,"mono ramp converges in 5 ms at 48 kHz");
+    SourceRoute device;device.audible=true;device.endpoint=L"speakers";
+    SourceRoute app;app.kind=SourceKind::Application;app.audible=true;app.processId=42;app.routingKnown=true;app.appEndpoints={L"speakers"};
+    CHECK(sourceOverlap(device,app)==Overlap::Confirmed,"app routed through captured device warns");
+    app.appEndpoints={L"chat"};CHECK(sourceOverlap(device,app)==Overlap::None,"separate playback route does not warn");
+    app.routingKnown=false;CHECK(sourceOverlap(device,app)==Overlap::Possible,"unknown routing qualified as possible");
+    app.audible=false;CHECK(sourceOverlap(device,app)==Overlap::None,"muting/excluding clears warning");
+    CHECK(sourceOverlap(device,device)==Overlap::Confirmed,"same endpoint twice warns");
+    SourceRoute mic=device;mic.kind=SourceKind::Microphone;CHECK(sourceOverlap(device,mic)==Overlap::None,"microphone is not playback overlap");
+    app.audible=true;CHECK(sourceOverlap(app,app)==Overlap::Confirmed,"same app twice warns");
+    StereoRing visual;visual.init(4096);Spectrum spectrum;
+    for(uint32_t i=0;i<2048;++i){float v=std::sin(6.283185307f*float(i)*1000.f/48000.f);visual.writeFrame(i,v,-v);}visual.endWrite(2048);
+    spectrum.update(visual,48000,.016f,true);
+    auto peak=std::max_element(spectrum.levels.begin(),spectrum.levels.end());
+    CHECK(*peak>-2.f,"spectrum sees opposite-polarity stereo without cancellation");
+    CHECK(peak-spectrum.levels.begin()>30 && peak-spectrum.levels.begin()<38,"1 kHz maps to the correct log frequency band");
+    for(int i=0;i<200;++i)spectrum.update(visual,48000,.016f,false);
+    CHECK(*std::max_element(spectrum.levels.begin(),spectrum.levels.end())<=-60.f,"stopped spectrum decays to silence");
+}
+
 int main() {
     std::printf("== audio-monitor DSP/config tests ==\n\n");
     testRing();
@@ -533,6 +568,7 @@ int main() {
     testFadeLandsOnTheStarvePoint();
     testMeter();
     testJson();
+    testMixModeAndRouting();
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED",
                 g_failures, g_failures == 1 ? "" : "s");

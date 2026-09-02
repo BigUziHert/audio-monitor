@@ -2,8 +2,8 @@
 //
 // The mixer.
 //
-// Topology: three capture threads, each writing its own SPSC ring, and one
-// render thread that reads all three, resamples them onto the render clock,
+// Topology: one capture thread per enabled source, each writing its own SPSC
+// ring, and one render thread that resamples them onto the render clock,
 // sums, and writes the Elgato. A supervisor thread handles every device
 // rebuild so neither the render thread nor a COM notification callback ever
 // does that work.
@@ -19,6 +19,7 @@
 #include "audio/Resampler.h"
 #include "audio/Meter.h"
 #include "audio/FadeEnvelope.h"
+#include "audio/MixMode.h"
 #include "config/Config.h"
 
 #include <array>
@@ -30,8 +31,7 @@
 
 namespace audiomon {
 
-inline constexpr int kChannelCount = 3;
-enum ChannelIndex { kGame = 0, kChat = 1, kMic = 2 };
+
 
 struct ChannelStatus {
     StreamState  state      = StreamState::Stopped;
@@ -40,6 +40,8 @@ struct ChannelStatus {
     uint32_t     sampleRate = 0;
     double       ratio      = 1.0;
     uint64_t     dropped    = 0;
+    std::wstring deviceId;
+    uint32_t processId = 0;
     std::wstring deviceName;
     std::string  error;
 };
@@ -50,6 +52,7 @@ struct OutputStatus {
     uint32_t     sampleRate  = 0;
     uint32_t     blockFrames = 0;
     uint64_t     underruns   = 0;
+    std::wstring deviceId;
     std::wstring deviceName;
     std::string  error;
 };
@@ -67,6 +70,11 @@ public:
     void setGain(int channel, float linearGain) noexcept;
     void setMuted(int channel, bool muted) noexcept;
     void setOutputGain(float linearGain) noexcept;
+    void setOutputMuted(bool muted) { outputMuted_.store(muted, std::memory_order_relaxed); }
+    void setEnabled(int channel, bool enabled);
+    void setMono(bool mono) { mono_.store(mono, std::memory_order_relaxed); }
+    bool running() const { return running_.load(std::memory_order_acquire); }
+    StereoRing& visualSamples() { return visualSamples_; }
 
     // Applies at the next device open: exclusive vs shared is decided during
     // IAudioClient::Initialize and cannot be changed on a live stream.
@@ -134,11 +142,15 @@ private:
     void supervisorMain();
     void requestRebuild();
 
-    std::array<std::unique_ptr<Channel>, kChannelCount> channels_;
+    std::array<std::unique_ptr<Channel>, kMaxSources> channels_;
     RenderStream  render_;
     DeviceManager devices_;
     StereoPeak    outputPeak_;
 
+    size_t sourceCount_ = 0; // changed only while every worker is stopped
+    StereoRing visualSamples_;
+    MixMode mixMode_;
+    std::atomic<bool> mono_{false}, outputMuted_{false};
     std::atomic<float> outputGain_{1.0f};
     float              smoothedOutputGain_ = 1.0f;
 

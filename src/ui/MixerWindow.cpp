@@ -1,7 +1,5 @@
 #include "ui/MixerWindow.h"
-#include "ui/Theme.h"
 #include "util/Startup.h"
-
 #include <imgui.h>
 #include <algorithm>
 #include <cmath>
@@ -9,465 +7,857 @@
 
 namespace audiomon::ui {
 namespace {
-
-constexpr float kMeterHeight  = 13.0f;
-constexpr float kMeterGap     = 3.0f;
-
-// A mixer strip stops being readable long before it is 2000px wide: the meter
-// becomes a thin ribbon and the dB scale turns into scattered ticks. Cap the
-// content and centre it, so maximising the window gives margins rather than
-// stretching everything.
-constexpr float kMaxContentWidth = 940.0f;
-constexpr float kStripHeight     = 126.0f;
-constexpr float kFaderMinDb   = -60.0f;
-// +12 dB matches the ceiling Config accepts. Without the headroom a config
-// holding a boosted gain would display pinned at 0 dB while actually applying
-// more, and a quiet microphone could not be brought up at all.
-constexpr float kFaderMaxDb   = 12.0f;
-
-ImU32 zoneColour(float db) {
-    if (db >= kMeterRedDb)    return IM_COL32(220,  70,  60, 255);
-    if (db >= kMeterYellowDb) return IM_COL32(226, 184,  63, 255);
-    return IM_COL32(76, 175, 96, 255);
-}
-
-// One horizontal bar with OBS's three colour zones, drawn as up to three
-// segments so the zone boundaries sit at fixed dB positions rather than
-// scaling with the level.
-void drawMeterBar(ImDrawList* dl, ImVec2 pos, float width, float height,
-                  float levelDb, float holdDb, bool active) {
-    const ImU32 bg    = IM_COL32(28, 29, 33, 255);
-    const ImU32 track = IM_COL32(44, 46, 52, 255);
-
-    dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), bg, 2.0f);
-
-    if (!active) {
-        dl->AddRectFilled(pos, ImVec2(pos.x + width, pos.y + height), track, 2.0f);
-        return;
+constexpr ImU32 background = IM_COL32(9, 13, 16, 255), panel = IM_COL32(18, 24, 28, 255),
+                card = IM_COL32(23, 29, 33, 255);
+constexpr ImU32 border = IM_COL32(41, 48, 54, 255), white = IM_COL32(242, 244, 248, 255),
+                gray = IM_COL32(173, 181, 190, 255);
+constexpr ImU32 purple = IM_COL32(139, 96, 255, 255), green = IM_COL32(48, 213, 73, 255),
+                amber = IM_COL32(255, 174, 51, 255);
+constexpr ImU32 red = IM_COL32(255, 58, 96, 255), cyan = IM_COL32(14, 193, 226, 255),
+                pink = IM_COL32(230, 63, 148, 255);
+enum Icon {
+    Wave,
+    Headphones,
+    Chat,
+    Mic,
+    Speaker,
+    Muted,
+    Arrow,
+    Down,
+    Check,
+    Refresh,
+    Plus,
+    Screen,
+    Clock,
+    Link,
+    Bars,
+    Gear,
+    Stop,
+    Play,
+    Minus,
+    Maximize,
+    Close
+};
+struct Canvas {
+    ImDrawList *dl;
+    ImVec2 origin;
+    float s;
+    ImVec2 p(float x, float y) const {
+        return {origin.x + x * s, origin.y + y * s};
     }
-
-    const float norm = dbToNorm(levelDb);
-    if (norm > 0.0f) {
-        struct Zone { float startDb, endDb; };
-        const Zone zones[3] = {
-            { kMeterFloorDb,  kMeterYellowDb },
-            { kMeterYellowDb, kMeterRedDb    },
-            { kMeterRedDb,    0.0f           },
+    void rect(float x, float y, float w, float h, ImU32 color, float rounding = 14,
+              bool stroke = true) const {
+        dl->AddRectFilled(p(x, y), p(x + w, y + h), color, rounding * s);
+        if (stroke)
+            dl->AddRect(p(x, y), p(x + w, y + h), border, rounding * s, 0, s);
+    }
+    void line(float x, float y, float xx, float yy, ImU32 color, float thickness = 2) const {
+        dl->AddLine(p(x, y), p(xx, yy), color, thickness * s);
+    }
+    void text(float x, float y, const std::string &label, float size = 21, ImU32 color = white,
+              bool bold = false, float maxWidth = 0) const {
+        auto &fonts = ImGui::GetIO().Fonts->Fonts;
+        ImFont *font = bold && fonts.Size > 1 ? fonts[1] : ImGui::GetFont();
+        ImVec4 clip(origin.x + x * s, origin.y + y * s, origin.x + (x + maxWidth) * s,
+                    origin.y + (y + size + 8) * s);
+        dl->AddText(font, size * s, p(x, y), color, label.c_str(), nullptr, 0,
+                    maxWidth > 0 ? &clip : nullptr);
+    }
+    bool hit(const char *id, float x, float y, float w, float h, const char *tooltip = nullptr) const {
+        ImGui::SetCursorScreenPos(p(x, y));
+        bool clicked = ImGui::InvisibleButton(id, {w * s, h * s}, ImGuiButtonFlags_EnableNav);
+        if (ImGui::IsItemHovered() && tooltip)
+            ImGui::SetTooltip("%s", tooltip);
+        if (ImGui::IsItemFocused())
+            dl->AddRect(p(x, y), p(x + w, y + h), purple, 8 * s, 0, 2 * s);
+        return clicked;
+    }
+    void icon(Icon kind, float x, float y, ImU32 color = white, float size = 28) const {
+        Canvas c{dl, p(x - size / 2, y - size / 2), s * size / 32};
+        auto l = [&](float a, float b, float d, float e, float t = 2.5f) { c.line(a, b, d, e, color, t); };
+        auto circle = [&](float a, float b, float r) {
+            dl->AddCircle(c.p(a, b), r * c.s, color, 24, 2.5f * c.s);
         };
-        for (const Zone& z : zones) {
-            const float a = dbToNorm(z.startDb);
-            const float b = std::min(dbToNorm(z.endDb), norm);
-            if (b <= a) continue;
-            dl->AddRectFilled(ImVec2(pos.x + a * width, pos.y),
-                              ImVec2(pos.x + b * width, pos.y + height),
-                              zoneColour(z.startDb + 0.01f));
+        switch (kind) {
+        case Wave:
+            for (int i = 0; i < 5; ++i) {
+                float h = i == 2 ? 27.f : (i % 2 ? 17.f : 5.f);
+                l(3 + i * 6.f, 16 - h / 2, 3 + i * 6.f, 16 + h / 2, 3);
+            }
+            break;
+        case Headphones:
+            dl->PathArcTo(c.p(16, 16), 12 * c.s, 3.14159f, 6.28319f, 20);
+            dl->PathStroke(color, 0, 3 * c.s);
+            c.rect(3, 15, 6, 13, color, 3, false);
+            c.rect(23, 15, 6, 13, color, 3, false);
+            break;
+        case Chat:
+            circle(16, 14, 12);
+            l(7, 23, 3, 30);
+            l(3, 30, 13, 25);
+            break;
+        case Mic:
+            c.rect(12, 2, 8, 19, color, 4, false);
+            l(7, 14, 7, 19);
+            l(25, 14, 25, 19);
+            dl->PathArcTo(c.p(16, 18), 9 * c.s, 0, 3.14159f, 18);
+            dl->PathStroke(color, 0, 2.5f * c.s);
+            l(16, 27, 16, 31);
+            l(10, 31, 22, 31);
+            break;
+        case Speaker:
+        case Muted:
+            c.rect(2, 12, 6, 9, color, 1, false);
+            dl->AddTriangleFilled(c.p(7, 12), c.p(16, 5), c.p(16, 28), color);
+            if (kind == Muted) {
+                l(21, 12, 30, 22);
+                l(30, 12, 21, 22);
+            } else {
+                dl->PathArcTo(c.p(15, 16), 10 * c.s, -.8f, .8f, 12);
+                dl->PathStroke(color, 0, 2 * c.s);
+                dl->PathArcTo(c.p(15, 16), 16 * c.s, -.7f, .7f, 12);
+                dl->PathStroke(color, 0, 2 * c.s);
+            }
+            break;
+        case Arrow:
+            l(12, 7, 21, 16);
+            l(21, 16, 12, 25);
+            break;
+        case Down:
+            l(7, 12, 16, 21);
+            l(16, 21, 25, 12);
+            break;
+        case Check:
+            l(7, 16, 13, 22, 3);
+            l(13, 22, 26, 9, 3);
+            break;
+        case Plus:
+            l(16, 4, 16, 28);
+            l(4, 16, 28, 16);
+            break;
+        case Refresh:
+            dl->PathArcTo(c.p(16, 16), 12 * c.s, .4f, 5.5f, 24);
+            dl->PathStroke(color, 0, 2.5f * c.s);
+            l(25, 3, 25, 11);
+            l(18, 11, 25, 11);
+            break;
+        case Screen:
+            dl->AddRect(c.p(2, 3), c.p(30, 23), color, 2 * c.s, 0, 2.5f * c.s);
+            l(16, 23, 16, 30);
+            l(8, 30, 24, 30);
+            break;
+        case Clock:
+            circle(16, 18, 12);
+            l(16, 18, 16, 10);
+            l(12, 1, 20, 1);
+            l(16, 1, 16, 5);
+            l(25, 5, 28, 8);
+            break;
+        case Link:
+            circle(11, 19, 8);
+            circle(23, 12, 8);
+            l(12, 18, 21, 12, 3);
+            break;
+        case Bars:
+            c.rect(4, 18, 5, 12, color, 1, false);
+            c.rect(13, 4, 5, 26, color, 1, false);
+            c.rect(22, 12, 5, 18, color, 1, false);
+            break;
+        case Gear:
+            circle(16, 16, 10);
+            circle(16, 16, 4);
+            for (int i = 0; i < 8; ++i) {
+                float a = i * 6.283185f / 8;
+                l(16 + 10 * std::cos(a), 16 + 10 * std::sin(a), 16 + 15 * std::cos(a), 16 + 15 * std::sin(a),
+                  4);
+            }
+            break;
+        case Stop:
+            dl->AddRect(c.p(3, 3), c.p(29, 29), color, 5 * c.s, 0, 2.5f * c.s);
+            break;
+        case Play:
+            dl->AddTriangleFilled(c.p(6, 2), c.p(29, 16), c.p(6, 30), color);
+            break;
+        case Minus:
+            l(6, 16, 26, 16, 2);
+            break;
+        case Maximize:
+            dl->AddRect(c.p(7, 7), c.p(25, 25), color, 2 * c.s, 0, 2 * c.s);
+            break;
+        case Close:
+            l(8, 8, 24, 24, 2);
+            l(24, 8, 8, 24, 2);
+            break;
         }
     }
-
-    // Peak hold: a bright tick that lingers, so a transient that is already
-    // gone is still readable.
-    if (holdDb > kMeterFloorDb) {
-        const float hx = pos.x + dbToNorm(holdDb) * width;
-        dl->AddRectFilled(ImVec2(hx - 1.0f, pos.y), ImVec2(hx + 1.0f, pos.y + height),
-                          IM_COL32(240, 240, 245, 230));
+    void badge(Icon type, float x, float y, ImU32 color) const {
+        ImVec4 v = ImGui::ColorConvertU32ToFloat4(color);
+        v.w = .13f;
+        dl->AddCircleFilled(p(x, y), 31 * s, ImGui::ColorConvertFloat4ToU32(v), 40);
+        icon(type, x, y, color, 34);
+    }
+    bool volume(const char *id, float x, float y, float width, float &gain) const {
+        // Keep the native slider's keyboard navigation; replace its appearance.
+        ImGui::SetCursorScreenPos(p(x, y));
+        ImGui::SetNextItemWidth(width * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
+        float value = std::min(gain, 1.0f);
+        bool changed = ImGui::SliderFloat(id, &value, 0, 1, "", ImGuiSliderFlags_NoInput);
+        ImGui::PopStyleVar();
+        if (changed)
+            gain = value;
+        float center = y + 18, end = x + 8 + (width - 16) * std::min(gain, 1.0f);
+        line(x + 8, center, x + width - 8, center, IM_COL32(46, 51, 58, 255), 9);
+        line(x + 8, center, end, center, purple, 9);
+        dl->AddCircleFilled(p(end, center + 2), 14 * s, IM_COL32(0, 0, 0, 80), 28);
+        dl->AddCircleFilled(p(end, center), 13 * s, white, 28);
+        if (ImGui::IsItemFocused())
+            dl->AddCircle(p(end, center), 17 * s, purple, 28, 2 * s);
+        char label[24];
+        std::snprintf(label, sizeof(label), "%.0f%%", gain * 100);
+        text(x + width + 14, y + 4, label, 20);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Mix volume: %.0f%% (Windows volume is unchanged)", gain * 100);
+        return changed;
+    }
+};
+ImU32 meterColor(float db) {
+    return db >= -2    ? IM_COL32(255, 76, 27, 255)
+           : db >= -12 ? IM_COL32(243, 224, 25, 255)
+                       : IM_COL32(12, 218, 64, 255);
+}
+void meter(const Canvas &c, float x, float y, float width, float db) {
+    for (int i = 0; i < 28; ++i) {
+        float threshold = -60.f + 60.f * i / 28;
+        c.rect(x + i * width / 28, y, width / 28 - 5, 15,
+               db > threshold ? meterColor(threshold) : IM_COL32(48, 54, 61, 255), 0, false);
     }
 }
-
-// dB tick marks under the meters, same landmarks OBS shows.
-void drawMeterScale(ImDrawList* dl, ImVec2 pos, float width) {
-    const float marks[] = { -60.0f, -50.0f, -40.0f, -30.0f, -20.0f, -10.0f, -5.0f, 0.0f };
-    const ImU32 col = IM_COL32(120, 124, 134, 255);
-    for (float db : marks) {
-        const float x = pos.x + dbToNorm(db) * width;
-        dl->AddLine(ImVec2(x, pos.y), ImVec2(x, pos.y + 3.0f), col);
-        char buf[8];
-        std::snprintf(buf, sizeof(buf), "%d", static_cast<int>(db));
-        const ImVec2 ts = ImGui::CalcTextSize(buf);
-        dl->AddText(ImVec2(x - ts.x * 0.5f, pos.y + 4.0f), col, buf);
-    }
+std::string sourceName(const ChannelConfig &c) {
+    return !c.label.empty()                    ? c.label
+           : c.kind == SourceKind::Application ? "App Audio"
+           : c.kind == SourceKind::Microphone  ? "Microphone"
+                                               : "Playback Audio";
 }
-
-const char* stateLabel(const ChannelStatus& s) {
-    switch (s.state) {
-        case StreamState::Running: return s.flowing ? "live" : "quiet";
-        case StreamState::Opening: return "opening";
-        case StreamState::Failed:  return "unavailable";
-        case StreamState::Stopped: return "stopped";
-    }
-    return "";
-}
-
-ImVec4 stateColour(const ChannelStatus& s) {
-    switch (s.state) {
-        case StreamState::Running: return s.flowing ? ImVec4(0.42f, 0.76f, 0.47f, 1.0f)
-                                                    : ImVec4(0.50f, 0.52f, 0.56f, 1.0f);
-        case StreamState::Opening: return ImVec4(0.85f, 0.72f, 0.35f, 1.0f);
-        default:                   return ImVec4(0.85f, 0.35f, 0.32f, 1.0f);
-    }
-}
-
-std::string narrow(const std::wstring& w) { return toUtf8(w); }
-
 } // namespace
-
-void MixerWindow::init(AudioEngine* engine, Config* config) {
+void MixerWindow::init(AudioEngine *engine, Config *config, void *window) {
     engine_ = engine;
     config_ = config;
-    strips_[kGame].title = "Game Audio";
-    strips_[kChat].title = "Chat Audio";
-    strips_[kMic].title  = "Microphone";
-    for (int i = 0; i < kChannelCount; ++i) strips_[i].index = i;
+    window_ = window;
+    refreshDevices();
 }
-
-void MixerWindow::refreshDeviceLists() {
-    renderDevices_  = engine_->listDevices(eRender);
-    captureDevices_ = engine_->listDevices(eCapture);
-    deviceListsLoaded_ = true;
+void MixerWindow::refreshDevices() {
+    DeviceManager devices;
+    if (devices.start(nullptr)) {
+        playback_ = devices.list(eRender);
+        microphones_ = devices.list(eCapture);
+    }
+    apps_ = listAudioApps();
+    refreshTimer_ = 0;
 }
-
-bool MixerWindow::drawChannelStrip(Strip& strip, float dt) {
-    bool changed = false;
-    const int  i  = strip.index;
-    const auto st = engine_->channelStatus(i);
-
-    ImGui::PushID(i);
-    ImGui::BeginChild("strip", ImVec2(contentWidth_, kStripHeight), true,
-                      ImGuiWindowFlags_NoScrollbar);
-
-    // --- header: name, state, device ---
-    ImGui::TextUnformatted(strip.title.c_str());
-    ImGui::SameLine();
-    ImGui::TextColored(stateColour(st), "  %s", stateLabel(st));
-
-    const std::string dev = st.deviceName.empty()
-        ? (st.error.empty() ? std::string("(no device)") : st.error)
-        : narrow(st.deviceName);
-    ImGui::SameLine();
-    const float availX = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, availX - ImGui::CalcTextSize(dev.c_str()).x - 4.0f));
-    ImGui::TextDisabled("%s", dev.c_str());
-
-    // --- meters ---
-    // take() returns max-since-last-poll, so nothing is missed between frames.
-    strip.meterL.update(engine_->channelPeak(i).l.take(), dt);
-    strip.meterR.update(engine_->channelPeak(i).r.take(), dt);
-
-    ImDrawList*  dl    = ImGui::GetWindowDrawList();
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const float  width  = ImGui::GetContentRegionAvail().x;
-    const bool   active = st.state == StreamState::Running;
-
-    drawMeterBar(dl, origin, width, kMeterHeight, strip.meterL.levelDb(), strip.meterL.holdDb(), active);
-    drawMeterBar(dl, ImVec2(origin.x, origin.y + kMeterHeight + kMeterGap), width, kMeterHeight,
-                 strip.meterR.levelDb(), strip.meterR.holdDb(), active);
-    drawMeterScale(dl, ImVec2(origin.x, origin.y + 2 * kMeterHeight + kMeterGap + 2.0f), width);
-    ImGui::Dummy(ImVec2(width, 2 * kMeterHeight + kMeterGap + 18.0f));
-
-    // --- fader + mute ---
-    float gain = config_->game.gain;
-    if (i == kChat) gain = config_->chat.gain;
-    if (i == kMic)  gain = config_->mic.gain;
-
-    // The fader is linear in dB, which is what makes it feel like a mixer
-    // rather than a volume slider crammed into the top 10% of its travel.
-    float db = gain > 0.0001f ? linearToDb(gain) : kFaderMinDb;
-    db = std::clamp(db, kFaderMinDb, kFaderMaxDb);
-
-    ImGui::SetNextItemWidth(width - 78.0f);
-    if (ImGui::SliderFloat("##fader", &db, kFaderMinDb, kFaderMaxDb, "%.1f dB")) {
-        const float lin = (db <= kFaderMinDb) ? 0.0f : dbToLinear(db);
-        engine_->setGain(i, lin);
-        if (i == kGame) config_->game.gain = lin;
-        if (i == kChat) config_->chat.gain = lin;
-        if (i == kMic)  config_->mic.gain  = lin;
-        changed = true;
+void MixerWindow::restart() {
+    if (engine_->running()) {
+        engine_->stop();
+        engine_->start(*config_);
     }
-
-    bool muted = (i == kGame) ? config_->game.muted
-               : (i == kChat) ? config_->chat.muted
-                              : config_->mic.muted;
-
-    ImGui::SameLine();
-    if (muted) {
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.70f, 0.24f, 0.22f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.30f, 0.27f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.86f, 0.36f, 0.32f, 1.0f));
-    }
-    if (ImGui::Button(muted ? "Muted" : "Mute", ImVec2(66, 0))) {
-        muted = !muted;
-        engine_->setMuted(i, muted);
-        if (i == kGame) config_->game.muted = muted;
-        if (i == kChat) config_->chat.muted = muted;
-        if (i == kMic)  config_->mic.muted  = muted;
-        changed = true;
-    }
-    if (muted) ImGui::PopStyleColor(3);
-
-    ImGui::EndChild();
-    ImGui::PopID();
-    return changed;
+    meters_ = {};
+    outputMeter_ = {};
+    spectrum_ = Spectrum{};
+    lastUnderruns_ = lastDropped_ = 0;
+    refreshTimer_ = 2;
 }
-
-bool MixerWindow::drawOutputSection(float dt) {
-    bool changed = false;
-    const OutputStatus os = engine_->outputStatus();
-
-    ImGui::PushID("out");
-    ImGui::BeginChild("outstrip", ImVec2(contentWidth_, kStripHeight), true,
-                      ImGuiWindowFlags_NoScrollbar);
-
-    ImGui::TextUnformatted("Output to capture card");
-    ImGui::SameLine();
-    if (os.state == StreamState::Running) {
-        ImGui::TextColored(ImVec4(0.42f, 0.76f, 0.47f, 1.0f), "  %s  %u Hz",
-                           os.exclusive ? "exclusive" : "shared", os.sampleRate);
-    } else if (os.state == StreamState::Opening) {
-        ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.35f, 1.0f), "  connecting");
-    } else {
-        ImGui::TextColored(ImVec4(0.85f, 0.35f, 0.32f, 1.0f), "  waiting for device");
+void MixerWindow::refreshStatus(float dt) {
+    refreshTimer_ += dt;
+    if (refreshTimer_ >= 2) {
+        apps_ = listAudioApps();
+        refreshTimer_ = 0;
     }
-
-    const std::string dev = os.deviceName.empty()
-        ? (os.error.empty() ? std::string("(no device)") : os.error)
-        : narrow(os.deviceName);
-    ImGui::SameLine();
-    const float availX = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, availX - ImGui::CalcTextSize(dev.c_str()).x - 4.0f));
-    ImGui::TextDisabled("%s", dev.c_str());
-
-    outMeterL_.update(engine_->outputPeak().l.take(), dt);
-    outMeterR_.update(engine_->outputPeak().r.take(), dt);
-
-    ImDrawList*  dl     = ImGui::GetWindowDrawList();
-    const ImVec2 origin = ImGui::GetCursorScreenPos();
-    const float  width  = ImGui::GetContentRegionAvail().x;
-    const bool   active = os.state == StreamState::Running;
-
-    drawMeterBar(dl, origin, width, kMeterHeight, outMeterL_.levelDb(), outMeterL_.holdDb(), active);
-    drawMeterBar(dl, ImVec2(origin.x, origin.y + kMeterHeight + kMeterGap), width, kMeterHeight,
-                 outMeterR_.levelDb(), outMeterR_.holdDb(), active);
-    drawMeterScale(dl, ImVec2(origin.x, origin.y + 2 * kMeterHeight + kMeterGap + 2.0f), width);
-    ImGui::Dummy(ImVec2(width, 2 * kMeterHeight + kMeterGap + 18.0f));
-
-    float db = config_->output.gain > 0.0001f ? linearToDb(config_->output.gain) : kFaderMinDb;
-    db = std::clamp(db, kFaderMinDb, kFaderMaxDb);
-    ImGui::SetNextItemWidth(width - 78.0f);
-    if (ImGui::SliderFloat("##outfader", &db, kFaderMinDb, kFaderMaxDb, "%.1f dB")) {
-        const float lin = (db <= kFaderMinDb) ? 0.0f : dbToLinear(db);
-        engine_->setOutputGain(lin);
-        config_->output.gain = lin;
-        changed = true;
+    severity_ = 0;
+    statusDetail_.clear();
+    if (!engine_->running()) {
+        status_ = "Stopped";
+        statusDetail_ = "Monitoring is stopped. Press Start Monitoring to resume your saved mix.";
+        return;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Settings", ImVec2(66, 0))) showSettings_ = !showSettings_;
-
-    ImGui::EndChild();
-    ImGui::PopID();
-    return changed;
-}
-
-bool MixerWindow::drawSettings() {
-    bool changed = false;
-    if (!deviceListsLoaded_) refreshDeviceLists();
-
-    // Sized to its content rather than filling the window: a tall window left
-    // an enormous empty panel below the controls.
-    ImGui::BeginChild("settings", ImVec2(contentWidth_, 330.0f), true);
-    ImGui::TextUnformatted("Devices");
-    ImGui::Separator();
-
-    struct Row { const char* label; ChannelConfig* cfg; const std::vector<DeviceInfo>* list; int channel; };
-    const Row rows[] = {
-        { "Game",   &config_->game,   &renderDevices_,  kGame },
-        { "Chat",   &config_->chat,   &renderDevices_,  kChat },
-        { "Mic",    &config_->mic,    &captureDevices_, kMic  },
-        { "Output", &config_->output, &renderDevices_,  -1    },
-    };
-
-    for (const Row& row : rows) {
-        ImGui::PushID(row.label);
-        ImGui::SetNextItemWidth(-90.0f);
-
-        // Show the endpoint that is actually OPEN, not just what was configured.
-        // Reporting the name pattern instead is useless precisely when it
-        // matters -- when you want to confirm an auto-match landed on the
-        // device you meant rather than a similarly named one.
-        const std::wstring live = (row.channel >= 0)
-            ? engine_->channelStatus(row.channel).deviceName
-            : engine_->outputStatus().deviceName;
-
-        std::string current;
-        if (!live.empty()) {
-            current = narrow(live);
-            if (row.cfg->deviceId.empty()) current += "   (auto)";
-        } else {
-            current = "(nothing matched \"" + toUtf8(row.cfg->deviceNameMatch) + "\")";
+    const auto out = engine_->outputStatus();
+    uint64_t dropped = 0;
+    std::vector<SourceRoute> routes;
+    auto warn = [&](const std::string &label, const std::string &detail, int severity = 1) {
+        if (severity > severity_) {
+            severity_ = severity;
+            status_ = label;
         }
+        if (!statusDetail_.empty())
+            statusDetail_ += "\n\n";
+        statusDetail_ += detail;
+    };
+    status_ = "Optimal";
+    if (out.state != StreamState::Running)
+        warn("Output unavailable", out.error.empty() ? "Waiting for the selected output device." : out.error,
+             2);
+    for (size_t i = 0; i < config_->sources.size(); ++i) {
+        const auto &source = config_->sources[i];
+        const auto state = engine_->channelStatus(static_cast<int>(i));
+        dropped += state.dropped;
+        SourceRoute route;
+        route.kind = source.kind;
+        route.endpoint = state.deviceId;
+        route.processId = state.processId;
+        route.audible = source.enabled && !source.muted && source.gain > 0.0001f &&
+                        state.state == StreamState::Running && !config_->output.muted &&
+                        config_->output.gain > 0.0001f;
+        if (source.enabled && state.state != StreamState::Running)
+            warn("Source unavailable",
+                 sourceName(source) + ": " + (state.error.empty() ? "Connecting..." : state.error));
+        for (const auto &app : apps_)
+            if (app.processId == state.processId && state.processId) {
+                route.appEndpoints = app.endpoints;
+                route.routingKnown = app.routingKnown;
+                break;
+            }
+        if (route.audible && source.kind == SourceKind::Playback && !route.endpoint.empty() &&
+            route.endpoint == out.deviceId)
+            warn("Feedback risk",
+                 sourceName(source) + " captures the selected output device. Choose a different output or "
+                                      "disable this source to avoid a feedback loop.",
+                 2);
+        routes.push_back(std::move(route));
+    }
+    for (size_t i = 0; i < routes.size(); ++i)
+        for (size_t j = i + 1; j < routes.size(); ++j) {
+            const auto overlap = sourceOverlap(routes[i], routes[j]);
+            if (overlap == Overlap::None)
+                continue;
+            bool confirmed = overlap == Overlap::Confirmed;
+            warn(
+                confirmed ? "Duplicate audio" : "Possible duplicate",
+                sourceName(config_->sources[i]) + " + " + sourceName(config_->sources[j]) + ": " +
+                    (confirmed
+                         ? "the same audio is included in both sources. This can cause doubled audio or echo."
+                         : "Windows could not confirm the app's playback route. If it plays through this "
+                           "device, its audio is captured twice.") +
+                    " Mute or disable one source, remove it, or route the app to a different playback "
+                    "device.");
+            if (confirmed && severity_ == 1)
+                status_ = "Duplicate audio";
+        }
+    if (out.underruns > lastUnderruns_ || dropped > lastDropped_)
+        dropoutTimer_ = 4;
+    lastUnderruns_ = out.underruns;
+    lastDropped_ = dropped;
+    dropoutTimer_ = std::max(0.f, dropoutTimer_ - dt);
+    if (dropoutTimer_ > 0)
+        warn("Audio dropouts", "Audio buffers were missed recently. Try increasing Buffer in Settings.");
+    if (clippingTimer_ > 0)
+        warn("Clipping", "The mix reached 0 dBFS. Lower a source or master volume to prevent distortion.", 2);
+    if (!severity_)
+        statusDetail_ = "Audio devices are running. No source overlap or recent dropouts detected.";
+}
+bool MixerWindow::drawSource(size_t index, float width, float dt) {
+    auto &source = config_->sources[index];
+    const auto state = engine_->running() ? engine_->channelStatus(static_cast<int>(index)) : ChannelStatus{};
+    const auto position = ImGui::GetCursorScreenPos();
+    Canvas c{ImGui::GetWindowDrawList(), position, scale_};
+    bool changed = false;
+    ImGui::PushID(static_cast<int>(index));
+    c.rect(0, 0, width, 214, card, 17);
+    auto color = source.kind == SourceKind::Microphone    ? pink
+                 : source.kind == SourceKind::Application ? cyan
+                 : index == 1                             ? cyan
+                                                          : purple;
+    auto icon = source.kind == SourceKind::Microphone                  ? Mic
+                : source.kind == SourceKind::Application || index == 1 ? Chat
+                                                                       : Headphones;
+    c.badge(icon, 43, 52, color);
+    c.text(90, 23, sourceName(source), 23, white, true, width - 204);
+    auto subtitle = state.deviceName.empty() ? toUtf8(source.deviceNameMatch) : toUtf8(state.deviceName);
+    if (source.kind == SourceKind::Application)
+        subtitle = state.state == StreamState::Running ? "Application audio" : "Waiting for application";
+    if (subtitle.empty())
+        subtitle = "Choose a device";
+    c.text(90, 61, subtitle, 18, gray, false, width - 108);
+    c.hit("Source details", 90, 59, width - 108, 30, subtitle.c_str());
+    c.rect(width - 107, 30, 34, 36, source.enabled ? purple : IM_COL32(43, 48, 55, 255), 7, false);
+    if (source.enabled)
+        c.icon(Check, width - 90, 48, white, 26);
+    if (c.hit("Enable source", width - 112, 24, 44, 48,
+              source.enabled ? "Exclude source from mix" : "Include source in mix")) {
+        source.enabled = !source.enabled;
+        if (engine_->running())
+            engine_->setEnabled(static_cast<int>(index), source.enabled);
+        changed = true;
+    }
+    c.rect(width - 58, 28, 40, 40, IM_COL32(39, 45, 51, 255), 9, false);
+    c.icon(Arrow, width - 38, 48, white, 25);
+    if (c.hit("Configure source", width - 60, 24, 44, 48, "Configure, rename, or remove this source")) {
+        editSource_ = static_cast<int>(index);
+        draft_ = source;
+        std::snprintf(name_, sizeof(name_), "%s", sourceName(source).c_str());
+        openSource_ = true;
+        refreshDevices();
+    }
+    float peak = engine_->running() ? std::max(engine_->channelPeak(static_cast<int>(index)).l.take(),
+                                               engine_->channelPeak(static_cast<int>(index)).r.take())
+                                    : 0;
+    meters_[index].update(peak, dt);
+    meter(c, 90, 112, width - 108, meters_[index].levelDb());
+    c.icon(source.muted ? Muted : Speaker, 39, 174, source.muted ? red : white, 27);
+    if (c.hit("Mute source", 18, 152, 42, 42, source.muted ? "Unmute source" : "Mute source")) {
+        source.muted = !source.muted;
+        if (engine_->running())
+            engine_->setMuted(static_cast<int>(index), source.muted);
+        changed = true;
+    }
+    if (c.volume("##source-volume", 80, 156, width - 161, source.gain)) {
+        if (engine_->running())
+            engine_->setGain(static_cast<int>(index), source.gain);
+        changed = true;
+    }
+    if (source.enabled && engine_->running() && state.state != StreamState::Running)
+        c.dl->AddCircleFilled(c.p(71, 75), 5 * scale_, amber, 16);
+    ImGui::SetCursorScreenPos(position);
+    ImGui::Dummy({width * scale_, 214 * scale_});
+    ImGui::PopID();
+    return changed;
+}
 
-        if (ImGui::BeginCombo(row.label, current.c_str())) {
-            if (ImGui::Selectable("(auto-detect by name)", row.cfg->deviceId.empty())) {
-                row.cfg->deviceId.clear();
-                engine_->setChannelDevice(row.channel, { L"", row.cfg->deviceNameMatch });
-                changed = true;
-            }
-            for (const auto& d : *row.list) {
-                const bool sel = (d.id == row.cfg->deviceId);
-                std::string label = narrow(d.name);
-                if (d.isDefault) label += "  [system default]";
-                if (ImGui::Selectable(label.c_str(), sel)) {
-                    // Narrow the name fallback to what was actually chosen.
-                    // Leaving the old broad substring in place means that if
-                    // this ID stops resolving, the fallback could silently
-                    // pick a different endpoint than the one selected here.
-                    row.cfg->deviceId        = d.id;
-                    row.cfg->deviceNameMatch = d.name;
-                    engine_->setChannelDevice(row.channel, { d.id, d.name });
-                    changed = true;
-                }
-            }
-            ImGui::EndCombo();
+bool MixerWindow::draw(float dt, int width, int height) {
+    dt = std::clamp(dt, .001f, .1f);
+    scale_ = std::min(float(width) / 1600.f, float(height) / 986.f);
+    const float w = width / scale_, h = height / scale_, rightX = 516, rightW = w - 542, footerY = h - 120,
+                outputY = footerY - 288, liveH = outputY - 124;
+    bool changed = false;
+    ImGui::SetNextWindowPos({0, 0});
+    ImGui::SetNextWindowSize({float(width), float(height)});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+    ImGui::PushFont(nullptr, 20 * scale_);
+    ImGui::Begin("Audio Monitor dashboard", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    Canvas c{ImGui::GetWindowDrawList(), {0, 0}, scale_};
+    c.rect(1, 1, w - 2, h - 2, background, 22);
+    c.icon(Wave, 65, 54, purple, 40);
+    c.text(109, 36, "Audio Monitor", 31, white, true);
+    c.hit("Move window", 320, 12, w - 590, 75, "Drag to move the window");
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ReleaseCapture();
+        PostMessageW(static_cast<HWND>(window_), WM_NCLBUTTONDOWN, HTCAPTION, 0);
+    }
+    const Icon controls[] = {Minus, Maximize, Close};
+    const char *tips[] = {"Minimize to tray", "Maximize / restore",
+                          config_->closeToTray ? "Close to tray" : "Exit Audio Monitor"};
+    for (int i = 0; i < 3; ++i) {
+        float x = w - 256 + i * 77.f;
+        c.rect(x, 25, 78, 56, card, 13);
+        c.icon(controls[i], x + 39, 53, white, 30);
+        ImGui::PushID(i + 500);
+        if (c.hit("Window control", x, 25, 77, 56, tips[i])) {
+            if (i == 0)
+                PostMessageW(static_cast<HWND>(window_), WM_SYSCOMMAND, SC_MINIMIZE, 0);
+            if (i == 1)
+                PostMessageW(static_cast<HWND>(window_), WM_SYSCOMMAND,
+                             IsZoomed(static_cast<HWND>(window_)) ? SC_RESTORE : SC_MAXIMIZE, 0);
+            if (i == 2)
+                PostMessageW(static_cast<HWND>(window_), WM_CLOSE, 0, 0);
         }
         ImGui::PopID();
     }
-
-    if (ImGui::Button("Rescan devices")) refreshDeviceLists();
-
-    ImGui::Dummy(ImVec2(0, 6));
-    ImGui::TextUnformatted("Behaviour");
-    ImGui::Separator();
-
-    bool autostart = config_->startWithWindows;
-    if (ImGui::Checkbox("Start with Windows (minimised to tray)", &autostart)) {
-        if (startup::setEnabled(autostart)) { config_->startWithWindows = autostart; changed = true; }
+    c.rect(26, 110, 470, h - 147, panel, 19);
+    c.text(56, 140, "Devices", 25, white, true);
+    c.icon(Refresh, 452, 153, gray, 31);
+    if (c.hit("Refresh devices", 425, 125, 54, 55, "Rescan connected devices and app audio sessions"))
+        refreshDevices();
+    ImGui::SetCursorScreenPos(c.p(44, 191));
+    ImGui::BeginChild("Source list", {434 * scale_, (h - 307) * scale_}, ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoBackground);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 18 * scale_));
+    const float sourceWidth = ImGui::GetContentRegionAvail().x / scale_;
+    for (size_t i = 0; i < config_->sources.size(); ++i)
+        changed |= drawSource(i, sourceWidth, dt);
+    if (config_->sources.empty())
+        ImGui::TextWrapped("Add a playback device, microphone, or app to begin your mix.");
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+    c.icon(Plus, 176, h - 78, purple, 29);
+    c.text(205, h - 95, "Add Device", 25, purple, true);
+    if (c.hit("Add Device", 74, h - 111, 375, 69, "Add a playback device, microphone, or application")) {
+        if (config_->sources.size() < kMaxSources) {
+            editSource_ = -1;
+            draft_ = ChannelConfig{};
+            name_[0] = 0;
+            openSource_ = true;
+            refreshDevices();
+        } else
+            ImGui::OpenPopup("Source limit");
     }
-
-    bool startMin = config_->startMinimized;
-    if (ImGui::Checkbox("Start hidden when launched manually", &startMin)) {
-        config_->startMinimized = startMin;
+    if (ImGui::BeginPopup("Source limit")) {
+        ImGui::TextUnformatted("Up to 16 sources can be mixed at once.");
+        ImGui::EndPopup();
+    }
+    const auto out = engine_->outputStatus();
+    float peak =
+        engine_->running() ? std::max(engine_->outputPeak().l.take(), engine_->outputPeak().r.take()) : 0;
+    outputMeter_.update(peak, dt);
+    clippingTimer_ = peak >= 1.f ? 2.f : std::max(0.f, clippingTimer_ - dt);
+    spectrum_.update(engine_->visualSamples(), out.sampleRate, dt,
+                     engine_->running() && out.state == StreamState::Running);
+    refreshStatus(dt);
+    const ImU32 statusColor = severity_ >= 2 ? red : severity_ ? amber : engine_->running() ? green : gray;
+    c.rect(rightX, 105, rightW, liveH, panel, 19);
+    c.icon(Wave, rightX + 48, 151, white, 31);
+    c.text(rightX + 85, 134, "Live Mix", 25, white, true);
+    const float graphX = rightX + 32, graphY = 192, graphW = rightW - 107, graphH = liveH - 298;
+    c.rect(graphX, graphY, graphW, graphH, IM_COL32(10, 16, 19, 255), 12, false);
+    for (int i = 0; i <= 5; ++i) {
+        float y = graphY + 18 + (graphH - 30) * float(i) / 5.f;
+        c.line(graphX + 18, y, graphX + graphW - 18, y, IM_COL32(26, 34, 39, 255), 1);
+        c.text(graphX + graphW + 17, y - 12, std::to_string(-i * 12), 19, gray);
+    }
+    const float barW = (graphW - 38) / 64.f;
+    for (size_t i = 0; i < Spectrum::kBands; ++i) {
+        float value = (spectrum_.levels[i] + 60.f) / 60.f, barH = std::max(3.f, value * (graphH - 30));
+        float x = graphX + 19 + float(i) * barW, y = graphY + graphH - 13 - barH;
+        auto bottom = IM_COL32(0, 217, 57, 255), top = meterColor(spectrum_.levels[i]);
+        c.dl->AddRectFilledMultiColor(c.p(x, y), c.p(x + barW * .57f, y + barH), value > .01f ? top : border,
+                                      value > .01f ? top : border, value > .01f ? bottom : border,
+                                      value > .01f ? bottom : border);
+    }
+    c.hit("Frequency spectrum", graphX, graphY, graphW, graphH,
+          "Live frequency spectrum: 30 Hz to 20 kHz, left to right. Level in dBFS.");
+    const float levelY = graphY + graphH + 23;
+    c.text(graphX, levelY, "Total Output Level", 23, gray);
+    char level[32];
+    if (outputMeter_.levelDb() <= -59.9f)
+        std::snprintf(level, sizeof(level), "-inf dBFS");
+    else
+        std::snprintf(level, sizeof(level), "%.1f dBFS", outputMeter_.levelDb());
+    c.text(graphX + graphW - 132, levelY, level, 22, peak >= 1 ? red : green, true);
+    const float tileY = 105 + liveH - 132, tileW = (rightW - 90) / 4;
+    const Icon tileIcons[] = {Wave, Clock, Link, Bars};
+    const ImU32 tileColors[] = {green, cyan, purple, amber};
+    const char *titles[] = {"Sample Rate", "Buffer", "Channels", "Status"};
+    std::string rate =
+        engine_->running() && out.state == StreamState::Running ? std::to_string(out.sampleRate) : "--";
+    if (rate.size() == 5)
+        rate.insert(2, ",");
+    std::string values[] = {rate + " Hz", std::to_string(config_->bufferMillis) + " ms",
+                            config_->mono ? "Mono" : "Stereo", status_};
+    for (int i = 0; i < 4; ++i) {
+        float x = rightX + 22 + i * (tileW + 15);
+        c.rect(x, tileY, tileW, 111, card, 15);
+        c.badge(tileIcons[i], x + 48, tileY + 56, tileColors[i]);
+        c.text(x + 95, tileY + 26, titles[i], 20, gray);
+        c.text(x + 95, tileY + 59, values[i], i == 3 && status_.size() > 14 ? 16.f : 22.f,
+               i == 3 ? statusColor : white, false, tileW - 106);
+        ImGui::PushID(i + 600);
+        if (c.hit("Audio information", x, tileY, tileW, 111,
+                  i == 3   ? "View audio health and routing warnings"
+                  : i == 2 ? "Switch Stereo / Mono"
+                           : "Open audio settings")) {
+            if (i == 2)
+                ImGui::OpenPopup("Mix channels");
+            else if (i == 3)
+                ImGui::OpenPopup("Audio status");
+            else
+                openSettings_ = true;
+        }
+        if (i == 2 && ImGui::BeginPopup("Mix channels")) {
+            for (int mode = 0; mode < 2; ++mode)
+                if (ImGui::Selectable(mode ? "Mono - same mix on both sides"
+                                           : "Stereo - separate left and right",
+                                      config_->mono == (mode == 1))) {
+                    config_->mono = mode == 1;
+                    engine_->setMono(config_->mono);
+                    changed = true;
+                }
+            ImGui::EndPopup();
+        }
+        if (i == 3) {
+            ImGui::SetNextWindowSize({490 * scale_, 0});
+            if (ImGui::BeginPopup("Audio status")) {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(statusColor), "%s", status_.c_str());
+                ImGui::Separator();
+                ImGui::TextWrapped("%s", statusDetail_.c_str());
+                ImGui::EndPopup();
+            }
+        }
+        ImGui::PopID();
+    }
+    c.rect(rightX, outputY, rightW, 264, panel, 19);
+    c.icon(Link, rightX + 49, outputY + 44, purple, 32);
+    c.text(rightX + 82, outputY + 25, "Output Device", 25, white, true);
+    c.rect(rightX + 18, outputY + 79, rightW - 38, 164, card, 16);
+    c.badge(Screen, rightX + 59, outputY + 127, purple);
+    auto outputName = !engine_->running() || out.deviceName.empty() ? toUtf8(config_->output.deviceNameMatch)
+                                                                    : toUtf8(out.deviceName);
+    if (outputName.empty())
+        outputName = "Choose output device";
+    c.text(rightX + 107, outputY + 97, outputName, 24, white, true, rightW - 318);
+    std::string outputSubtitle = engine_->running() && out.state == StreamState::Running
+                                     ? (out.exclusive ? "Exclusive audio output" : "Shared audio output")
+                                     : "Combined audio destination";
+    c.text(rightX + 107, outputY + 132, outputSubtitle, 19, gray);
+    bool active = engine_->running() && out.state == StreamState::Running;
+    c.rect(rightX + rightW - 197, outputY + 102, 97, 46,
+           active ? IM_COL32(20, 53, 31, 255) : IM_COL32(49, 42, 29, 255), 24, false);
+    c.text(rightX + rightW - 176, outputY + 112, active ? "Active" : "Idle", 20, active ? green : amber);
+    c.rect(rightX + rightW - 83, outputY + 101, 46, 46, IM_COL32(40, 46, 53, 255), 11, false);
+    c.icon(Down, rightX + rightW - 60, outputY + 124, white, 28);
+    if (c.hit("Select output device", rightX + rightW - 86, outputY + 98, 52, 52,
+              "Choose where the combined mix is sent")) {
+        refreshDevices();
+        ImGui::OpenPopup("Output device");
+    }
+    ImGui::SetNextWindowSizeConstraints({350 * scale_, 0}, {800 * scale_, 450 * scale_});
+    if (ImGui::BeginPopup("Output device")) {
+        if (playback_.empty())
+            ImGui::TextUnformatted("No playback devices found. Connect one and refresh.");
+        for (const auto &device : playback_) {
+            ImGui::PushID(toUtf8(device.id).c_str());
+            if (ImGui::Selectable(toUtf8(device.name).c_str(), device.id == config_->output.deviceId)) {
+                config_->output.deviceId = device.id;
+                config_->output.deviceNameMatch = device.name;
+                engine_->setChannelDevice(-1, {device.id, device.name});
+                changed = true;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+    c.icon(config_->output.muted ? Muted : Speaker, rightX + 54, outputY + 203,
+           config_->output.muted ? red : white, 28);
+    if (c.hit("Mute output", rightX + 32, outputY + 182, 44, 44,
+              config_->output.muted ? "Unmute entire output" : "Mute entire output")) {
+        config_->output.muted = !config_->output.muted;
+        engine_->setOutputMuted(config_->output.muted);
         changed = true;
     }
-
-    bool excl = config_->exclusiveOutput;
-    if (ImGui::Checkbox("Open the capture card in exclusive mode", &excl)) {
-        config_->exclusiveOutput = excl;
-        engine_->setExclusiveOutput(excl);   // the engine holds its own copy
+    if (c.volume("##master-volume", rightX + 96, outputY + 185, rightW - 221, config_->output.gain)) {
+        engine_->setOutputGain(config_->output.gain);
         changed = true;
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Exclusive mode bypasses the Windows mixer for the lowest latency.\n"
-                          "Takes effect the next time the output device is opened.\n"
-                          "Automatically refused if the card is a system default device.");
-    }
-
-    int buffer = static_cast<int>(config_->bufferMillis);
-    ImGui::SetNextItemWidth(160.0f);
-    if (ImGui::SliderInt("Buffer (ms)", &buffer, 20, 250)) {
-        config_->bufferMillis = static_cast<uint32_t>(buffer);
-        engine_->setBufferMillis(config_->bufferMillis);
+    const float settingsW = rightW * .238f, stopW = rightW * .35f, stateW = rightW * .325f,
+                stopX = rightX + settingsW + (rightW - settingsW - stopW - stateW) * .5f;
+    c.rect(rightX, footerY, settingsW, 73, card, 18);
+    c.icon(Gear, rightX + 70, footerY + 36, gray, 34);
+    c.text(rightX + 106, footerY + 21, "Settings", 25, white, true);
+    if (c.hit("Settings", rightX, footerY, settingsW, 73))
+        openSettings_ = true;
+    bool running = engine_->running();
+    c.rect(stopX, footerY - 1, stopW, 76, running ? red : IM_COL32(109, 71, 231, 255), 17, false);
+    c.icon(running ? Stop : Play, stopX + 69, footerY + 36, white, 34);
+    c.text(stopX + 108, footerY + 19, running ? "Stop Monitoring" : "Start Monitoring", 28, white, true);
+    if (c.hit("Toggle monitoring", stopX, footerY, stopW, 74,
+              running ? "Stop capturing and sending audio" : "Resume saved mix")) {
+        if (running) {
+            engine_->updateConfigFromRuntime(*config_);
+            engine_->stop();
+        } else
+            engine_->start(*config_);
+        meters_ = {};
+        outputMeter_ = {};
+        spectrum_ = Spectrum{};
+        lastUnderruns_ = lastDropped_ = 0;
         changed = true;
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Target depth for each channel's buffer. Lower is less delay to the\n"
-                          "stream PC; higher tolerates more scheduling jitter under game load.\n"
-                          "Applies immediately -- the buffer migrates to the new depth over a\n"
-                          "few seconds without interrupting audio.");
+    float stateX = rightX + rightW - stateW;
+    c.rect(stateX, footerY, stateW, 73, card, 18);
+    c.dl->AddCircleFilled(c.p(stateX + 64, footerY + 36), 8 * scale_, running ? green : gray, 24);
+    c.text(stateX + 91, footerY + 21, running ? "Monitoring Active" : "Monitoring Stopped", 24, white, true);
+    changed |= drawDialogs();
+    ImGui::End();
+    ImGui::PopFont();
+    ImGui::PopStyleVar(2);
+    return changed;
+}
+
+bool MixerWindow::drawDialogs() {
+    bool changed = false;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24 * scale_, 24 * scale_});
+    if (openSource_) {
+        ImGui::OpenPopup("Configure source");
+        openSource_ = false;
     }
-
-    ImGui::Dummy(ImVec2(0, 6));
-    if (ImGui::Button("Close settings")) showSettings_ = false;
-    ImGui::SameLine();
-    if (ImGui::Button("Restore defaults")) ImGui::OpenPopup("Restore defaults?");
-    ImGui::SameLine();
-    if (ImGui::Button("Exit application")) exitRequested_ = true;
-
-    // Confirmed, because this discards a mix the user may have spent a while
-    // setting and there is no undo.
-    if (ImGui::BeginPopupModal("Restore defaults?", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("This resets everything to first-run defaults:");
-        ImGui::BulletText("device selections back to auto-detect by name");
-        ImGui::BulletText("all faders to 0 dB and all channels unmuted");
-        ImGui::BulletText("exclusive mode on, buffer back to 50 ms");
-        ImGui::BulletText("start with Windows and start-hidden both turned off");
-        ImGui::Dummy(ImVec2(0, 4));
-        ImGui::TextDisabled("Your Windows sound settings are not touched.");
-        ImGui::Dummy(ImVec2(0, 6));
-
-        if (ImGui::Button("Restore", ImVec2(120, 0))) {
-            restoreDefaults();
+    ImGui::SetNextWindowSize({650 * scale_, 0}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
+    if (ImGui::BeginPopupModal("Configure source", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(editSource_ < 0 ? "Add an audio source" : "Source settings");
+        ImGui::Separator();
+        int kind = static_cast<int>(draft_.kind);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##Source type", &kind, "Playback device\0Microphone\0Application audio\0")) {
+            draft_.kind = static_cast<SourceKind>(kind);
+            draft_.deviceId.clear();
+            draft_.deviceNameMatch.clear();
+            draft_.processPath.clear();
+        }
+        bool valid = false;
+        if (draft_.kind == SourceKind::Application) {
+            if (!processCaptureSupported())
+                ImGui::TextWrapped("Application capture requires Windows build 20348 or later (Windows 11 "
+                                   "recommended) and a recent Windows SDK.");
+            ImGui::TextWrapped("Captures this app and its child processes. Start audio in the app, then "
+                               "Refresh if it is missing.");
+            std::string selected =
+                draft_.processPath.empty() ? "Choose an application" : toUtf8(draft_.processPath);
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##Application", selected.c_str())) {
+                for (const auto &app : apps_) {
+                    auto label = toUtf8(app.name) + " (" + std::to_string(app.processId) + ")";
+                    if (ImGui::Selectable(label.c_str(), app.path == draft_.processPath)) {
+                        draft_.processPath = app.path;
+                        if (!name_[0])
+                            std::snprintf(name_, sizeof(name_), "%s", toUtf8(app.name).c_str());
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            valid = processCaptureSupported() && !draft_.processPath.empty();
+        } else {
+            const auto &devices = draft_.kind == SourceKind::Microphone ? microphones_ : playback_;
+            std::string selected = toUtf8(draft_.deviceNameMatch);
+            if (selected.empty())
+                selected = "Choose an audio device";
+            ImGui::SetNextItemWidth(-1);
+            if (ImGui::BeginCombo("##Device", selected.c_str())) {
+                for (const auto &device : devices) {
+                    ImGui::PushID(toUtf8(device.id).c_str());
+                    if (ImGui::Selectable(toUtf8(device.name).c_str(), device.id == draft_.deviceId)) {
+                        draft_.deviceId = device.id;
+                        draft_.deviceNameMatch = device.name;
+                        if (!name_[0])
+                            std::snprintf(name_, sizeof(name_), "%s",
+                                          draft_.kind == SourceKind::Microphone
+                                              ? "Microphone"
+                                              : toUtf8(device.name).c_str());
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            valid = !draft_.deviceId.empty() || !draft_.deviceNameMatch.empty();
+        }
+        if (ImGui::Button("Refresh"))
+            refreshDevices();
+        ImGui::TextUnformatted("Display name");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##Source name", name_, sizeof(name_));
+        ImGui::Checkbox("Include in mix", &draft_.enabled);
+        ImGui::SameLine();
+        ImGui::Checkbox("Muted", &draft_.muted);
+        float gain = draft_.gain * 100;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##Gain boost", &gain, 0, 400, "Mix gain %.0f%%"))
+            draft_.gain = gain / 100;
+        ImGui::TextDisabled("Above 100%% boosts quiet sources. Watch for clipping.");
+        ImGui::Separator();
+        ImGui::BeginDisabled(!valid);
+        if (ImGui::Button(editSource_ < 0 ? "Add source" : "Save changes")) {
+            draft_.label = name_[0] ? name_ : sourceName(draft_);
+            if (editSource_ < 0)
+                config_->sources.push_back(draft_);
+            else
+                config_->sources[editSource_] = draft_;
+            restart();
             changed = true;
             ImGui::CloseCurrentPopup();
         }
+        ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Cancel"))
+            ImGui::CloseCurrentPopup();
+        if (editSource_ >= 0) {
+            ImGui::SameLine();
+            if (ImGui::Button("Remove source")) {
+                config_->sources.erase(config_->sources.begin() + editSource_);
+                restart();
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            }
+        }
         ImGui::EndPopup();
     }
-
-    ImGui::EndChild();
+    if (openSettings_) {
+        ImGui::OpenPopup("Settings");
+        openSettings_ = false;
+    }
+    ImGui::SetNextWindowSize({660 * scale_, 0}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
+    if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Audio");
+        ImGui::Separator();
+        ImGui::Text("Sample rate: %u Hz", engine_->outputStatus().sampleRate);
+        ImGui::TextWrapped("The sample rate follows the output device. Configure its supported format in "
+                           "Windows Sound settings.");
+        int buffer = static_cast<int>(config_->bufferMillis);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderInt("##Buffer", &buffer, 20, 250, "Buffer: %d ms")) {
+            config_->bufferMillis = static_cast<uint32_t>(buffer);
+            engine_->setBufferMillis(config_->bufferMillis);
+            changed = true;
+        }
+        ImGui::TextWrapped(
+            "Lower buffers reduce delay; higher buffers tolerate scheduling jitter. Applies live.");
+        int mono = config_->mono ? 1 : 0;
+        if (ImGui::Combo("Channels", &mono, "Stereo\0Mono\0")) {
+            config_->mono = mono == 1;
+            engine_->setMono(config_->mono);
+            changed = true;
+        }
+        if (ImGui::Checkbox("Use exclusive output when available", &config_->exclusiveOutput)) {
+            engine_->setExclusiveOutput(config_->exclusiveOutput);
+            if (engine_->running())
+                engine_->setChannelDevice(-1, {config_->output.deviceId, config_->output.deviceNameMatch});
+            changed = true;
+        }
+        ImGui::TextWrapped("System default outputs always use shared mode so other apps keep their audio.");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Application");
+        ImGui::Separator();
+        bool autostart = config_->startWithWindows;
+        if (ImGui::Checkbox("Start with Windows (in tray)", &autostart)) {
+            if (startup::setEnabled(autostart)) {
+                config_->startWithWindows = autostart;
+                changed = true;
+            } else
+                ImGui::OpenPopup("Startup setting failed");
+        }
+        if (ImGui::BeginPopup("Startup setting failed")) {
+            ImGui::TextUnformatted("Could not update Windows startup. Please try again.");
+            ImGui::EndPopup();
+        }
+        changed |= ImGui::Checkbox("Start hidden when launched manually", &config_->startMinimized);
+        changed |= ImGui::Checkbox("Close button keeps monitoring in the tray", &config_->closeToTray);
+        ImGui::TextDisabled("Minimize always sends the app to the tray.");
+        ImGui::Separator();
+        if (ImGui::Button("Done"))
+            ImGui::CloseCurrentPopup();
+        ImGui::SameLine();
+        if (ImGui::Button("Restore defaults"))
+            ImGui::OpenPopup("Restore defaults?");
+        ImGui::SameLine();
+        if (ImGui::Button("Exit application"))
+            exitRequested_ = true;
+        if (ImGui::BeginPopupModal("Restore defaults?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped("Reset all sources, devices, gains, and application preferences?");
+            if (ImGui::Button("Reset")) {
+                bool startupChanged = startup::setEnabled(false), oldStartup = config_->startWithWindows;
+                *config_ = Config::defaults();
+                if (!startupChanged)
+                    config_->startWithWindows = oldStartup;
+                restart();
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel"))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
     return changed;
 }
-
-void MixerWindow::restoreDefaults() {
-    *config_ = Config::defaults();
-
-    // Push every value through to the engine. Writing the config alone would
-    // leave the running streams and the registry out of step with what the UI
-    // now displays.
-    engine_->setGain(kGame, config_->game.gain);
-    engine_->setGain(kChat, config_->chat.gain);
-    engine_->setGain(kMic,  config_->mic.gain);
-    engine_->setOutputGain(config_->output.gain);
-    engine_->setMuted(kGame, config_->game.muted);
-    engine_->setMuted(kChat, config_->chat.muted);
-    engine_->setMuted(kMic,  config_->mic.muted);
-    engine_->setExclusiveOutput(config_->exclusiveOutput);
-    engine_->setBufferMillis(config_->bufferMillis);
-
-    // Defaults carry no endpoint IDs, so this re-resolves by name -- which is
-    // the point: it is how you recover from having pinned the wrong device.
-    engine_->setChannelDevice(kGame, { L"", config_->game.deviceNameMatch });
-    engine_->setChannelDevice(kChat, { L"", config_->chat.deviceNameMatch });
-    engine_->setChannelDevice(kMic,  { L"", config_->mic.deviceNameMatch });
-    engine_->setChannelDevice(-1,    { L"", config_->output.deviceNameMatch });
-
-    // Actually remove the Run entry rather than just unticking the box.
-    startup::setEnabled(false);
-    config_->startWithWindows = startup::isEnabled();
-
-    refreshDeviceLists();
-}
-
-bool MixerWindow::draw(float dt, int windowW, int windowH) {
-    bool changed = false;
-
-    deviceRefreshTimer_ -= dt;
-    if (deviceRefreshTimer_ <= 0.0f) { deviceRefreshTimer_ = 5.0f; if (showSettings_) refreshDeviceLists(); }
-
-    ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImVec2(float(windowW), float(windowH)));
-    ImGui::Begin("audio-monitor", nullptr,
-                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    const float avail = ImGui::GetContentRegionAvail().x;
-    contentWidth_ = std::min(avail, kMaxContentWidth);
-    const float margin = (avail - contentWidth_) * 0.5f;
-    if (margin > 1.0f) ImGui::Indent(margin);
-
-    for (auto& s : strips_) changed |= drawChannelStrip(s, dt);
-    ImGui::Dummy(ImVec2(0, 2));
-    changed |= drawOutputSection(dt);
-
-    if (showSettings_) changed |= drawSettings();
-
-    if (margin > 1.0f) ImGui::Unindent(margin);
-    ImGui::End();
-    return changed;
-}
-
 } // namespace audiomon::ui

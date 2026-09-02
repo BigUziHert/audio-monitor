@@ -1,4 +1,5 @@
 #include "audio/CaptureStream.h"
+#include "audio/AppAudio.h"
 #include "audio/RealtimeThread.h"
 #include "util/Log.h"
 #include "util/Text.h"
@@ -79,6 +80,7 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
     // predates this device and may even be at a different sample rate. Bumping
     // the epoch makes the mixer drop it and re-prime.
     epoch_.fetch_add(1, std::memory_order_release);
+    dropped_.store(0, std::memory_order_relaxed);
     quit_.store(false, std::memory_order_relaxed);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual reset: a stop stays stopped
     state_.store(StreamState::Opening, std::memory_order_release);
@@ -100,6 +102,7 @@ void CaptureStream::stopLocked() {
 }
 
 bool CaptureStream::openDevice(const DeviceRef& ref) {
+    if (mode_ == CaptureMode::Application) return openProcess(ref.nameMatch);
     const EDataFlow flow = (mode_ == CaptureMode::Loopback) ? eRender : eCapture;
 
     ComPtr<IMMDevice> device;
@@ -203,11 +206,55 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
     return true;
 }
 
+bool CaptureStream::openProcess(const std::wstring& path) {
+    if (!processCaptureSupported()) {
+        setError("App capture requires Windows build 20348+ and a recent Windows SDK", E_NOTIMPL);
+        return false;
+    }
+    const uint32_t pid = findAppProcess(path);
+    if (!pid) { setError("App is closed or has multiple independent instances; open one instance", E_FAIL); return false; }
+    process_ = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process_) { setError("Cannot access app", HRESULT_FROM_WIN32(GetLastError())); return false; }
+    HRESULT hr = activateProcessCapture(pid, stopEvent_, client_);
+    if (FAILED(hr) || !client_) { setError("App audio activation failed", hr); return false; }
+    WAVEFORMATEXTENSIBLE format;
+    buildFloat32Format(format, 48000, 2);
+    parseWaveFormat(&format.Format, format_);
+    converter_.configure(format_);
+    sampleRate_.store(48000, std::memory_order_release);
+    hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                             AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, 0, 0, &format.Format, nullptr);
+    if (FAILED(hr)) { setError("App audio Initialize", hr); return false; }
+    UINT32 frames = 0;
+    hr = client_->GetBufferSize(&frames);
+    if (FAILED(hr)) { setError("App capture buffer", hr); return false; }
+    scratch_.assign(static_cast<size_t>(frames) * 2, 0.0f);
+    hr = client_->GetService(__uuidof(IAudioCaptureClient), capture_.putVoid());
+    if (FAILED(hr)) { setError("App capture service", hr); return false; }
+    timer_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!timer_) { setError("App capture event", E_OUTOFMEMORY); return false; }
+    hr = client_->SetEventHandle(timer_);
+    if (SUCCEEDED(hr)) hr = client_->Start();
+    if (FAILED(hr)) { setError("App capture start", hr); return false; }
+    {
+        std::lock_guard<std::mutex> lock(infoMutex_);
+        resolvedName_ = path.substr(path.find_last_of(L"\\/") + 1);
+    }
+    processId_.store(pid, std::memory_order_relaxed);
+    return true;
+}
+
 void CaptureStream::closeDevice() {
     if (client_) client_->Stop();
     capture_.reset();
     client_.reset();
-    if (timer_) { CancelWaitableTimer(timer_); CloseHandle(timer_); timer_ = nullptr; }
+    if (timer_) {
+        if (mode_ != CaptureMode::Application) CancelWaitableTimer(timer_);
+        CloseHandle(timer_); timer_ = nullptr;
+    }
+    if (process_) { CloseHandle(process_); process_ = nullptr; }
+    processId_.store(0, std::memory_order_relaxed);
 }
 
 void CaptureStream::drainPackets() {
@@ -320,6 +367,12 @@ void CaptureStream::threadMain(DeviceRef ref) {
             const DWORD wr = WaitForMultipleObjects(waitCount, waits, FALSE, 100);
             if (wr == WAIT_OBJECT_0) break;                 // stop requested
             if (quit_.load(std::memory_order_relaxed)) break;
+
+            if (process_ && WaitForSingleObject(process_, 0) == WAIT_OBJECT_0) {
+                setError("App closed; waiting for it to reopen", E_FAIL);
+                state_.store(StreamState::Failed, std::memory_order_release);
+                break;
+            }
 
             drainPackets();
             if (state_.load(std::memory_order_acquire) == StreamState::Failed) break;

@@ -1,58 +1,40 @@
 #pragma once
-//
-// The mixer panel, modelled on the OBS audio mixer.
-//
-// The important property, and the reason this app exists: a fader here only
-// scales what is summed and sent to the capture card. Nothing in this UI ever
-// touches an endpoint's volume, so the level in the user's own headset is
-// unaffected -- exactly like OBS monitoring.
-//
 #include "audio/AudioEngine.h"
-#include "audio/Meter.h"
-#include "config/Config.h"
-
+#include "audio/AppAudio.h"
+#include "audio/Spectrum.h"
+#include "audio/Overlap.h"
 #include <array>
-#include <string>
-#include <vector>
 
 namespace audiomon::ui {
-
 class MixerWindow {
-public:
-    void init(AudioEngine* engine, Config* config);
+  public:
+    void init(AudioEngine *engine, Config *config, void *window);
+    bool draw(float dt, int width, int height);
+    bool exitRequested() const {
+        return exitRequested_;
+    }
 
-    // Draws one frame. Returns true if a setting changed and the config should
-    // be written back.
-    bool draw(float dtSeconds, int windowW, int windowH);
-
-    bool exitRequested() const { return exitRequested_; }
-
-private:
-    struct Strip {
-        MeterBallistics meterL, meterR;
-        std::string     title;
-        int             index = 0;
-    };
-
-    bool drawChannelStrip(Strip& strip, float dt);
-    bool drawOutputSection(float dt);
-    bool drawSettings();
-    void restoreDefaults();
-    void refreshDeviceLists();
-
-    AudioEngine* engine_ = nullptr;
-    Config*      config_ = nullptr;
-
-    std::array<Strip, kChannelCount> strips_;
-    MeterBallistics outMeterL_, outMeterR_;
-
-    std::vector<DeviceInfo> renderDevices_;
-    std::vector<DeviceInfo> captureDevices_;
-    bool  deviceListsLoaded_ = false;
-    float contentWidth_      = 0.0f;   // capped and centred; set each frame
-    bool  showSettings_      = false;
-    bool  exitRequested_     = false;
-    float deviceRefreshTimer_ = 0.0f;
+  private:
+    void refreshDevices();
+    void refreshStatus(float dt);
+    void restart();
+    bool drawSource(size_t index, float width, float dt);
+    bool drawDialogs();
+    AudioEngine *engine_ = nullptr;
+    Config *config_ = nullptr;
+    void *window_ = nullptr;
+    std::array<MeterBallistics, kMaxSources> meters_;
+    MeterBallistics outputMeter_;
+    Spectrum spectrum_;
+    std::vector<DeviceInfo> playback_, microphones_;
+    std::vector<AppAudioInfo> apps_;
+    std::string status_ = "Stopped", statusDetail_;
+    int severity_ = 0;
+    float scale_ = 1, refreshTimer_ = 0, clippingTimer_ = 0, dropoutTimer_ = 0;
+    uint64_t lastUnderruns_ = 0, lastDropped_ = 0;
+    bool exitRequested_ = false, openSettings_ = false, openSource_ = false;
+    int editSource_ = -1;
+    ChannelConfig draft_;
+    char name_[128]{};
 };
-
 } // namespace audiomon::ui

@@ -12,6 +12,20 @@ if(NOT WIN32)
   message(FATAL_ERROR "audio-monitor targets Windows only (WASAPI). Use cmake/mingw-w64-x86_64.cmake to cross-compile for portability checks.")
 endif()
 
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(dsp-test tests/dsp_test.cpp)
+  target_link_libraries(dsp-test PRIVATE audiomon_core)
+  add_test(NAME dsp COMMAND dsp-test)
+  add_executable(config-test tests/config_test.cpp)
+  target_link_libraries(config-test PRIVATE audiomon_core)
+  add_test(NAME config COMMAND config-test)
+  add_executable(app-capture-test tests/app_capture_test.cpp)
+  target_link_libraries(app-capture-test PRIVATE audiomon_core)
+  add_test(NAME app-capture COMMAND app-capture-test)
+  set_tests_properties(app-capture PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 35)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -48,6 +62,7 @@ endif()
 # Everything that is not UI. Linked by both the GUI app and the CLI tool so the
 # audio path can be brought up and verified without any window existing.
 add_library(audiomon_core STATIC
+  src/audio/AppAudio.cpp
   src/audio/DeviceManager.cpp
   src/audio/CaptureStream.cpp
   src/audio/RenderStream.cpp
@@ -63,7 +78,7 @@ add_library(audiomon_core STATIC
 target_include_directories(audiomon_core PUBLIC src)
 target_link_libraries(audiomon_core PUBLIC
   audiomon_flags
-  ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32
+  mmdevapi ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32
 )
 
 # --------------------------------------------------------------------- cli ---
@@ -110,6 +125,11 @@ if(AUDIOMON_BUILD_GUI)
     res/app.rc
   )
   target_link_libraries(audio-monitor PRIVATE audiomon_core imgui)
+  if(BUILD_TESTING)
+    add_executable(ui-test tests/ui_test.cpp src/ui/MixerWindow.cpp src/ui/Theme.cpp)
+    target_link_libraries(ui-test PRIVATE audiomon_core imgui)
+    add_test(NAME dashboard COMMAND ui-test)
+  endif()
 
   # The entry point is wWinMain. MSVC resolves that from /SUBSYSTEM:WINDOWS
   # with UNICODE defined; mingw needs -municode to select the wide runtime

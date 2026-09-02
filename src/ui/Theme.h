@@ -1,11 +1,10 @@
 #pragma once
 //
-// Visual style. Modelled on the OBS audio mixer: dark, flat, and legible at a
-// glance rather than decorative.
+// Dashboard palette and conventional dBFS meter zones.
 //
 namespace audiomon::ui {
 
-inline constexpr float kColBackground[3] = { 0.129f, 0.133f, 0.145f };
+inline constexpr float kColBackground[3] = { 0.035f, 0.047f, 0.055f };
 
 // Meter zones, matching the convention OBS uses so the colours mean the same
 // thing to someone who already reads that mixer.

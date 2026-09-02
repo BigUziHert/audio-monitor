@@ -1,16 +1,9 @@
 //
 // Tray-resident mixer application.
 //
-// Window behaviour, which is most of what makes this pleasant to live with:
-//
-//  * Minimise and close both HIDE the window rather than minimising or
-//    exiting. A hidden window is gone from the taskbar and from Alt-Tab
-//    entirely, which is what "in the tray, not alongside normal windows"
-//    means. Exit is only ever reached through the tray menu.
-//  * While hidden the process does no rendering at all -- no D3D device, no
-//    swapchain, no timer -- and blocks in GetMessage. That matters because
-//    this thing sits in the tray for hours while a game has the GPU.
-//  * While visible it runs a normal vsync-paced loop so the meters move.
+// Minimize hides to the tray, releasing the renderer while audio continues.
+// Close exits unless the user enables close-to-tray in Settings.
+// The dashboard owns the title bar; Windows still handles sizing and snapping.
 //
 #include "audio/AudioEngine.h"
 #include "config/Config.h"
@@ -21,6 +14,8 @@
 #include "util/Startup.h"
 
 #include <windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 
@@ -36,11 +31,8 @@ namespace {
 constexpr wchar_t kWindowClass[] = L"AudioMonitorWindow";
 constexpr wchar_t kWindowTitle[] = L"Audio Monitor";
 constexpr wchar_t kMutexName[]   = L"Local\\AudioMonitorSingleInstance";
-// Deliberately compact. The content is capped and centred, so a wider window
-// only adds margins -- there is nothing to gain from opening large, and this is
-// a panel you glance at rather than work in.
-constexpr int     kWindowWidth   = 620;
-constexpr int     kWindowHeight  = 600;
+constexpr int     kWindowWidth   = 1440;
+constexpr int     kWindowHeight  = 890;
 
 // Sent by a second instance to bring the running one to the front.
 UINT g_showMessage = 0;
@@ -100,8 +92,8 @@ void saveConfigIfDirty(App& app, bool force) {
     // failed to start, its atomics still hold construction defaults, and
     // copying those over the loaded config would silently reset every fader
     // and mute the user had saved.
-    if (app.engineRunning) app.engine.updateConfigFromRuntime(app.config);
-    app.config.save();
+    if (app.engine.running()) app.engine.updateConfigFromRuntime(app.config);
+    if (!app.config.save()) return;  // retain dirty state and retry a failed save
     app.configDirty = false;
     app.lastSave    = now;
 }
@@ -120,6 +112,33 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (g_showMessage && msg == g_showMessage && app) { showWindow(*app); return 0; }
 
     switch (msg) {
+        case WM_NCCALCSIZE:
+            if (wp) {
+                // Keep the client in the work area when maximized.
+                if (IsZoomed(hwnd)) {
+                    MONITORINFO info{sizeof(info)};
+                    GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info);
+                    reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] = info.rcWork;
+                }
+                return 0;
+            }
+            break;
+        case WM_NCHITTEST: {
+            if (IsZoomed(hwnd)) return HTCLIENT;
+            POINT pt{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt);
+            RECT rc{}; GetClientRect(hwnd,&rc);
+            const int edge=7;
+            const bool left=pt.x<edge,right=pt.x>=rc.right-edge,top=pt.y<edge,bottom=pt.y>=rc.bottom-edge;
+            if(top)return left?HTTOPLEFT:right?HTTOPRIGHT:HTTOP;
+            if(bottom)return left?HTBOTTOMLEFT:right?HTBOTTOMRIGHT:HTBOTTOM;
+            if(left)return HTLEFT; if(right)return HTRIGHT;
+            return HTCLIENT;
+        }
+        case WM_DPICHANGED: {
+            const auto* rect=reinterpret_cast<RECT*>(lp);
+            SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOZORDER|SWP_NOACTIVATE);
+            return 0;
+        }
         case ui::kTrayCallbackMessage: {
             // Under NOTIFYICON_VERSION_4 the event is in the low word of lParam.
             switch (LOWORD(lp)) {
@@ -161,8 +180,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case WM_CLOSE:
-            // The close button hides. Exit is deliberate, via the tray menu.
-            if (app) hideWindow(*app);
+            if (app && app->config.closeToTray) hideWindow(*app);
+            else DestroyWindow(hwnd);
             return 0;
 
         case WM_SIZE:
@@ -173,8 +192,8 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_GETMINMAXINFO: {
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-            mmi->ptMinTrackSize.x = 460;
-            mmi->ptMinTrackSize.y = 420;
+            mmi->ptMinTrackSize.x = 960;
+            mmi->ptMinTrackSize.y = 600;
             return 0;
         }
 
@@ -199,6 +218,7 @@ bool commandLineHas(const wchar_t* flag) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
+    ImGui_ImplWin32_EnableDpiAwareness();
     g_showMessage = RegisterWindowMessageW(L"AudioMonitorShowWindow");
 
     // Single instance: a second launch just raises the first one's window.
@@ -255,8 +275,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                                nullptr, nullptr, hInstance, nullptr);
     if (!app.hwnd) { CoUninitialize(); return 1; }
 
+    SetWindowPos(app.hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
+    const DWORD cornerPreference=2; // DWMWCP_ROUND, harmless on older Windows.
+    DwmSetWindowAttribute(app.hwnd,33,&cornerPreference,sizeof(cornerPreference));
     app.tray.add(app.hwnd, icon, kWindowTitle);
-    app.mixer.init(&app.engine, &app.config);
+    app.mixer.init(&app.engine, &app.config, app.hwnd);
 
     app.engineRunning = app.engine.start(app.config);
     if (!app.engineRunning) {

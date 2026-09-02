@@ -19,7 +19,11 @@ param(
     [ValidateSet('Release', 'Debug', 'RelWithDebInfo')]
     [string]$Config = 'Release',
 
-    [switch]$Clean
+    [switch]$Clean,
+
+    [string]$BuildDir = 'build',
+
+    [switch]$Test
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,6 +31,11 @@ $repo = Split-Path -Parent $PSScriptRoot
 Push-Location $repo
 
 try {
+    $buildPath = [IO.Path]::GetFullPath((Join-Path $repo $BuildDir))
+    $workspacePrefix = [IO.Path]::GetFullPath($repo).TrimEnd('\') + '\'
+    if (-not $buildPath.StartsWith($workspacePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'BuildDir must be a subdirectory of this repository.'
+    }
     # --- locate Visual Studio -------------------------------------------------
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path $vswhere)) {
@@ -83,24 +92,29 @@ Then open a NEW terminal so the updated PATH takes effect.
     }
 
     # --- build ----------------------------------------------------------------
-    if ($Clean -and (Test-Path build)) {
+    if ($Clean -and (Test-Path -LiteralPath $buildPath)) {
         Write-Host "Removing previous build directory..." -ForegroundColor Yellow
-        Remove-Item -Recurse -Force build
+        Remove-Item -LiteralPath $buildPath -Recurse -Force
     }
 
-    & $cmakeExe -S . -B build -G 'Visual Studio 17 2022' -A x64
+    & $cmakeExe -S . -B $buildPath -G 'Visual Studio 17 2022' -A x64
     if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE." }
 
-    & $cmakeExe --build build --config $Config
+    & $cmakeExe --build $buildPath --config $Config
     if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE." }
 
     Write-Host ""
     Write-Host "Build succeeded." -ForegroundColor Green
-    Get-ChildItem (Join-Path 'build' $Config) -Filter *.exe -ErrorAction SilentlyContinue |
+    if ($Test) {
+        $ctestExe = Join-Path (Split-Path $cmakeExe) 'ctest.exe'
+        & $ctestExe --test-dir $buildPath -C $Config --output-on-failure
+        if ($LASTEXITCODE -ne 0) { throw "Tests failed with exit code $LASTEXITCODE." }
+    }
+    Get-ChildItem (Join-Path $buildPath $Config) -Filter *.exe -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host ("  {0}  ({1:N0} bytes)" -f $_.FullName, $_.Length) }
     Write-Host ""
     Write-Host "Start with the headless tool -- it opens no audio devices:" -ForegroundColor Cyan
-    Write-Host "    .\build\$Config\audiomon-cli.exe --list"
+    Write-Host "    .\$BuildDir\$Config\audiomon-cli.exe --list"
 }
 finally {
     Pop-Location

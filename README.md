@@ -17,19 +17,43 @@ arrives over HDMI as a single feed.
 
 ## What it does
 
-- **Three input channels.** Two are WASAPI *loopback* captures of render
-  endpoints (the Arctis Game and Chat outputs); the third is an ordinary
-  shared-mode capture of a USB microphone.
-- **One output.** All three are summed and rendered to the capture card's
-  endpoint, in exclusive mode where possible.
-- **An OBS-style mixer.** Per channel: a dB-linear fader, a mute button, and a
-  stereo peak meter with peak-hold and OBS's colour zones.
-- **Faders are monitor-only.** Moving a fader changes what reaches the capture
-  card and nothing else. The level in your own headset is untouched, exactly
-  like OBS monitoring.
-- **Lives in the tray.** Optionally starts with Windows, minimised. Minimising
-  or closing hides it from the taskbar and Alt-Tab entirely, leaving only the
-  tray icon.
+- **Dashboard mixer.** A dark two-column layout with source cards, a live
+  frequency spectrum, output selection, and audio health status.
+- **Up to 16 sources.** Add playback devices, microphones, or individual
+  applications such as Discord. The original Game, Chat, and Microphone
+  selections are migrated automatically.
+- **Independent source controls.** The checkmark includes/excludes a source;
+  the speaker mutes it while retaining its gain. The arrow opens source
+  selection, naming, gain boost, and removal. Sliders adjust the forwarded
+  mix without changing Windows or headset volumes.
+- **Stereo / Mono.** Click the Channels card to switch live. Mono averages
+  left and right and sends the same signal to both sides, with a short ramp
+  to avoid a click. The selection is saved.
+- **Useful status.** Click Status for details about unavailable devices,
+  clipping, recent buffer drops, duplicate sources, or output feedback risk.
+  Selecting a playback endpoint and an app routed through it reports
+  **Duplicate audio**. Unconfirmed app routing reports **Possible duplicate**.
+  Warnings update about every two seconds and clear when sources are muted,
+  disabled, removed, or routed separately. Detection uses Windows session
+  routing; it does not analyze acoustic microphone echo.
+- **Master output controls.** Pick the destination, adjust its mix gain, or
+  mute the combined output. Stop/Start Monitoring preserves your configuration.
+- **Tray support.** Minimize keeps audio running and releases the renderer.
+  Close exits by default; Settings can make Close hide to the tray instead.
+  Optional Windows startup and hidden manual launch remain available.
+
+Application capture requires **Windows build 20348 or later** (Windows 11
+recommended) and a Windows SDK that includes `audioclientactivationparams.h`.
+It captures the selected process and its children, regardless of output device.
+Start audio in an app and use Refresh if it is missing from the picker. The
+executable path is saved, so a normal app restart reconnects automatically;
+after an app update moves its executable, select it again. Multiple independent
+instances at the same path are reported as ambiguous; close extra instances.
+See Microsoft's [process loopback documentation](https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params).
+
+Adding, removing, or replacing a source briefly restarts a running mix.
+Volume, mute, stereo/mono, and buffer changes apply live. Sample Rate displays
+the actual negotiated output rate; configure the device format in Windows Sound.
 
 ## Why loopback instead of a virtual audio driver
 
@@ -79,8 +103,9 @@ Passivity is enforced structurally rather than by good intentions:
 
 ## Building
 
-Requires **Visual Studio 2022** (or the standalone Build Tools) with the C++
-workload, and **CMake 3.21+**. Dear ImGui is fetched automatically by CMake, so
+Requires **Visual Studio 2022** (or the standalone Build Tools) with the
+Desktop development with C++ workload, a **Windows 11 SDK** (22621 or newer
+recommended), and **CMake 3.21+**. Dear ImGui is fetched automatically by CMake, so
 the first configure needs a network connection.
 
 ```powershell
@@ -109,6 +134,33 @@ The binaries land in `build\Release\`:
 | --- | --- |
 | `audio-monitor.exe` | the tray application |
 | `audiomon-cli.exe`  | a headless console tool, useful for bring-up |
+
+### Build and test the devchatgpt branch
+
+Exit any running Audio Monitor instance first (tray menu > Exit). Windows
+cannot replace an executable that is still running, and launching a second
+instance only shows the first one's window.
+
+```powershell
+git switch devchatgpt
+git pull --ff-only origin devchatgpt
+.\scripts\build.ps1 -BuildDir build-devchatgpt -Test
+.\build-devchatgpt\Release\audio-monitor.exe
+```
+
+`-BuildDir` is optional and defaults to `build`. `-Test` runs DSP, configuration
+migration, headless dashboard, and process-capture activation/restart tests.
+The capture test only opens its own process; it does not play sound or modify
+Windows audio routing. It skips on systems without process capture support.
+The headless dashboard test exercises layouts and controls without a desktop
+window; audible behavior still needs a test with your devices.
+
+To test overlap, add your speaker/headphone endpoint and add Discord as an
+Application audio source. Play Discord audio through that endpoint: Status
+should turn amber with Duplicate audio and identify both sources. Muting or
+disabling either source clears the overlap warning. Click Channels to compare
+Stereo and Mono; Stop Monitoring should silence the forwarded mix and leave
+its configuration ready to resume.
 
 ### Bring-up: get audio flowing before worrying about the UI
 
@@ -148,17 +200,27 @@ whenever you change something in the UI.
 
 ```json
 {
-  "version": 1,
-  "game":   { "deviceId": "{0.0.0.00000000}.{...}", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "muted": false },
-  "chat":   { "deviceId": "",                       "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "muted": false },
-  "mic":    { "deviceId": "",                       "deviceName": "USB Advanced Audio Device", "gain": 1, "muted": false },
-  "output": { "deviceId": "",                       "deviceName": "Elgato 4K", "gain": 1, "muted": false },
+  "version": 2,
+  "sources": [
+    { "label": "Headphones", "kind": "playback", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "enabled": true, "gain": 1, "muted": false },
+    { "label": "Chat Audio", "kind": "playback", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "enabled": true, "gain": 1, "muted": false },
+    { "label": "Microphone", "kind": "microphone", "deviceId": "", "deviceName": "USB Advanced Audio Device", "enabled": true, "gain": 1, "muted": false }
+  ],
+  "output": { "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "muted": false },
+  "mono": false,
+  "closeToTray": false,
   "exclusiveOutput": true,
   "startWithWindows": false,
   "startMinimized": false,
   "bufferMillis": 50
 }
 ```
+
+On the first save of a version 1 configuration, the original is preserved as
+`config.json.v1.bak` beside `config.json`. To return to an older build, exit the
+app and copy that backup over `config.json`. Application sources additionally
+store `processPath`; process IDs are deliberately not persisted.
+
 
 Each device is stored **twice**: as an exact endpoint ID and as a
 case-insensitive friendly-name substring. The ID is tried first. If it no
@@ -175,7 +237,7 @@ error. This is not hypothetical: on a machine with Elgato Wave Link installed,
 *virtual driver* rather than the capture card. The defaults are chosen to be
 unambiguous, not merely plausible.
 
-If a default picks nothing or is ambiguous on your machine, open **Settings**
+If a default picks nothing or is ambiguous on your machine, open the source card's **arrow**
 in the app and choose the endpoint explicitly; the exact ID is then persisted.
 
 `startWithWindows` registers `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
@@ -241,7 +303,7 @@ task class so a fullscreen game cannot starve it, with denormal flushing (FTZ
 *and* DAZ) enabled per-thread, and it performs no allocation, no locking, no
 logging and no COM calls. Everything it touches is preallocated at startup.
 
-Thread topology is three capture threads plus one render thread, communicating
+Thread topology is one capture thread per enabled source plus one render thread, communicating
 through lock-free SPSC ring buffers. The alternative — draining all three
 captures on the render thread — was rejected because `GetBuffer`/`ReleaseBuffer`
 are COM calls with no non-blocking guarantee, and one stalled capture device
@@ -265,6 +327,14 @@ Notifications are debounced by 750 ms, because a driver reinstall fires a burst
 of them. A capture that fails is retried; the capture card enumerating late on
 a cold boot is treated as a normal startup state rather than an error, and the
 app attaches to it automatically when it appears.
+
+### Spectrum display
+
+The render thread feeds a bounded visualization queue. A 2,048-point Hann-windowed
+FFT runs on the UI thread and displays 64 logarithmic bands (30 Hz to 20 kHz,
+limited by Nyquist). The two sides are analyzed separately so opposite-polarity
+stereo signals do not disappear from the graph. Visualization samples are
+dropped when the queue fills; the audio path never waits for the window.
 
 ### Output format negotiation
 

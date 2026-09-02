@@ -26,7 +26,7 @@
 
 namespace audiomon {
 
-enum class CaptureMode { Loopback, Microphone };
+enum class CaptureMode { Loopback, Microphone, Application };
 
 class CaptureStream {
 public:
@@ -70,11 +70,13 @@ public:
     std::wstring        resolvedId() const;
     uint64_t            droppedFrames() const noexcept { return dropped_.load(std::memory_order_relaxed); }
     std::string         lastError() const;
+    uint32_t processId() const { return processId_.load(std::memory_order_relaxed); }
 
 private:
     void stopLocked();          // caller holds lifecycleMutex_
     void threadMain(DeviceRef ref);
     bool openDevice(const DeviceRef& ref);
+    bool openProcess(const std::wstring& path);
     void closeDevice();
     void drainPackets();
     void setError(const char* what, HRESULT hr);
@@ -95,6 +97,8 @@ private:
     std::thread  thread_;
     HANDLE       stopEvent_  = nullptr;
     HANDLE       timer_      = nullptr;
+    HANDLE       process_    = nullptr;
+    std::atomic<uint32_t> processId_{0};
 
     ComPtr<IAudioClient>        client_;
     ComPtr<IAudioCaptureClient> capture_;
