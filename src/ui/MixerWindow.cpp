@@ -439,7 +439,11 @@ bool MixerWindow::draw(float dt, int width, int height) {
     c.rect(1, 1, w - 2, h - 2, background, 22);
     c.icon(Wave, 65, 54, purple, 40);
     c.text(109, 36, "Audio Monitor", 31, white, true);
-    c.hit("Move window", 320, 12, w - 590, 75, "Drag to move the window");
+    // A mouse drag region, not a focusable control with the shared purple outline.
+    ImGui::SetCursorScreenPos(c.p(320, 12));
+    ImGui::InvisibleButton("Move window", {(w - 590) * scale_, 75 * scale_});
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Drag to move the window");
     if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         ReleaseCapture();
         PostMessageW(static_cast<HWND>(window_), WM_NCLBUTTONDOWN, HTCAPTION, 0);
