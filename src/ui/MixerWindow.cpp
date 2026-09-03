@@ -444,7 +444,11 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
     if (subtitle.empty())
         subtitle = "Choose a device";
     c.text(90, 61, subtitle, 18, gray, false, width - 108);
-    c.hit("Source details", 90, 59, width - 108, 30, subtitle.c_str());
+    // Keep the full description available on hover without creating a keyboard stop.
+    ImGui::SetCursorScreenPos(c.p(90, 59));
+    ImGui::Dummy({(width - 108) * scale_, 30 * scale_});
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", subtitle.c_str());
     c.rect(width - 107, 30, 34, 36, source.enabled ? purple : IM_COL32(43, 48, 55, 255), 7, false);
     if (source.enabled)
         c.icon(Check, width - 90, 48, white, 26);
