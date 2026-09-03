@@ -1,6 +1,7 @@
 #include "ui/MixerWindow.h"
 #include "util/Startup.h"
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -263,6 +264,47 @@ std::string sourceName(const ChannelConfig &c) {
            : c.kind == SourceKind::Microphone  ? "Microphone"
                                                : "Playback Audio";
 }
+ImVec4 popupBounds(float scale) {
+    const auto *viewport = ImGui::GetMainViewport();
+    const float margin = std::ceil(12 * scale);
+    return {viewport->WorkPos.x + margin, viewport->WorkPos.y + margin,
+            viewport->WorkPos.x + viewport->WorkSize.x - margin,
+            viewport->WorkPos.y + viewport->WorkSize.y - margin};
+}
+void constrainPopupPosition(ImGuiSizeCallbackData *data) {
+    // Avoid a one-pixel scrollbar when scaled text produces a fractional height.
+    data->DesiredSize.y = std::ceil(data->DesiredSize.y);
+    // Size callbacks run during Begin, before the frame and contents are drawn.
+    // Preserve a pending centered position on opening; ImGui applies its pivot
+    // after calculating the constrained size, including the first measuring frame.
+    if (ImGui::GetCurrentWindow()->SetWindowPosVal.x != FLT_MAX)
+        return;
+    const auto &bounds = *static_cast<const ImVec4 *>(data->UserData);
+    const ImVec2 pos{std::clamp(data->Pos.x, bounds.x, std::max(bounds.x, bounds.z - data->DesiredSize.x)),
+                     std::clamp(data->Pos.y, bounds.y, std::max(bounds.y, bounds.w - data->DesiredSize.y))};
+    if (pos.x != data->Pos.x || pos.y != data->Pos.y)
+        ImGui::SetWindowPos(pos);
+}
+void constrainNextPopup(ImVec4 &bounds, ImVec2 minSize, ImVec2 maxSize) {
+    maxSize.x = std::min(maxSize.x, bounds.z - bounds.x);
+    maxSize.y = std::floor(std::min(maxSize.y, bounds.w - bounds.y));
+    minSize.x = std::min(minSize.x, maxSize.x);
+    minSize.y = std::min(minSize.y, maxSize.y);
+    ImGui::SetNextWindowSizeConstraints(minSize, maxSize, constrainPopupPosition, &bounds);
+}
+bool beginBoundedPopup(const char *name, float scale, ImVec2 minSize = {0, 0},
+                       ImVec2 maxSize = {FLT_MAX, FLT_MAX}) {
+    auto bounds = popupBounds(scale);
+    constrainNextPopup(bounds, minSize, maxSize);
+    return ImGui::BeginPopup(name, ImGuiWindowFlags_NoMove);
+}
+bool beginBoundedModal(const char *name, float width, float scale) {
+    auto bounds = popupBounds(scale);
+    ImGui::SetNextWindowSize({width * scale, 0}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
+    constrainNextPopup(bounds, {width * scale, 0}, {width * scale, FLT_MAX});
+    return ImGui::BeginPopupModal(name, nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+}
 } // namespace
 void MixerWindow::init(AudioEngine *engine, Config *config, void *window) {
     engine_ = engine;
@@ -511,7 +553,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
         } else
             ImGui::OpenPopup("Source limit");
     }
-    if (ImGui::BeginPopup("Source limit")) {
+    if (beginBoundedPopup("Source limit", scale_)) {
         ImGui::TextUnformatted("Up to 16 sources can be mixed at once.");
         ImGui::EndPopup();
     }
@@ -580,7 +622,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
             else
                 openSettings_ = true;
         }
-        if (i == 2 && ImGui::BeginPopup("Mix channels")) {
+        if (i == 2 && beginBoundedPopup("Mix channels", scale_)) {
             for (int mode = 0; mode < 2; ++mode)
                 if (ImGui::Selectable(mode ? "Mono - same mix on both sides"
                                            : "Stereo - separate left and right",
@@ -593,7 +635,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
         }
         if (i == 3) {
             ImGui::SetNextWindowSize({490 * scale_, 0});
-            if (ImGui::BeginPopup("Audio status")) {
+            if (beginBoundedPopup("Audio status", scale_)) {
                 ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(statusColor), "%s", status_.c_str());
                 ImGui::Separator();
                 ImGui::TextWrapped("%s", statusDetail_.c_str());
@@ -628,8 +670,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
         refreshDevices();
         ImGui::OpenPopup("Output device");
     }
-    ImGui::SetNextWindowSizeConstraints({350 * scale_, 0}, {800 * scale_, 450 * scale_});
-    if (ImGui::BeginPopup("Output device")) {
+    if (beginBoundedPopup("Output device", scale_, {350 * scale_, 0}, {800 * scale_, 450 * scale_})) {
         if (playback_.empty())
             ImGui::TextUnformatted("No playback devices found. Connect one and refresh.");
         for (const auto &device : playback_) {
@@ -706,9 +747,7 @@ bool MixerWindow::drawDialogs() {
         ImGui::OpenPopup("Configure source");
         openSource_ = false;
     }
-    ImGui::SetNextWindowSize({650 * scale_, 0}, ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
-    if (ImGui::BeginPopupModal("Configure source", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (beginBoundedModal("Configure source", 650, scale_)) {
         ImGui::TextUnformatted(editSource_ < 0 ? "Add an audio source" : "Source settings");
         ImGui::Separator();
         int kind = static_cast<int>(draft_.kind);
@@ -809,9 +848,7 @@ bool MixerWindow::drawDialogs() {
         ImGui::OpenPopup("Settings");
         openSettings_ = false;
     }
-    ImGui::SetNextWindowSize({660 * scale_, 0}, ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
-    if (ImGui::BeginPopupModal("Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (beginBoundedModal("Settings", 660, scale_)) {
         ImGui::TextUnformatted("Audio");
         ImGui::Separator();
         ImGui::Text("Sample rate: %u Hz", engine_->outputStatus().sampleRate);
@@ -850,7 +887,7 @@ bool MixerWindow::drawDialogs() {
             } else
                 ImGui::OpenPopup("Startup setting failed");
         }
-        if (ImGui::BeginPopup("Startup setting failed")) {
+        if (beginBoundedPopup("Startup setting failed", scale_)) {
             ImGui::TextUnformatted("Could not update Windows startup. Please try again.");
             ImGui::EndPopup();
         }
@@ -866,7 +903,7 @@ bool MixerWindow::drawDialogs() {
         ImGui::SameLine();
         if (ImGui::Button("Exit application"))
             exitRequested_ = true;
-        if (ImGui::BeginPopupModal("Restore defaults?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (beginBoundedModal("Restore defaults?", 560, scale_)) {
             ImGui::TextWrapped("Reset all sources, devices, gains, and application preferences?");
             if (ImGui::Button("Reset")) {
                 bool startupChanged = startup::setEnabled(false), oldStartup = config_->startWithWindows;

@@ -108,6 +108,68 @@ int main() {
         expect(mixer.hitTitleBar(700, 50, 1600, 986), "Title bar stays blocked after dismissing Status");
         click(670, 900);
         expect(popup() != nullptr, "Settings blocked after dismissing Status");
+        auto expectPopupFits = [&](ImGuiWindow *dialog) {
+            expect(dialog && dialog->Pos.x >= 0 && dialog->Pos.y >= 0 &&
+                       dialog->Pos.x + dialog->Size.x <= io.DisplaySize.x &&
+                       dialog->Pos.y + dialog->Size.y <= io.DisplaySize.y,
+                   "Popup extends beyond the application");
+        };
+        auto dragAndResizePopup = [&]() {
+            auto *dialog = popup();
+            if (!dialog) { expect(false, "Missing dialog for drag test"); return; }
+            const ImVec2 original = dialog->Pos;
+            const ImVec2 grab{dialog->Pos.x + dialog->Size.x / 2,
+                              dialog->Pos.y + dialog->TitleBarHeight / 2};
+            io.AddMousePosEvent(grab.x, grab.y);
+            frame(1600, 986);
+            io.AddMouseButtonEvent(0, true);
+            frame(1600, 986);
+            io.AddMousePosEvent(grab.x + 20, grab.y + 20);
+            frame(1600, 986);
+            expect(dialog->Pos.x > original.x && dialog->Pos.y > original.y,
+                   "Popup can no longer be dragged within the application");
+            for (auto target : {ImVec2(-500, 400), ImVec2(800, -500),
+                                ImVec2(2100, 400), ImVec2(800, 1500)}) {
+                io.AddMousePosEvent(target.x, target.y);
+                frame(1600, 986);
+                expectPopupFits(dialog);
+            }
+            io.AddMouseButtonEvent(0, false);
+            frame(1600, 986);
+            expectPopupFits(dialog);
+            // Resize with the popup still open; check every frame, including
+            // the transition while auto-sized content is being remeasured.
+            for (int i = 0; i < 3; ++i) {
+                frame(960, 600);
+                expectPopupFits(dialog);
+            }
+            ImGui::SetScrollY(dialog, dialog->ScrollMax.y);
+            frame(960, 600);
+            expect(dialog->DC.CursorPosPrevLine.y >= dialog->Pos.y + dialog->TitleBarHeight &&
+                       dialog->DC.CursorPosPrevLine.y + 20 <= dialog->Pos.y + dialog->Size.y,
+                   "Popup action buttons are unreachable at minimum window size");
+            for (auto size : {ImVec2(1440, 890), ImVec2(1600, 986)}) {
+                for (int i = 0; i < 3; ++i) {
+                    frame(int(size.x), int(size.y));
+                    expectPopupFits(dialog);
+                }
+                expect(dialog->ScrollMax.y == 0, "Unnecessary scrollbar when the dialog fits");
+            }
+        };
+        dragAndResizePopup(); // Settings
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 110, dialog->DC.CursorPosPrevLine.y + 10); // Restore defaults
+        expect(popup() && std::strcmp(popup()->Name, "Restore defaults?") == 0,
+               "Confirmation popup missing");
+        dragAndResizePopup(); // Nested confirmation, without resetting anything.
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorPosPrevLine.x - 20, dialog->DC.CursorPosPrevLine.y + 10); // Cancel
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 20, dialog->DC.CursorPosPrevLine.y + 10); // Done
+        expect(!popup(), "Settings remained open after drag tests");
+        click(440, 239); // Configure the first source.
+        expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
+        dragAndResizePopup();
         ImGui::DestroyContext();
     }
     CoUninitialize();
