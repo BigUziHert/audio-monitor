@@ -92,9 +92,20 @@ int main() {
         expect(popup() != nullptr, "Settings blocked after adjusting volume");
         expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from a modal");
         if (auto *dialog = popup()) {
-            click(dialog->DC.CursorStartPos.x + 20, dialog->DC.CursorPosPrevLine.y + 10); // Done
+            click(dialog->DC.CursorStartPos.x + 220, dialog->DC.CursorStartPos.y + 231); // Start hidden
+            expect(!config.startMinimized, "Settings draft applied before Save");
+            click(dialog->DC.CursorStartPos.x + 453, dialog->DC.CursorStartPos.y + 716); // Cancel
         }
-        expect(!popup(), "Done did not close Settings");
+        expect(!popup(), "Cancel did not close Settings");
+        expect(!config.startMinimized, "Cancel did not discard Settings changes");
+        click(670, 900); // Reopen Settings and verify Save commits the draft.
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 220, dialog->DC.CursorStartPos.y + 231); // Start hidden
+            expect(!config.startMinimized, "Settings draft applied before Save");
+            click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save
+        }
+        expect(!popup() && config.startMinimized, "Save did not commit Settings changes");
+        config.startMinimized = false;
         expect(mixer.hitTitleBar(700, 50, 1600, 986), "Title bar stays blocked after closing Settings");
         click(1200, 488); // Channels again, with no Escape between any actions.
         expect(popup() != nullptr, "Channels blocked after closing Settings");
@@ -119,7 +130,7 @@ int main() {
             if (!dialog) { expect(false, "Missing dialog for drag test"); return; }
             const ImVec2 original = dialog->Pos;
             const ImVec2 grab{dialog->Pos.x + dialog->Size.x / 2,
-                              dialog->Pos.y + dialog->TitleBarHeight / 2};
+                              dialog->Pos.y + (dialog->TitleBarHeight > 0 ? dialog->TitleBarHeight / 2 : 20)};
             io.AddMousePosEvent(grab.x, grab.y);
             frame(1600, 986);
             io.AddMouseButtonEvent(0, true);
@@ -160,17 +171,20 @@ int main() {
                 expect(dialog->ScrollMax.y == 0, "Unnecessary scrollbar when the dialog fits");
             }
         };
-        dragAndResizePopup(); // Settings
+        dragAndResizePopup(false); // Settings
         if (auto *dialog = popup())
-            click(dialog->DC.CursorStartPos.x + 110, dialog->DC.CursorPosPrevLine.y + 10); // Restore defaults
+            click(dialog->DC.CursorStartPos.x + 83, dialog->DC.CursorStartPos.y + 716); // Restore defaults
         expect(popup() && std::strcmp(popup()->Name, "Restore defaults?") == 0,
                "Confirmation popup missing");
-        dragAndResizePopup(); // Nested confirmation, without resetting anything.
+        dragAndResizePopup(); // Nested confirmation.
         if (auto *dialog = popup())
-            click(dialog->DC.CursorPosPrevLine.x - 20, dialog->DC.CursorPosPrevLine.y + 10); // Cancel
+            click(dialog->DC.CursorStartPos.x + 20, dialog->DC.CursorPosPrevLine.y + 10); // Reset
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
+               "Reset did not return to Settings");
+        expect(config.output.gain < .9f, "Restore defaults applied before Save");
         if (auto *dialog = popup())
-            click(dialog->DC.CursorStartPos.x + 20, dialog->DC.CursorPosPrevLine.y + 10); // Done
-        expect(!popup(), "Settings remained open after drag tests");
+            click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save Settings
+        expect(!popup() && config.output.gain == 1.f, "Restore defaults was not committed by Save");
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
         dragAndResizePopup(false);

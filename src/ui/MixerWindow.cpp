@@ -42,6 +42,7 @@ enum Icon {
     Close,
     Sliders,
     Info,
+    Puzzle,
     Dot
 };
 struct Canvas {
@@ -227,6 +228,22 @@ struct Canvas {
             circle(16, 16, 12);
             dl->AddCircleFilled(c.p(16, 10), 1.9f * c.s, color, 12);
             l(16, 15, 16, 23, 2.2f);
+            break;
+        case Puzzle:
+            // Four-lobed puzzle-piece outline used by the Plugins settings page.
+            dl->PathLineTo(c.p(5, 6));
+            dl->PathLineTo(c.p(12, 6));
+            dl->PathBezierCubicCurveTo(c.p(10, 1), c.p(20, 1), c.p(18, 6));
+            dl->PathLineTo(c.p(26, 6));
+            dl->PathLineTo(c.p(26, 13));
+            dl->PathBezierCubicCurveTo(c.p(31, 11), c.p(31, 21), c.p(26, 19));
+            dl->PathLineTo(c.p(26, 27));
+            dl->PathLineTo(c.p(18, 27));
+            dl->PathBezierCubicCurveTo(c.p(20, 32), c.p(10, 32), c.p(12, 27));
+            dl->PathLineTo(c.p(5, 27));
+            dl->PathLineTo(c.p(5, 19));
+            dl->PathBezierCubicCurveTo(c.p(0, 21), c.p(0, 11), c.p(5, 13));
+            dl->PathStroke(color, ImDrawFlags_Closed, 2.3f * c.s);
             break;
         case Dot:
             dl->AddCircleFilled(c.p(16, 16), 16 * c.s, color, 24);
@@ -698,8 +715,10 @@ bool MixerWindow::draw(float dt, int width, int height) {
                 ImGui::OpenPopup("Mix channels");
             else if (i == 3)
                 ImGui::OpenPopup("Audio status");
-            else
+            else {
+                settingsPage_ = 0;
                 openSettings_ = true;
+            }
         }
         if (i == 2 && beginBoundedPopup("Mix channels", scale_)) {
             for (int mode = 0; mode < 2; ++mode)
@@ -780,8 +799,10 @@ bool MixerWindow::draw(float dt, int width, int height) {
                 stopX = rightX + settingsW + (rightW - settingsW - stopW - stateW) * .5f;
     c.rect(rightX, footerY, settingsW, 73, card, 18);
     c.centeredIconLabel(Gear, rightX + settingsW / 2, footerY + 36.5f, "Settings", 25, 34, gray);
-    if (c.hit("Settings", rightX, footerY, settingsW, 73))
+    if (c.hit("Settings", rightX, footerY, settingsW, 73)) {
+        settingsPage_ = 1;
         openSettings_ = true;
+    }
     bool running = engine_->running();
     c.rect(stopX, footerY - 1, stopW, 76, running ? red : IM_COL32(109, 71, 231, 255), 17, false);
     c.centeredIconLabel(running ? Stop : Play, stopX + stopW / 2, footerY + 37,
@@ -1060,73 +1081,216 @@ bool MixerWindow::drawDialogs() {
         ImGui::EndPopup();
     }
     if (openSettings_) {
+        settingsDraft_ = *config_;
+        settingsRestoreAll_ = false;
         ImGui::OpenPopup("Settings");
         openSettings_ = false;
     }
-    if (beginBoundedModal("Settings", 660, scale_)) {
-        ImGui::TextUnformatted("Audio");
-        ImGui::Separator();
-        ImGui::Text("Sample rate: %u Hz", engine_->outputStatus().sampleRate);
-        ImGui::TextWrapped("The sample rate follows the output device. Configure its supported format in "
-                           "Windows Sound settings.");
-        int buffer = static_cast<int>(config_->bufferMillis);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderInt("##Buffer", &buffer, 20, 250, "Buffer: %d ms")) {
-            config_->bufferMillis = static_cast<uint32_t>(buffer);
-            engine_->setBufferMillis(config_->bufferMillis);
-            changed = true;
+    if (beginBoundedModal("Settings", 770, scale_,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+        constexpr float dialogW = 722.f, dialogH = 740.f;
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        Canvas c{ImGui::GetWindowDrawList(), start, scale_};
+        ImGui::Dummy({dialogW * scale_, dialogH * scale_});
+        ImGui::PushID("settings-dialog");
+
+        auto drawButton = [&](const char *id, float x, float y, float w, float h, const char *label,
+                              ImU32 fill, ImU32 labelColor = white) {
+            c.rect(x, y, w, h, fill, 10, false);
+            c.centeredText(x + w / 2, y + h / 2, label, 19, labelColor);
+            return c.hit(id, x, y, w, h);
+        };
+        auto drawCheck = [&](const char *id, float x, float y, const char *label, const char *description,
+                             bool &value, bool enabled = true) {
+            const ImU32 boxColor = value && enabled ? IM_COL32(109, 71, 231, 255)
+                                                    : IM_COL32(42, 48, 54, 255);
+            c.rect(x, y, 24, 24, boxColor, 5, false);
+            if (value)
+                c.icon(Check, x + 12, y + 12, enabled ? white : gray, 19);
+            c.text(x + 36, y - 2, label, 18, enabled ? white : gray);
+            if (description && *description)
+                c.text(x + 36, y + 27, description, 14, gray, false, 470);
+            if (!enabled)
+                return false;
+            if (c.hit(id, x - 4, y - 5, 510, description && *description ? 52.f : 34.f)) {
+                value = !value;
+                return true;
+            }
+            return false;
+        };
+        auto drawRadio = [&](const char *id, float x, float y, const char *label, bool selected,
+                             bool enabled = true) {
+            c.dl->AddCircle(c.p(x, y), 10 * scale_,
+                            selected ? purple : IM_COL32(92, 100, 109, 255), 24, 2 * scale_);
+            if (selected)
+                c.dl->AddCircleFilled(c.p(x, y), 5 * scale_, white, 20);
+            c.text(x + 18, y - 10, label, 17, enabled ? white : gray);
+            return enabled && c.hit(id, x - 12, y - 15, 100, 30);
+        };
+
+        c.dl->AddCircleFilled(c.p(32, 30), 31 * scale_, IM_COL32(48, 37, 83, 255), 40);
+        c.icon(Gear, 32, 30, purple, 34);
+        c.text(78, 6, "Settings", 31, white, true);
+        c.rect(dialogW - 42, 1, 40, 40, card, 9);
+        c.icon(Close, dialogW - 22, 21, white, 25);
+        if (c.hit("Close settings", dialogW - 42, 1, 40, 40))
+            ImGui::CloseCurrentPopup();
+
+        struct SettingsNavItem {
+            const char *label;
+            Icon icon;
+        };
+        constexpr SettingsNavItem nav[] = {{"Audio", Wave}, {"General", Gear},
+                                            {"Plugins", Puzzle}, {"About", Info}};
+        for (int i = 0; i < 4; ++i) {
+            const float y = 92 + i * 58.f;
+            const bool selected = settingsPage_ == i;
+            if (selected)
+                c.rect(0, y, 158, 50, IM_COL32(48, 37, 83, 255), 9, false);
+            c.icon(nav[i].icon, 24, y + 25, selected ? purple : gray, 27);
+            c.text(51, y + 12, nav[i].label, 19, selected ? IM_COL32(185, 147, 255, 255) : white);
+            ImGui::PushID(i + 1200);
+            if (c.hit("Settings page", 0, y, 158, 50))
+                settingsPage_ = i;
+            ImGui::PopID();
         }
-        ImGui::TextWrapped(
-            "Lower buffers reduce delay; higher buffers tolerate scheduling jitter. Applies live.");
-        int mono = config_->mono ? 1 : 0;
-        if (ImGui::Combo("Channels", &mono, "Stereo\0Mono\0")) {
-            config_->mono = mono == 1;
-            engine_->setMono(config_->mono);
-            changed = true;
+
+        c.rect(174, 90, 548, 574, panel, 14);
+        const float contentX = 196;
+        if (settingsPage_ == 0) {
+            c.icon(Wave, contentX + 10, 124, white, 27);
+            c.text(contentX + 38, 107, "Audio", 21, white, true);
+
+            c.text(contentX, 154, "Output format", 16, gray);
+            c.rect(contentX, 181, 504, 76, card, 10);
+            c.badge(Wave, contentX + 40, 219, green);
+            c.text(contentX + 83, 194, "Sample Rate", 15, gray);
+            auto sampleRate = engine_->outputStatus().sampleRate;
+            std::string sample = sampleRate ? std::to_string(sampleRate) : "--";
+            if (sample.size() == 5)
+                sample.insert(2, ",");
+            c.text(contentX + 83, 221, sample + " Hz", 19, white);
+            c.text(contentX + 264, 194, "Follows the selected output device", 15, gray);
+            c.text(contentX + 264, 221, "Change it in Windows Sound settings", 15, gray);
+
+            c.text(contentX, 282, "Buffer", 17, white);
+            char bufferLabel[24];
+            std::snprintf(bufferLabel, sizeof(bufferLabel), "%u ms", settingsDraft_.bufferMillis);
+            c.text(contentX + 443, 282, bufferLabel, 17, purple);
+            int buffer = static_cast<int>(settingsDraft_.bufferMillis);
+            ImGui::SetCursorScreenPos(c.p(contentX, 309));
+            ImGui::SetNextItemWidth(504 * scale_);
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
+            const bool bufferChanged =
+                ImGui::SliderInt("##Settings buffer", &buffer, 20, 250, "", ImGuiSliderFlags_NoInput);
+            const bool bufferFocused =
+                ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible;
+            ImGui::PopStyleVar();
+            if (bufferChanged)
+                settingsDraft_.bufferMillis = static_cast<uint32_t>(buffer);
+            const float bufferFraction = float(buffer - 20) / 230.f;
+            c.line(contentX + 8, 327, contentX + 496, 327, IM_COL32(46, 51, 58, 255), 8);
+            c.line(contentX + 8, 327, contentX + 8 + 488 * bufferFraction, 327, purple, 8);
+            c.dl->AddCircleFilled(c.p(contentX + 8 + 488 * bufferFraction, 327), 11 * scale_, white, 24);
+            if (bufferFocused)
+                c.dl->AddRect(c.p(contentX, 309), c.p(contentX + 504, 345), purple, 8 * scale_, 0,
+                              2 * scale_);
+            c.text(contentX, 350, "Lower values reduce delay; higher values better tolerate scheduling jitter.",
+                   14, gray, false, 504);
+
+            c.line(contentX, 389, contentX + 504, 389, border, 1);
+            c.text(contentX, 410, "Channels", 17, white);
+            c.rect(contentX, 440, 244, 60, card, 10);
+            c.rect(contentX + 260, 440, 244, 60, card, 10);
+            if (drawRadio("Stereo channels", contentX + 24, 470, "Stereo", !settingsDraft_.mono))
+                settingsDraft_.mono = false;
+            if (drawRadio("Mono channels", contentX + 284, 470, "Mono", settingsDraft_.mono))
+                settingsDraft_.mono = true;
+
+            c.line(contentX, 521, contentX + 504, 521, border, 1);
+            drawCheck("Exclusive output", contentX, 544, "Use exclusive output when available",
+                      "System-default outputs remain shared so other apps keep their audio.",
+                      settingsDraft_.exclusiveOutput);
+        } else if (settingsPage_ == 1) {
+            c.icon(Gear, contentX + 10, 124, white, 27);
+            c.text(contentX + 38, 107, "General", 21, white, true);
+            drawCheck("Start with Windows", contentX, 157, "Start with Windows (in tray)",
+                      "Start Audio Monitor automatically when Windows starts.",
+                      settingsDraft_.startWithWindows);
+            drawCheck("Start hidden", contentX, 219, "Start hidden when launched manually",
+                      "Launch Audio Monitor to the system tray.", settingsDraft_.startMinimized);
+            drawCheck("Close to tray", contentX, 281, "Close button keeps monitoring in the tray",
+                      "Audio monitoring will continue running in the background.",
+                      settingsDraft_.closeToTray);
+
+            c.line(contentX, 347, contentX + 504, 347, border, 1);
+            c.text(contentX, 369, "Updates", 17, white);
+            bool updatesUnavailable = false;
+            drawCheck("Automatic updates", contentX, 399, "Check for updates automatically",
+                      "Automatic updates are not available in this build.", updatesUnavailable, false);
+
+            c.line(contentX, 463, contentX + 504, 463, border, 1);
+            c.text(contentX, 483, "Language", 17, white);
+            c.text(contentX + 363, 485, "System Default only", 14, gray);
+            c.rect(contentX, 510, 250, 42, card, 8);
+            c.text(contentX + 14, 520, "System Default", 17, gray);
+
+            c.line(contentX, 574, contentX + 504, 574, border, 1);
+            c.text(contentX, 595, "Theme", 17, white);
+            c.text(contentX + 437, 597, "Dark only", 14, gray);
+            drawRadio("Dark theme", contentX + 10, 633, "Dark", true, false);
+            drawRadio("Light theme", contentX + 120, 633, "Light", false, false);
+            drawRadio("System theme", contentX + 230, 633, "System", false, false);
+        } else if (settingsPage_ == 2) {
+            c.badge(Puzzle, 448, 263, purple);
+            c.centeredText(448, 327, "Work In Progress", 28, white);
+            c.centeredText(448, 365, "Plugin support is currently being built.", 17, gray);
+        } else {
+            c.badge(Info, 448, 221, purple);
+            c.centeredText(448, 285, "Audio Monitor", 28, white);
+            c.centeredText(448, 323, "Version 0.1.0", 17, gray);
+            c.centeredText(448, 367, "A low-latency Windows audio monitor and mixer.", 17, gray);
+            if (drawButton("Exit application", 350, 421, 196, 48, "Exit Audio Monitor", card))
+                exitRequested_ = true;
         }
-        if (ImGui::Checkbox("Use exclusive output when available", &config_->exclusiveOutput)) {
-            engine_->setExclusiveOutput(config_->exclusiveOutput);
-            if (engine_->running())
-                engine_->setChannelDevice(-1, {config_->output.deviceId, config_->output.deviceNameMatch});
-            changed = true;
-        }
-        ImGui::TextWrapped("System default outputs always use shared mode so other apps keep their audio.");
-        ImGui::Spacing();
-        ImGui::TextUnformatted("Application");
-        ImGui::Separator();
-        bool autostart = config_->startWithWindows;
-        if (ImGui::Checkbox("Start with Windows (in tray)", &autostart)) {
-            if (startup::setEnabled(autostart)) {
-                config_->startWithWindows = autostart;
-                changed = true;
-            } else
+
+        if (drawButton("Restore defaults", 0, 691, 166, 49, "Restore Defaults", card,
+                       IM_COL32(185, 147, 255, 255)))
+            ImGui::OpenPopup("Restore defaults?");
+        if (drawButton("Cancel settings", 378, 691, 150, 49, "Cancel", card))
+            ImGui::CloseCurrentPopup();
+        if (drawButton("Save settings", 544, 691, 178, 49, "Save", IM_COL32(109, 71, 231, 255))) {
+            if (settingsDraft_.startWithWindows != config_->startWithWindows &&
+                !startup::setEnabled(settingsDraft_.startWithWindows)) {
                 ImGui::OpenPopup("Startup setting failed");
+            } else {
+                const bool exclusiveChanged = settingsDraft_.exclusiveOutput != config_->exclusiveOutput;
+                *config_ = settingsDraft_;
+                if (settingsRestoreAll_) {
+                    restart();
+                } else {
+                    engine_->setBufferMillis(config_->bufferMillis);
+                    engine_->setMono(config_->mono);
+                    if (exclusiveChanged) {
+                        engine_->setExclusiveOutput(config_->exclusiveOutput);
+                        if (engine_->running())
+                            engine_->setChannelDevice(
+                                -1, {config_->output.deviceId, config_->output.deviceNameMatch});
+                    }
+                }
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            }
         }
         if (beginBoundedPopup("Startup setting failed", scale_)) {
             ImGui::TextUnformatted("Could not update Windows startup. Please try again.");
             ImGui::EndPopup();
         }
-        changed |= ImGui::Checkbox("Start hidden when launched manually", &config_->startMinimized);
-        changed |= ImGui::Checkbox("Close button keeps monitoring in the tray", &config_->closeToTray);
-        ImGui::TextDisabled("Minimize always sends the app to the tray.");
-        ImGui::Separator();
-        if (ImGui::Button("Done"))
-            ImGui::CloseCurrentPopup();
-        ImGui::SameLine();
-        if (ImGui::Button("Restore defaults"))
-            ImGui::OpenPopup("Restore defaults?");
-        ImGui::SameLine();
-        if (ImGui::Button("Exit application"))
-            exitRequested_ = true;
         if (beginBoundedModal("Restore defaults?", 560, scale_)) {
             ImGui::TextWrapped("Reset all sources, devices, gains, and application preferences?");
             if (ImGui::Button("Reset")) {
-                bool startupChanged = startup::setEnabled(false), oldStartup = config_->startWithWindows;
-                *config_ = Config::defaults();
-                if (!startupChanged)
-                    config_->startWithWindows = oldStartup;
-                restart();
-                changed = true;
+                settingsDraft_ = Config::defaults();
+                settingsRestoreAll_ = true;
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
@@ -1134,6 +1298,7 @@ bool MixerWindow::drawDialogs() {
                 ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
+        ImGui::PopID();
         ImGui::EndPopup();
     }
     ImGui::PopStyleVar();
