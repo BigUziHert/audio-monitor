@@ -22,6 +22,7 @@ int main() {
     ChannelConfig app;
     app.kind = SourceKind::Application;
     app.label = "Discord";
+    app.icon = "chat";
     app.processPath = L"C:\\Apps\\Discord.exe";
     app.enabled = false;
     c.sources.push_back(app);
@@ -29,8 +30,9 @@ int main() {
     c.closeToTray = true;
     auto copy = Config::fromJson(JsonValue::parse(c.toJson().dump()));
     check(copy.sources.size() == 4 && copy.sources[3].processPath == app.processPath &&
+              copy.sources[3].icon == "chat" &&
               !copy.sources[3].enabled,
-          "app identity and enabled state persist");
+          "app identity, icon, and enabled state persist");
     check(copy.mono && copy.closeToTray && copy.output.muted, "mix and window preferences persist");
     c.sources.clear();
     copy = Config::fromJson(c.toJson());

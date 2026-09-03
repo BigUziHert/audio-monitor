@@ -27,6 +27,7 @@ struct ChannelConfig {
     std::wstring processPath;      // stable identity; never persist a process ID
     std::wstring deviceId;         // exact endpoint id, if known
     std::wstring deviceNameMatch;  // case-insensitive substring fallback
+    std::string  icon;             // optional UI icon key; empty keeps the automatic icon
     float        gain  = 1.0f;     // linear, 0..1
     bool         muted = false;
 };

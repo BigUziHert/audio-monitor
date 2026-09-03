@@ -22,6 +22,7 @@ JsonValue channelToJson(const ChannelConfig& c) {
     v.set("processPath", JsonValue(toUtf8(c.processPath)));
     v.set("deviceId",   JsonValue(toUtf8(c.deviceId)));
     v.set("deviceName", JsonValue(toUtf8(c.deviceNameMatch)));
+    if (!c.icon.empty()) v.set("icon", JsonValue(c.icon));
     v.set("gain",       JsonValue(static_cast<double>(c.gain)));
     v.set("muted",      JsonValue(c.muted));
     return v;
@@ -31,6 +32,7 @@ ChannelConfig channelFromJson(const JsonValue* v, const ChannelConfig& fallback)
     if (!v || !v->isObject()) return fallback;
     ChannelConfig c = fallback;
     if (auto x = v->find("label")) c.label = x->asString(c.label);
+    if (auto x = v->find("icon")) c.icon = x->asString(c.icon);
     if (auto x = v->find("enabled")) c.enabled = x->asBool(c.enabled);
     if (auto x = v->find("processPath")) c.processPath = toWide(x->asString(""));
     if (auto x = v->find("kind")) {

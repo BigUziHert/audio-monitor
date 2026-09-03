@@ -114,7 +114,7 @@ int main() {
                        dialog->Pos.y + dialog->Size.y <= io.DisplaySize.y,
                    "Popup extends beyond the application");
         };
-        auto dragAndResizePopup = [&]() {
+        auto dragAndResizePopup = [&](bool expectDrag = true) {
             auto *dialog = popup();
             if (!dialog) { expect(false, "Missing dialog for drag test"); return; }
             const ImVec2 original = dialog->Pos;
@@ -126,8 +126,12 @@ int main() {
             frame(1600, 986);
             io.AddMousePosEvent(grab.x + 20, grab.y + 20);
             frame(1600, 986);
-            expect(dialog->Pos.x > original.x && dialog->Pos.y > original.y,
-                   "Popup can no longer be dragged within the application");
+            if (expectDrag)
+                expect(dialog->Pos.x > original.x && dialog->Pos.y > original.y,
+                       "Popup can no longer be dragged within the application");
+            else
+                expect(std::abs(dialog->Pos.x - original.x) < 1.f && std::abs(dialog->Pos.y - original.y) < 1.f,
+                       "Fixed popup moved when dragged");
             for (auto target : {ImVec2(-500, 400), ImVec2(800, -500),
                                 ImVec2(2100, 400), ImVec2(800, 1500)}) {
                 io.AddMousePosEvent(target.x, target.y);
@@ -169,7 +173,7 @@ int main() {
         expect(!popup(), "Settings remained open after drag tests");
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
-        dragAndResizePopup();
+        dragAndResizePopup(false);
         ImGui::DestroyContext();
     }
     CoUninitialize();

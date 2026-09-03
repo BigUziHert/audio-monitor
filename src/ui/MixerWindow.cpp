@@ -6,6 +6,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 namespace audiomon::ui {
 namespace {
@@ -39,6 +40,8 @@ enum Icon {
     Minus,
     Maximize,
     Close,
+    Sliders,
+    Info,
     Dot
 };
 struct Canvas {
@@ -212,6 +215,19 @@ struct Canvas {
             l(8, 8, 24, 24, 2);
             l(24, 8, 8, 24, 2);
             break;
+        case Sliders:
+            l(4, 9, 28, 9, 2);
+            l(4, 16, 28, 16, 2);
+            l(4, 23, 28, 23, 2);
+            dl->AddCircleFilled(c.p(11, 9), 3.5f * c.s, color, 16);
+            dl->AddCircleFilled(c.p(22, 16), 3.5f * c.s, color, 16);
+            dl->AddCircleFilled(c.p(15, 23), 3.5f * c.s, color, 16);
+            break;
+        case Info:
+            circle(16, 16, 12);
+            dl->AddCircleFilled(c.p(16, 10), 1.9f * c.s, color, 12);
+            l(16, 15, 16, 23, 2.2f);
+            break;
         case Dot:
             dl->AddCircleFilled(c.p(16, 16), 16 * c.s, color, 24);
             break;
@@ -266,6 +282,68 @@ std::string sourceName(const ChannelConfig &c) {
            : c.kind == SourceKind::Microphone  ? "Microphone"
                                                : "Playback Audio";
 }
+Icon iconFromKey(const std::string &key, Icon fallback) {
+    if (key == "microphone")
+        return Mic;
+    if (key == "speaker")
+        return Speaker;
+    if (key == "chat")
+        return Chat;
+    if (key == "headphones")
+        return Headphones;
+    if (key == "screen")
+        return Screen;
+    if (key == "wave")
+        return Wave;
+    return fallback;
+}
+const char *defaultIconKey(SourceKind kind) {
+    return kind == SourceKind::Microphone  ? "microphone"
+           : kind == SourceKind::Application ? "chat"
+                                             : "speaker";
+}
+Icon sourceIcon(const ChannelConfig &source, size_t index) {
+    const Icon fallback = source.kind == SourceKind::Microphone                  ? Mic
+                          : source.kind == SourceKind::Application || index == 1 ? Chat
+                                                                                 : Headphones;
+    return iconFromKey(source.icon, fallback);
+}
+ImU32 sourceColor(const ChannelConfig &source, size_t index) {
+    const std::string key = source.icon.empty() ? "" : source.icon;
+    if (key == "microphone")
+        return pink;
+    if (key == "chat" || key == "screen")
+        return cyan;
+    if (key == "wave")
+        return green;
+    return source.kind == SourceKind::Microphone    ? pink
+           : source.kind == SourceKind::Application ? cyan
+           : index == 1                             ? cyan
+                                                    : purple;
+}
+bool gainSlider(const Canvas &c, const char *id, float x, float y, float width, float &gain) {
+    ImGui::SetCursorScreenPos(c.p(x, y));
+    ImGui::SetNextItemWidth(width * c.s);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
+    float value = std::clamp(gain, 0.f, 4.f);
+    const bool changed = ImGui::SliderFloat(id, &value, 0.f, 4.f, "", ImGuiSliderFlags_NoInput);
+    ImGui::PopStyleVar();
+    if (changed)
+        gain = value;
+
+    const float center = y + 18, end = x + 8 + (width - 16) * std::clamp(gain / 4.f, 0.f, 1.f);
+    c.line(x + 8, center, x + width - 8, center, IM_COL32(46, 51, 58, 255), 8);
+    c.line(x + 8, center, end, center, purple, 8);
+    for (int i = 0; i <= 16; ++i) {
+        const float tx = x + 8 + (width - 16) * float(i) / 16.f;
+        c.line(tx, center + 15, tx, center + (i % 4 == 0 ? 23 : 19), IM_COL32(54, 60, 68, 255), 1);
+    }
+    c.dl->AddCircleFilled(c.p(end, center + 2), 13 * c.s, IM_COL32(0, 0, 0, 80), 28);
+    c.dl->AddCircleFilled(c.p(end, center), 12 * c.s, white, 28);
+    if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
+        c.dl->AddCircle(c.p(end, center), 16 * c.s, purple, 28, 2 * c.s);
+    return changed;
+}
 ImVec4 popupBounds(float scale) {
     const auto *viewport = ImGui::GetMainViewport();
     const float margin = std::ceil(12 * scale);
@@ -300,12 +378,12 @@ bool beginBoundedPopup(const char *name, float scale, ImVec2 minSize = {0, 0},
     constrainNextPopup(bounds, minSize, maxSize);
     return ImGui::BeginPopup(name, ImGuiWindowFlags_NoMove);
 }
-bool beginBoundedModal(const char *name, float width, float scale) {
+bool beginBoundedModal(const char *name, float width, float scale, ImGuiWindowFlags flags = 0) {
     auto bounds = popupBounds(scale);
     ImGui::SetNextWindowSize({width * scale, 0}, ImGuiCond_Always);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
     constrainNextPopup(bounds, {width * scale, 0}, {width * scale, FLT_MAX});
-    return ImGui::BeginPopupModal(name, nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    return ImGui::BeginPopupModal(name, nullptr, ImGuiWindowFlags_AlwaysAutoResize | flags);
 }
 } // namespace
 void MixerWindow::init(AudioEngine *engine, Config *config, void *window) {
@@ -429,13 +507,8 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
     bool changed = false;
     ImGui::PushID(static_cast<int>(index));
     c.rect(0, 0, width, 214, card, 17);
-    auto color = source.kind == SourceKind::Microphone    ? pink
-                 : source.kind == SourceKind::Application ? cyan
-                 : index == 1                             ? cyan
-                                                          : purple;
-    auto icon = source.kind == SourceKind::Microphone                  ? Mic
-                : source.kind == SourceKind::Application || index == 1 ? Chat
-                                                                       : Headphones;
+    auto color = sourceColor(source, index);
+    auto icon = sourceIcon(source, index);
     c.badge(icon, 43, 52, color);
     c.text(90, 23, sourceName(source), 23, white, true, width - 204);
     auto subtitle = state.deviceName.empty() ? toUtf8(source.deviceNameMatch) : toUtf8(state.deviceName);
@@ -753,79 +826,226 @@ bool MixerWindow::drawDialogs() {
         ImGui::OpenPopup("Configure source");
         openSource_ = false;
     }
-    if (beginBoundedModal("Configure source", 650, scale_)) {
-        ImGui::TextUnformatted(editSource_ < 0 ? "Add an audio source" : "Source settings");
-        ImGui::Separator();
-        int kind = static_cast<int>(draft_.kind);
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##Source type", &kind, "Playback device\0Microphone\0Application audio\0")) {
-            draft_.kind = static_cast<SourceKind>(kind);
-            draft_.deviceId.clear();
-            draft_.deviceNameMatch.clear();
-            draft_.processPath.clear();
-        }
-        bool valid = false;
-        if (draft_.kind == SourceKind::Application) {
-            if (!processCaptureSupported())
-                ImGui::TextWrapped("Application capture requires Windows build 20348 or later (Windows 11 "
-                                   "recommended) and a recent Windows SDK.");
-            ImGui::TextWrapped("Captures this app and its child processes. Start audio in the app, then "
-                               "Refresh if it is missing.");
-            std::string selected =
-                draft_.processPath.empty() ? "Choose an application" : toUtf8(draft_.processPath);
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##Application", selected.c_str())) {
+    if (beginBoundedModal("Configure source", 770, scale_,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+        constexpr float dialogW = 722.f, dialogH = 860.f;
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        Canvas c{ImGui::GetWindowDrawList(), start, scale_};
+        ImGui::Dummy({dialogW * scale_, dialogH * scale_});
+        ImGui::PushID("source-dialog");
+
+        const bool isApp = draft_.kind == SourceKind::Application;
+        auto selectKind = [&](bool application) {
+            if (application && draft_.kind != SourceKind::Application) {
+                draft_.kind = SourceKind::Application;
+                draft_.deviceId.clear();
+                draft_.deviceNameMatch.clear();
+            } else if (!application && draft_.kind == SourceKind::Application) {
+                draft_.kind = SourceKind::Playback;
+                draft_.processPath.clear();
+            }
+        };
+        auto drawSourceType = [&](const char *id, float x, const char *title, const char *subtitle,
+                                  Icon icon, bool selected) {
+            c.rect(x, 153, 334, 93, selected ? IM_COL32(22, 27, 33, 255) : card, 10);
+            if (selected)
+                c.dl->AddRect(c.p(x, 153), c.p(x + 334, 246), purple, 10 * scale_, 0, 2 * scale_);
+            c.icon(icon, x + 48, 199, selected ? white : gray, 40);
+            c.text(x + 86, 178, title, 19, white, true, 205);
+            c.text(x + 86, 209, subtitle, 15, gray, false, 215);
+            c.dl->AddCircle(c.p(x + 286, 200), 11 * scale_, selected ? purple : IM_COL32(95, 102, 111, 255),
+                            24, 2 * scale_);
+            if (selected)
+                c.dl->AddCircleFilled(c.p(x + 286, 200), 5 * scale_, white, 16);
+            return c.hit(id, x, 153, 334, 93);
+        };
+        auto drawButton = [&](const char *id, float x, float y, float w, float h, const char *label,
+                              Icon icon, ImU32 fill, bool enabled = true) {
+            const ImU32 buttonFill = enabled ? fill : IM_COL32(42, 47, 54, 255);
+            c.rect(x, y, w, h, buttonFill, 10, false);
+            if (icon == Dot)
+                c.centeredText(x + w / 2, y + h / 2, label, 19, enabled ? white : gray);
+            else
+                c.centeredIconLabel(icon, x + w / 2, y + h / 2, label, 21, 27, enabled ? white : gray,
+                                    enabled ? white : gray);
+            if (!enabled) {
+                ImGui::SetCursorScreenPos(c.p(x, y));
+                ImGui::InvisibleButton(id, {w * scale_, h * scale_});
+                return false;
+            }
+            return c.hit(id, x, y, w, h);
+        };
+
+        c.dl->AddCircleFilled(c.p(32, 30), 31 * scale_, IM_COL32(66, 45, 130, 255), 40);
+        c.icon(Plus, 32, 30, white, 33);
+        c.text(78, 6, editSource_ < 0 ? "Add Audio Source" : "Edit Audio Source", 31, white, true);
+        c.text(78, 45, editSource_ < 0 ? "Select an audio source to monitor and add to the mix"
+                                        : "Update this audio source in the mix",
+               17, gray);
+        c.rect(dialogW - 42, 1, 40, 40, card, 9);
+        c.icon(Close, dialogW - 22, 21, white, 25);
+        if (c.hit("Close source dialog", dialogW - 42, 1, 40, 40))
+            ImGui::CloseCurrentPopup();
+
+        c.rect(0, 91, dialogW, 176, panel, 14);
+        c.icon(Wave, 28, 125, purple, 28);
+        c.text(58, 108, "1.  Select Source Type", 20, white, true);
+        if (drawSourceType("Audio Device", 18, "Audio Device", "Use a headset, speaker, or microphone",
+                           Speaker, !isApp))
+            selectKind(false);
+        if (drawSourceType("Application Audio", 370, "Application Audio", "Capture audio from an application",
+                           Screen, isApp))
+            selectKind(true);
+
+        c.rect(0, 286, dialogW, 142, panel, 14);
+        c.icon(Speaker, 28, 319, purple, 28);
+        c.text(58, 302, isApp ? "2.  Choose Application" : "2.  Choose Device", 20, white, true);
+        std::string selected = "Select a device...";
+        if (isApp) {
+            for (const auto &app : apps_)
+                if (app.path == draft_.processPath) {
+                    selected = toUtf8(app.name);
+                    break;
+                }
+            if (selected == "Select a device..." && !draft_.processPath.empty())
+                selected = toUtf8(draft_.processPath);
+            if (selected == "Select a device...")
+                selected = "Select an application...";
+        } else if (!draft_.deviceNameMatch.empty())
+            selected = toUtf8(draft_.deviceNameMatch);
+
+        ImGui::SetCursorScreenPos(c.p(18, 340));
+        ImGui::SetNextItemWidth(542 * scale_);
+        if (ImGui::BeginCombo("##Source picker", selected.c_str())) {
+            if (isApp) {
+                if (apps_.empty())
+                    ImGui::TextUnformatted("No application audio sessions found.");
                 for (const auto &app : apps_) {
-                    auto label = toUtf8(app.name) + " (" + std::to_string(app.processId) + ")";
+                    const auto label = toUtf8(app.name) + " (" + std::to_string(app.processId) + ")";
+                    ImGui::PushID(toUtf8(app.path).c_str());
                     if (ImGui::Selectable(label.c_str(), app.path == draft_.processPath)) {
                         draft_.processPath = app.path;
                         if (!name_[0])
                             std::snprintf(name_, sizeof(name_), "%s", toUtf8(app.name).c_str());
                     }
+                    ImGui::PopID();
                 }
-                ImGui::EndCombo();
-            }
-            valid = processCaptureSupported() && !draft_.processPath.empty();
-        } else {
-            const auto &devices = draft_.kind == SourceKind::Microphone ? microphones_ : playback_;
-            std::string selected = toUtf8(draft_.deviceNameMatch);
-            if (selected.empty())
-                selected = "Choose an audio device";
-            ImGui::SetNextItemWidth(-1);
-            if (ImGui::BeginCombo("##Device", selected.c_str())) {
-                for (const auto &device : devices) {
+            } else {
+                if (playback_.empty() && microphones_.empty())
+                    ImGui::TextUnformatted("No audio devices found.");
+                for (const auto &device : playback_) {
                     ImGui::PushID(toUtf8(device.id).c_str());
-                    if (ImGui::Selectable(toUtf8(device.name).c_str(), device.id == draft_.deviceId)) {
+                    const auto label = toUtf8(device.name) + "  (Playback)";
+                    if (ImGui::Selectable(label.c_str(), draft_.kind == SourceKind::Playback &&
+                                                         device.id == draft_.deviceId)) {
+                        draft_.kind = SourceKind::Playback;
                         draft_.deviceId = device.id;
                         draft_.deviceNameMatch = device.name;
                         if (!name_[0])
-                            std::snprintf(name_, sizeof(name_), "%s",
-                                          draft_.kind == SourceKind::Microphone
-                                              ? "Microphone"
-                                              : toUtf8(device.name).c_str());
+                            std::snprintf(name_, sizeof(name_), "%s", toUtf8(device.name).c_str());
                     }
                     ImGui::PopID();
                 }
-                ImGui::EndCombo();
+                for (const auto &device : microphones_) {
+                    ImGui::PushID(toUtf8(device.id).c_str());
+                    const auto label = toUtf8(device.name) + "  (Microphone)";
+                    if (ImGui::Selectable(label.c_str(), draft_.kind == SourceKind::Microphone &&
+                                                         device.id == draft_.deviceId)) {
+                        draft_.kind = SourceKind::Microphone;
+                        draft_.deviceId = device.id;
+                        draft_.deviceNameMatch = device.name;
+                        if (!name_[0])
+                            std::snprintf(name_, sizeof(name_), "Microphone");
+                    }
+                    ImGui::PopID();
+                }
             }
-            valid = !draft_.deviceId.empty() || !draft_.deviceNameMatch.empty();
+            ImGui::EndCombo();
         }
-        if (ImGui::Button("Refresh"))
+        if (drawButton("Refresh source choices", 574, 337, 130, 47, "Refresh", Refresh, card))
             refreshDevices();
-        ImGui::TextUnformatted("Display name");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##Source name", name_, sizeof(name_));
+        c.text(18, 399,
+               isApp ? "Select the application audio session you want to monitor."
+                     : "Select the audio device you want to monitor.",
+               16, gray, false, dialogW - 36);
+
+        c.rect(0, 448, dialogW, 339, panel, 14);
+        c.icon(Sliders, 28, 482, purple, 27);
+        c.text(58, 465, "3.  Customize Source", 20, white, true);
+        c.text(18, 507, "Icon", 16, white);
+        c.line(348, 510, 348, 730, border, 1);
+        c.text(372, 507, "Display Name", 16, white);
+        char count[24];
+        std::snprintf(count, sizeof(count), "%zu / 128", std::strlen(name_));
+        c.text(dialogW - 91, 507, count, 15, gray);
+        ImGui::SetCursorScreenPos(c.p(372, 531));
+        ImGui::SetNextItemWidth(332 * scale_);
+        ImGui::InputTextWithHint("##Source name", "e.g. Microphone", name_, sizeof(name_));
+
+        const char *selectedIcon = draft_.icon.empty() ? defaultIconKey(draft_.kind) : draft_.icon.c_str();
+        struct IconChoice {
+            const char *key;
+            Icon icon;
+        };
+        constexpr IconChoice iconChoices[] = {{"microphone", Mic}, {"speaker", Speaker}, {"chat", Chat},
+                                              {"headphones", Headphones}, {"screen", Screen}, {"wave", Wave}};
+        for (int i = 0; i < 6; ++i) {
+            const float ix = 18 + float(i % 3) * 55.f, iy = 531 + float(i / 3) * 55.f;
+            const bool selectedIconChoice = std::strcmp(selectedIcon, iconChoices[i].key) == 0;
+            c.rect(ix, iy, 46, 46, selectedIconChoice ? IM_COL32(39, 30, 67, 255) : card, 7);
+            if (selectedIconChoice)
+                c.dl->AddRect(c.p(ix, iy), c.p(ix + 46, iy + 46), purple, 7 * scale_, 0, 2 * scale_);
+            c.icon(iconChoices[i].icon, ix + 23, iy + 23, selectedIconChoice ? purple : white, 25);
+            ImGui::PushID(i + 900);
+            if (c.hit("Icon choice", ix, iy, 46, 46))
+                draft_.icon = iconChoices[i].key;
+            ImGui::PopID();
+        }
+
+        ImGui::SetCursorScreenPos(c.p(372, 590));
         ImGui::Checkbox("Include in mix", &draft_.enabled);
-        ImGui::SameLine();
+        c.text(401, 620, "This source will be mixed into the output.", 15, gray, false, 146);
+        ImGui::SetCursorScreenPos(c.p(552, 590));
         ImGui::Checkbox("Muted", &draft_.muted);
-        float gain = draft_.gain * 100;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##Gain boost", &gain, 0, 400, "Mix gain %.0f%%"))
-            draft_.gain = gain / 100;
-        ImGui::TextDisabled("Above 100%% boosts quiet sources. Watch for clipping.");
-        ImGui::Separator();
-        ImGui::BeginDisabled(!valid);
-        if (ImGui::Button(editSource_ < 0 ? "Add source" : "Save changes")) {
+        c.text(581, 620, "Start this source muted", 15, gray, false, 120);
+
+        c.text(18, 671, "Mix Gain", 17, white);
+        c.icon(Info, 107, 682, gray, 18);
+        c.icon(Speaker, 28, 711, white, 24);
+        float gain = draft_.gain;
+        if (gainSlider(c, "##Gain boost", 58, 693, 500, gain))
+            draft_.gain = gain;
+        c.rect(588, 690, 91, 36, card, 8);
+        char gainLabel[24];
+        std::snprintf(gainLabel, sizeof(gainLabel), "%.0f%%", draft_.gain * 100);
+        c.centeredText(633.5f, 708, gainLabel, 18, white);
+        const char *gainMarks[] = {"0%", "100%", "200%", "300%", "400%"};
+        for (int i = 0; i < 5; ++i)
+            c.centeredText(58 + 500 * float(i) / 4.f, 749, gainMarks[i], 15, gray);
+        c.text(18, 780, "Adjust how much of this source is mixed into the output. 100% is normal volume.",
+               15, gray, false, dialogW - 36);
+
+        const bool valid = isApp ? processCaptureSupported() && !draft_.processPath.empty()
+                                 : !draft_.deviceId.empty() || !draft_.deviceNameMatch.empty();
+        if (isApp && !processCaptureSupported())
+            c.text(18, 399, "Application capture requires Windows build 20348 or later.", 16, amber,
+                   false, dialogW - 36);
+
+        if (editSource_ >= 0 &&
+            drawButton("Remove source", 0, 806, 164, 48, "Remove", Close, IM_COL32(61, 40, 86, 255))) {
+            config_->sources.erase(config_->sources.begin() + editSource_);
+            restart();
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        if (drawButton("Cancel source dialog", editSource_ >= 0 ? 386.f : 324.f, 806, 144, 48, "Cancel",
+                       Dot, card))
+            ImGui::CloseCurrentPopup();
+        const float saveX = editSource_ >= 0 ? 546.f : 486.f;
+        const float saveW = editSource_ >= 0 ? 176.f : 236.f;
+        if (drawButton("Commit source dialog", saveX, 806, saveW, 48,
+                       editSource_ < 0 ? "Add Source" : "Save", Plus, IM_COL32(109, 71, 231, 255),
+                       valid)) {
             draft_.label = name_[0] ? name_ : sourceName(draft_);
             if (editSource_ < 0)
                 config_->sources.push_back(draft_);
@@ -835,19 +1055,8 @@ bool MixerWindow::drawDialogs() {
             changed = true;
             ImGui::CloseCurrentPopup();
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
-            ImGui::CloseCurrentPopup();
-        if (editSource_ >= 0) {
-            ImGui::SameLine();
-            if (ImGui::Button("Remove source")) {
-                config_->sources.erase(config_->sources.begin() + editSource_);
-                restart();
-                changed = true;
-                ImGui::CloseCurrentPopup();
-            }
-        }
+
+        ImGui::PopID();
         ImGui::EndPopup();
     }
     if (openSettings_) {
