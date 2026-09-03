@@ -88,7 +88,9 @@ struct Canvas {
         bool clicked = ImGui::InvisibleButton(id, {w * s, h * s}, ImGuiButtonFlags_EnableNav);
         if (ImGui::IsItemHovered() && tooltip)
             ImGui::SetTooltip("%s", tooltip);
-        if (ImGui::IsItemFocused())
+        // Popup dismissal restores focus, but only keyboard/gamepad navigation
+        // should leave a visible outline after the mouse action is finished.
+        if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
             dl->AddRect(p(x, y), p(x + w, y + h), purple, 8 * s, 0, 2 * s);
         return clicked;
     }
@@ -236,7 +238,7 @@ struct Canvas {
         line(x + 8, center, end, center, purple, 9);
         dl->AddCircleFilled(p(end, center + 2), 14 * s, IM_COL32(0, 0, 0, 80), 28);
         dl->AddCircleFilled(p(end, center), 13 * s, white, 28);
-        if (ImGui::IsItemFocused())
+        if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
             dl->AddCircle(p(end, center), 17 * s, purple, 28, 2 * s);
         char label[24];
         std::snprintf(label, sizeof(label), "%.0f%%", gain * 100);
