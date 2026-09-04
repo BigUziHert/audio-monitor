@@ -1437,13 +1437,15 @@ bool MixerWindow::drawDialogs() {
             return false;
         };
         auto drawRadio = [&](const char *id, float x, float y, const char *label, bool selected,
-                             bool enabled = true) {
+                              bool enabled = true, bool fullCard = false) {
             c.dl->AddCircle(c.p(x, y), 10 * scale_,
                             selected ? purple : IM_COL32(92, 100, 109, 255), 24, 2 * scale_);
             if (selected)
                 c.dl->AddCircleFilled(c.p(x, y), 5 * scale_, white, 20);
             c.text(x + 18, y - 10, label, 17, enabled ? white : gray);
-            return enabled && c.hit(id, x - 12, y - 15, 100, 30);
+            return enabled &&
+                   (fullCard ? c.hit(id, x - 24, y - 30, 244, 60)
+                             : c.hit(id, x - 12, y - 15, 100, 30));
         };
 
         c.dl->AddCircleFilled(c.p(32, 30), 31 * scale_, IM_COL32(48, 37, 83, 255), 40);
@@ -1521,9 +1523,11 @@ bool MixerWindow::drawDialogs() {
             c.text(contentX, 410, "Channels", 17, white);
             c.rect(contentX, 440, 244, 60, card, 10);
             c.rect(contentX + 260, 440, 244, 60, card, 10);
-            if (drawRadio("Stereo channels", contentX + 24, 470, "Stereo", !settingsDraft_.mono))
+            if (drawRadio("Stereo channels", contentX + 24, 470, "Stereo", !settingsDraft_.mono,
+                          true, true))
                 settingsDraft_.mono = false;
-            if (drawRadio("Mono channels", contentX + 284, 470, "Mono", settingsDraft_.mono))
+            if (drawRadio("Mono channels", contentX + 284, 470, "Mono", settingsDraft_.mono,
+                          true, true))
                 settingsDraft_.mono = true;
 
             c.line(contentX, 521, contentX + 504, 521, border, 1);

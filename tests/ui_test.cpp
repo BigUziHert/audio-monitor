@@ -91,12 +91,16 @@ int main() {
                "Sample Rate did not open Settings");
         if (auto *dialog = popup()) {
             click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 327); // Buffer slider
+            click(dialog->DC.CursorStartPos.x + 690, dialog->DC.CursorStartPos.y + 490); // Mono card edge
             click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save
         }
         expect(config.bufferMillis != originalBuffer,
                "Sample Rate did not open the Audio settings page");
+        expect(config.mono, "Empty area of the Mono card was not clickable");
         config.bufferMillis = originalBuffer;
         engine.setBufferMillis(originalBuffer);
+        config.mono = false;
+        engine.setMono(false);
         click(900, 488); // Buffer also opens the Audio settings page.
         expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
                "Buffer did not open Settings");
