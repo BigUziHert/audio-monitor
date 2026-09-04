@@ -10,6 +10,25 @@ int main() {
             ++failed;
         }
     };
+    for (const char* text : {
+             R"({"gain":1e})", R"({"gain":.})", R"({"gain":+1})", R"({"gain":01})",
+             R"({"gain":1.})", R"({"gain":1e+})", R"({"gain":1-2})", R"({"gain":1.2.3})",
+             R"({"gain":1e9999})", R"({"label":"\uZZZZ"})", R"({"label":"\u12x4"})",
+             R"({"label":"\uD800"})", R"({"label":"\uDC00"})", R"({"label":"\uD800\u0041"})",
+             "{\"label\":\"raw\nnewline\"}"}) {
+        std::string error;
+        const auto invalid = JsonValue::parse(text, &error);
+        check(invalid.isNull() && !error.empty(), text);
+    }
+    std::string parseError;
+    const auto valid = JsonValue::parse(
+        R"({"negative":-0.125,"exponent":2.5E+1,"label":"\u0041\uD83D\uDD0A"})", &parseError);
+    check(parseError.empty() && valid.find("negative") &&
+              valid.find("negative")->asNumber(0) == -0.125 && valid.find("exponent") &&
+              valid.find("exponent")->asNumber(0) == 25,
+          "valid fractions and exponents parse");
+    check(valid.find("label") && valid.find("label")->asString("") == "A\xF0\x9F\x94\x8A",
+          "Unicode escapes and surrogate pairs decode to UTF-8");
     auto legacy = JsonValue::parse(
         R"({"game":{"deviceId":"game-pin","gain":0.8,"muted":true},"chat":{"gain":0.7},"mic":{"gain":2.1},"output":{"muted":true},"bufferMillis":90})");
     auto c = Config::fromJson(legacy);

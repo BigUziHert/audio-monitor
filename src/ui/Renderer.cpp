@@ -58,24 +58,29 @@ bool Renderer::createDeviceObjects(void* hwnd) {
         }
     }
 
-    createRenderTarget();
-    return true;
+    return createRenderTarget();
 }
 
-void Renderer::createRenderTarget() {
+bool Renderer::createRenderTarget() {
     ID3D11Texture2D* back = nullptr;
+    HRESULT hr = E_FAIL;
     if (SUCCEEDED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&back))) && back) {
-        device_->CreateRenderTargetView(back, nullptr, &rtv_);
+        hr = device_->CreateRenderTargetView(back, nullptr, &rtv_);
         back->Release();
     }
+    return SUCCEEDED(hr) && rtv_;
 }
 
 void Renderer::releaseRenderTarget() {
+    // The immediate context holds a reference to the bound view after Present.
+    // ResizeBuffers cannot release its back buffer until that reference is gone.
+    if (context_) context_->OMSetRenderTargets(0, nullptr, nullptr);
     if (rtv_) { rtv_->Release(); rtv_ = nullptr; }
 }
 
 bool Renderer::ensureCreated(void* hwnd) {
-    if (device_) return true;
+    if (device_ && !recoveryNeeded_) return true;
+    if (device_) destroy();
     hwnd_ = hwnd;
     if (!createDeviceObjects(hwnd)) { destroy(); return false; }
 
@@ -97,6 +102,9 @@ bool Renderer::ensureCreated(void* hwnd) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(device_, context_);
     imguiInit_ = true;
+    recoveryNeeded_ = false;
+    // Creation already sized the back buffer to the current client area.
+    pendingW_ = pendingH_ = 0;
     return true;
 }
 
@@ -120,16 +128,23 @@ void Renderer::onResize(uint32_t w, uint32_t h) {
     pendingH_ = h;
 }
 
-void Renderer::beginFrame() {
+bool Renderer::beginFrame() {
+    if (!ensureCreated(hwnd_)) return false;
     if (pendingW_ && pendingH_ && swapChain_) {
         releaseRenderTarget();
-        swapChain_->ResizeBuffers(0, pendingW_, pendingH_, DXGI_FORMAT_UNKNOWN, 0);
-        createRenderTarget();
+        const HRESULT hr = swapChain_->ResizeBuffers(0, pendingW_, pendingH_, DXGI_FORMAT_UNKNOWN, 0);
+        if (FAILED(hr) || !createRenderTarget()) {
+            LOG_WARN("ui: swapchain resize failed; recreating the renderer (0x%08lX)",
+                     static_cast<unsigned long>(hr));
+            recoveryNeeded_ = true;
+            return false;
+        }
         pendingW_ = pendingH_ = 0;
     }
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+    return true;
 }
 
 bool Renderer::endFrame(bool vsync) {
@@ -143,12 +158,15 @@ bool Renderer::endFrame(bool vsync) {
     // is load-bearing: while occluded it returns immediately instead of
     // waiting for vsync.
     const HRESULT hr = swapChain_->Present(vsync ? 1 : 0, 0);
+    if (FAILED(hr)) recoveryNeeded_ = true;
     return hr == DXGI_STATUS_OCCLUDED;
 }
 
 bool Renderer::stillOccluded() {
     if (!swapChain_) return false;
-    return swapChain_->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED;
+    const HRESULT hr = swapChain_->Present(0, DXGI_PRESENT_TEST);
+    if (FAILED(hr)) recoveryNeeded_ = true;
+    return hr == DXGI_STATUS_OCCLUDED;
 }
 
 } // namespace audiomon::ui

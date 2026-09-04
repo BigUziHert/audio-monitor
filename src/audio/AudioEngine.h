@@ -113,6 +113,7 @@ public:
     void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept override;
 
 private:
+    friend struct AudioEngineTestAccess;
     struct Channel {
         CaptureStream  stream;
         DriftResampler resampler;

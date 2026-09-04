@@ -267,6 +267,7 @@ void FormatConverter::fromStereoFloat(const float* src, void* dst, uint32_t fram
             const float v = std::clamp((src[f * 2] + src[f * 2 + 1]) * 0.5f, -1.0f, 1.0f);
             switch (fmt_.type) {
                 case SampleType::Float32: reinterpret_cast<float*>(frame)[0] = v; break;
+                case SampleType::Float64: reinterpret_cast<double*>(frame)[0] = v; break;
                 case SampleType::Int16:   reinterpret_cast<int16_t*>(frame)[0] =
                                               static_cast<int16_t>(v * 32767.0f); break;
                 case SampleType::Int32:   reinterpret_cast<int32_t*>(frame)[0] =

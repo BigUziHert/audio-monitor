@@ -220,9 +220,9 @@ bool Config::save() const {
 
     DWORD written = 0;
     const BOOL ok = WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-    FlushFileBuffers(h);
+    const BOOL flushed = FlushFileBuffers(h);
     CloseHandle(h);
-    if (!ok || written != text.size()) { DeleteFileW(tmp.c_str()); return false; }
+    if (!ok || written != text.size() || !flushed) { DeleteFileW(tmp.c_str()); return false; }
 
     if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         DeleteFileW(tmp.c_str());

@@ -13,8 +13,8 @@ namespace audiomon {
 namespace {
 
 // Loopback delivers no packets at all while its endpoint is silent, so "no
-// packets" is a normal state, not a fault. This is only how long we wait
-// before telling the mixer to emit silence for the channel.
+// packets" is a normal state, not a fault. After this timeout the mixer drains
+// any buffered tail, then emits silence without chasing the idle capture clock.
 constexpr double kIdleAfterSeconds = 0.10;
 
 // Ring capacity is derived from this, in frames per millisecond.

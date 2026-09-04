@@ -318,8 +318,12 @@ struct Canvas {
         // value is configured in the editor. Keep boosted values adjustable
         // instead of collapsing them to 100% on the next interaction.
         const ImGuiID sliderId = ImGui::GetID(id);
-        const bool boostedDrag = ImGui::GetActiveID() == sliderId;
-        const float maxGain = gain > 1.0001f || boostedDrag ? 4.0f : 1.0f;
+        auto *storage = ImGui::GetStateStorage();
+        if (ImGui::GetActiveID() != sliderId)
+            storage->SetFloat(sliderId, gain > 1.0001f ? 4.0f : 1.0f);
+        // Latch the starting range for mouse and keyboard interactions. Merely
+        // being active must not turn an ordinary 50% adjustment into 200%.
+        const float maxGain = storage->GetFloat(sliderId, 1.0f);
         float value = std::clamp(gain, 0.0f, maxGain);
         bool changed = ImGui::SliderFloat(id, &value, 0, maxGain, "", ImGuiSliderFlags_NoInput);
         ImGui::PopStyleVar();

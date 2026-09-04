@@ -314,7 +314,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                 DispatchMessageW(&msg);
             }
             if (!running) break;
-            if (!app.visible || !app.renderer.alive()) continue;
+            if (!app.visible) continue;
 
             // Present does not wait for vsync while the window is occluded --
             // covered by a fullscreen game, or the workstation locked -- so
@@ -332,7 +332,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             RECT rc{};
             GetClientRect(app.hwnd, &rc);
 
-            app.renderer.beginFrame();
+            if (!app.renderer.beginFrame()) { Sleep(100); continue; }
             if (app.mixer.draw(dt, rc.right - rc.left, rc.bottom - rc.top)) app.configDirty = true;
             app.occluded = app.renderer.endFrame(true);   // vsync paces the loop
 

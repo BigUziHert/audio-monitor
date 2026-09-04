@@ -85,6 +85,25 @@ int main() {
             frame(1600, 986);
         };
         frame(1600, 986);
+        auto holdGainSlider = [&](float x, float y, float &gain, float expectedGain) {
+            io.AddMousePosEvent(x, y);
+            frame(1600, 986);
+            io.AddMouseButtonEvent(0, true);
+            frame(1600, 986);
+            expect(std::abs(gain - expectedGain) < .06f, "Slider click set an unexpected gain");
+            const float gainOnPress = gain;
+            for (int i = 0; i < 4; ++i) {
+                frame(1600, 986);
+                expect(std::abs(gain - gainOnPress) < .001f,
+                       "Holding a gain slider changed its range without moving the pointer");
+            }
+            io.AddMouseButtonEvent(0, false);
+            frame(1600, 986);
+            frame(1600, 986);
+        };
+        holdGainSlider(1030, 785, config.output.gain, .5f);
+        holdGainSlider(260, 365, config.sources[0].gain, .5f);
+        config.output.gain = config.sources[0].gain = 1.f;
         const auto originalBuffer = config.bufferMillis;
         click(650, 488); // Sample Rate opens the Audio settings page.
         expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
@@ -268,6 +287,9 @@ int main() {
         click(825, 785); // Lower boosted output to about 100% in one held interaction.
         expect(config.output.gain > .75f && config.output.gain < 1.25f,
                "Dashboard output slider changed scale before the boosted drag finished");
+        config.output.gain = 2.75f;
+        holdGainSlider(700, 785, config.output.gain, .4f); // Keep the boosted range below 100% while held.
+        holdGainSlider(1030, 785, config.output.gain, .5f); // A new interaction returns to the normal range.
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
         dragAndResizePopup(false);

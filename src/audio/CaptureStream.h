@@ -52,8 +52,8 @@ public:
     StreamState state() const noexcept { return state_.load(std::memory_order_acquire); }
 
     // True when packets have arrived recently. Loopback delivers nothing at
-    // all while its endpoint is silent, so this is how the mixer knows to emit
-    // silence and freeze the rate controller rather than chase an empty ring.
+    // all while its endpoint is silent, so the mixer drains the buffered tail
+    // and freezes the rate controller rather than chasing an empty ring.
     bool flowing() const noexcept { return flowing_.load(std::memory_order_acquire); }
 
     // Bumped on any timeline break (discontinuity, reconnect, overflow drop).
@@ -73,6 +73,7 @@ public:
     uint32_t processId() const { return processId_.load(std::memory_order_relaxed); }
 
 private:
+    friend struct AudioEngineTestAccess;
     void stopLocked();          // caller holds lifecycleMutex_
     void threadMain(DeviceRef ref);
     bool openDevice(const DeviceRef& ref);

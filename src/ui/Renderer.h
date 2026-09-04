@@ -29,7 +29,8 @@ public:
 
     void onResize(uint32_t width, uint32_t height);
 
-    void beginFrame();
+    // False means no frame was started; the caller should throttle and retry.
+    bool beginFrame();
 
     // Returns true if the swapchain is occluded (the window is covered, the
     // workstation is locked, or a fullscreen app owns the output). Present
@@ -42,8 +43,9 @@ public:
     bool stillOccluded();
 
 private:
+    friend struct RendererTestAccess;
     bool createDeviceObjects(void* hwnd);
-    void createRenderTarget();
+    bool createRenderTarget();
     void releaseRenderTarget();
 
     ID3D11Device*           device_    = nullptr;
@@ -52,6 +54,7 @@ private:
     ID3D11RenderTargetView* rtv_       = nullptr;
     void*                   hwnd_      = nullptr;
     bool                    imguiInit_ = false;
+    bool                    recoveryNeeded_ = false;
     uint32_t                pendingW_  = 0;
     uint32_t                pendingH_  = 0;
 };

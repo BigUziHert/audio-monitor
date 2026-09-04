@@ -205,7 +205,11 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             ch.stream.ring().dropAllFromConsumer();
         }
 
-        const bool live = ch.stream.state() == StreamState::Running && ch.stream.flowing();
+        const bool flowing = ch.stream.flowing();
+        // Loopback stops delivering packets when playback stops, but the ring
+        // may still hold the buffer's entire tail. Drain it before going idle.
+        const bool live = ch.stream.state() == StreamState::Running &&
+                          (flowing || ch.stream.ring().depth() > 0);
         uint32_t   made = 0;
 
         if (live) {
@@ -244,7 +248,9 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             // from it, so we do not immediately starve. This is also the path
             // taken every time a silent loopback endpoint starts producing
             // again.
-            if (ch.priming && depth >= ch.targetDepth) {
+            // A short sound may end before it fills the target buffer. Once
+            // capture is idle, waiting for more packets would strand it forever.
+            if (ch.priming && (depth >= ch.targetDepth || (!flowing && depth >= 4))) {
                 ch.priming = false;
                 ch.rate.reset();
             }
@@ -253,7 +259,8 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                 // The controller only ever corrects for drift; the base ratio
                 // handles a genuine rate difference and is not part of the
                 // correction the clamp applies to.
-                const double ratio = ch.baseRatio * ch.rate.update(double(depth));
+                const double ratio = ch.baseRatio *
+                    (flowing ? ch.rate.update(double(depth)) : ch.rate.ratio());
                 ch.ratioOut.store(ratio, std::memory_order_relaxed);
                 made = ch.resampler.produce(ch.stream.ring(), ch.scratch.data(), frames, ratio);
                 if (made < frames) ch.priming = true;   // starved: re-prime
@@ -369,17 +376,8 @@ void AudioEngine::supervisorMain() {
         }
         if (quit_.load(std::memory_order_relaxed)) break;
 
-        // Each ref is read from config_ IMMEDIATELY before the restart that
-        // uses it, not from a snapshot taken at the top of the pass. A snapshot
-        // goes stale the moment the UI changes a device -- and Restore
-        // defaults changes four at once -- so a channel that failed fast on
-        // its new name would have been reopened on its OLD pinned device.
-        auto outputRef = [this](bool& exclusive) {
-            std::lock_guard<std::mutex> lock(configMutex_);
-            exclusive = config_.exclusiveOutput;
-            return DeviceRef{ config_.output.deviceId, config_.output.deviceNameMatch };
-        };
-
+        // Serialize reading each selection AND restarting it with UI changes.
+        // Releasing the lock in between lets a stale restart undo a new choice.
         for (size_t i = 0; i < sourceCount_; ++i) {
             std::lock_guard<std::mutex> lock(configMutex_);
             const auto& source = config_.sources[i];
@@ -389,6 +387,7 @@ void AudioEngine::supervisorMain() {
                 ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
         }
 
+        std::lock_guard<std::mutex> outputLock(configMutex_);
         // Passivity check. If the endpoint we hold exclusively has since become
         // a system default -- the user changed it in the Sound control panel,
         // or a driver reinstall reassigned it -- we must hand exclusive control
@@ -399,18 +398,16 @@ void AudioEngine::supervisorMain() {
             devices_.isDefaultForAnyRole(render_.resolvedId())) {
             LOG_WARN("supervisor: output endpoint became a system default; "
                      "releasing exclusive mode and reopening shared");
-            bool exclusive;
-            const DeviceRef ref = outputRef(exclusive);
-            render_.start(devices_, ref, this, exclusive);
+            render_.start(devices_, {config_.output.deviceId, config_.output.deviceNameMatch},
+                          this, config_.exclusiveOutput);
         }
 
         // The Elgato commonly enumerates late on a cold boot, so a failed
         // output is a normal startup state that resolves itself.
         if (render_.state() == StreamState::Failed || render_.wantsRetry()) {
             LOG_INFO("supervisor: restarting output (%s)", render_.lastError().c_str());
-            bool exclusive;
-            const DeviceRef ref = outputRef(exclusive);
-            render_.start(devices_, ref, this, exclusive);
+            render_.start(devices_, {config_.output.deviceId, config_.output.deviceNameMatch},
+                          this, config_.exclusiveOutput);
         }
     }
 
@@ -450,24 +447,20 @@ OutputStatus AudioEngine::outputStatus() const {
 }
 
 void AudioEngine::setChannelDevice(int channel, const DeviceRef& ref) {
-    {
-        std::lock_guard<std::mutex> lock(configMutex_);
-        ChannelConfig* target = channel >= 0 && size_t(channel) < config_.sources.size()
-            ? &config_.sources[channel] : &config_.output;
-        target->deviceId        = ref.id;
-        target->deviceNameMatch = ref.nameMatch;
-    }
+    // Render callbacks never take configMutex_, so it is safe to hold it while
+    // start() joins the worker. This also serializes with supervisor restarts.
+    std::lock_guard<std::mutex> lock(configMutex_);
+    if (channel >= 0 && size_t(channel) >= config_.sources.size()) return;
+    ChannelConfig& target = channel >= 0 ? config_.sources[channel] : config_.output;
+    target.deviceId        = ref.id;
+    target.deviceNameMatch = ref.nameMatch;
 
     if (!running()) return;
-    if (channel >= 0 && size_t(channel) < sourceCount_) {
-        channels_[channel]->stream.start(devices_, ref);
+    if (channel >= 0) {
+        if (size_t(channel) < sourceCount_ && target.enabled)
+            channels_[channel]->stream.start(devices_, ref);
     } else {
-        // Read the flag out from under the lock first. start() joins the
-        // render thread, and holding configMutex_ across that join would
-        // deadlock against onRenderFormat if it were to take the same lock.
-        bool exclusive;
-        { std::lock_guard<std::mutex> lock(configMutex_); exclusive = config_.exclusiveOutput; }
-        render_.start(devices_, ref, this, exclusive);
+        render_.start(devices_, ref, this, config_.exclusiveOutput);
     }
 }
 

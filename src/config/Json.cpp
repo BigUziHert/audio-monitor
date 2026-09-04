@@ -1,8 +1,7 @@
 #include "config/Json.h"
 
-#include <cctype>
+#include <charconv>
 #include <cstdio>
-#include <cstdlib>
 
 namespace audiomon {
 namespace {
@@ -91,13 +90,46 @@ struct Parser {
 
     bool parseNumber(JsonValue& out) {
         const size_t start = i;
-        if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
-        bool any = false;
-        while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) ||
-                                s[i] == '.' || s[i] == 'e' || s[i] == 'E' ||
-                                s[i] == '-' || s[i] == '+')) { ++i; any = true; }
-        if (!any) return fail("expected a value");
-        out = JsonValue(std::strtod(s.substr(start, i - start).c_str(), nullptr));
+        const auto isDigit = [this] { return i < s.size() && s[i] >= '0' && s[i] <= '9'; };
+        if (i < s.size() && s[i] == '-') ++i;
+        if (!isDigit()) return fail("expected a number");
+        if (s[i] == '0') {
+            ++i;
+            if (isDigit()) return fail("leading zero in number");
+        } else {
+            while (isDigit()) ++i;
+        }
+        if (i < s.size() && s[i] == '.') {
+            ++i;
+            if (!isDigit()) return fail("expected fraction digits");
+            while (isDigit()) ++i;
+        }
+        if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+            ++i;
+            if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
+            if (!isDigit()) return fail("expected exponent digits");
+            while (isDigit()) ++i;
+        }
+        double number = 0;
+        const auto result = std::from_chars(s.data() + start, s.data() + i, number);
+        if (result.ec != std::errc{} || result.ptr != s.data() + i)
+            return fail("number out of range");
+        out = JsonValue(number);
+        return true;
+    }
+
+    bool parseHex4(unsigned& value) {
+        if (i + 4 > s.size()) return fail("truncated \\u escape");
+        value = 0;
+        for (int digit = 0; digit < 4; ++digit) {
+            const char c = s[i++];
+            unsigned hex;
+            if (c >= '0' && c <= '9') hex = c - '0';
+            else if (c >= 'a' && c <= 'f') hex = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') hex = c - 'A' + 10;
+            else return fail("invalid hex digit in \\u escape");
+            value = (value << 4) | hex;
+        }
         return true;
     }
 
@@ -108,6 +140,7 @@ struct Parser {
         while (i < s.size()) {
             const char c = s[i++];
             if (c == '"') return true;
+            if (static_cast<unsigned char>(c) < 0x20) return fail("unescaped control character");
             if (c != '\\') { out += c; continue; }
             if (i >= s.size()) break;
             const char e = s[i++];
@@ -121,17 +154,18 @@ struct Parser {
                 case 'b':  out += '\b'; break;
                 case 'f':  out += '\f'; break;
                 case 'u': {
-                    if (i + 4 > s.size()) return fail("truncated \\u escape");
-                    unsigned cp = std::strtoul(s.substr(i, 4).c_str(), nullptr, 16);
-                    i += 4;
-                    // Recombine a surrogate pair if the low half follows.
-                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= s.size() &&
-                        s[i] == '\\' && s[i + 1] == 'u') {
-                        const unsigned lo = std::strtoul(s.substr(i + 2, 4).c_str(), nullptr, 16);
-                        if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                            i += 6;
-                        }
+                    unsigned cp;
+                    if (!parseHex4(cp)) return false;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        if (i + 2 > s.size() || s[i] != '\\' || s[i + 1] != 'u')
+                            return fail("missing low surrogate");
+                        i += 2;
+                        unsigned lo;
+                        if (!parseHex4(lo)) return false;
+                        if (lo < 0xDC00 || lo > 0xDFFF) return fail("invalid low surrogate");
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        return fail("unpaired low surrogate");
                     }
                     appendUtf8(out, cp);
                     break;
