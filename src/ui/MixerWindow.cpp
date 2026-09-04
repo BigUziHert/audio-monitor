@@ -1457,19 +1457,20 @@ bool MixerWindow::drawDialogs() {
         struct SettingsNavItem {
             const char *label;
             Icon icon;
+            int page;
         };
-        constexpr SettingsNavItem nav[] = {{"Audio", Wave}, {"General", Gear},
-                                            {"Plugins", Puzzle}, {"About", Info}};
+        constexpr SettingsNavItem nav[] = {{"General", Gear, 1}, {"Audio", Wave, 0},
+                                            {"Plugin", Puzzle, 2}, {"About", Info, 3}};
         for (int i = 0; i < 4; ++i) {
             const float y = 92 + i * 58.f;
-            const bool selected = settingsPage_ == i;
+            const bool selected = settingsPage_ == nav[i].page;
             if (selected)
                 c.rect(0, y, 158, 50, IM_COL32(48, 37, 83, 255), 9, false);
             c.icon(nav[i].icon, 24, y + 25, selected ? purple : gray, 27);
             c.text(51, y + 12, nav[i].label, 19, selected ? IM_COL32(185, 147, 255, 255) : white);
             ImGui::PushID(i + 1200);
             if (c.hit("Settings page", 0, y, 158, 50))
-                settingsPage_ = i;
+                settingsPage_ = nav[i].page;
             ImGui::PopID();
         }
 

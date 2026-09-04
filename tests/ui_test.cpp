@@ -85,6 +85,24 @@ int main() {
             frame(1600, 986);
         };
         frame(1600, 986);
+        const auto originalBuffer = config.bufferMillis;
+        click(650, 488); // Sample Rate opens the Audio settings page.
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
+               "Sample Rate did not open Settings");
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 327); // Buffer slider
+            click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save
+        }
+        expect(config.bufferMillis != originalBuffer,
+               "Sample Rate did not open the Audio settings page");
+        config.bufferMillis = originalBuffer;
+        engine.setBufferMillis(originalBuffer);
+        click(900, 488); // Buffer also opens the Audio settings page.
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
+               "Buffer did not open Settings");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 700, dialog->DC.CursorStartPos.y + 21); // Close
+        expect(!popup(), "Buffer Settings did not close cleanly");
         click(1200, 488); // Channels
         expect(popup() && std::strcmp(popup()->Name, "Channels") == 0, "Channels dialog missing");
         expectFixedModal(popup(), "Channels is not modal");
