@@ -45,6 +45,12 @@ enum Icon {
     Puzzle,
     Dot
 };
+struct IconChoice {
+    const char *key;
+    Icon icon;
+};
+constexpr IconChoice iconChoices[] = {{"microphone", Mic}, {"speaker", Speaker}, {"chat", Chat},
+                                      {"headphones", Headphones}, {"screen", Screen}, {"wave", Wave}};
 struct Canvas {
     ImDrawList *dl;
     ImVec2 origin;
@@ -76,9 +82,49 @@ struct Canvas {
         dl->AddText(fontFor(bold), size * s, p(x, y), color, label.c_str(), nullptr, 0,
                     maxWidth > 0 ? &clip : nullptr);
     }
+    void scrollingText(float x, float y, const std::string &label, float size, ImU32 color,
+                       bool bold, float maxWidth) const {
+        const auto measured = textSize(label, size, bold);
+        if (measured.x <= maxWidth) {
+            text(x, y, label, size, color, bold, maxWidth);
+            return;
+        }
+
+        // Pause at both ends so long names remain readable instead of moving constantly.
+        constexpr float speed = 34.f, hold = 1.15f;
+        const float travel = measured.x - maxWidth;
+        const float travelTime = travel / speed;
+        const float cycle = hold * 2 + travelTime * 2;
+        const float phase = static_cast<float>(std::fmod(ImGui::GetTime(), cycle));
+        float offset = 0;
+        if (phase > hold && phase <= hold + travelTime)
+            offset = (phase - hold) * speed;
+        else if (phase > hold + travelTime && phase <= hold * 2 + travelTime)
+            offset = travel;
+        else if (phase > hold * 2 + travelTime)
+            offset = travel - (phase - hold * 2 - travelTime) * speed;
+
+        const ImVec4 clip(origin.x + x * s, origin.y + y * s,
+                          origin.x + (x + maxWidth) * s, origin.y + (y + size + 8) * s);
+        dl->AddText(fontFor(bold), size * s, p(x - offset, y), color, label.c_str(), nullptr, 0, &clip);
+    }
+    void wrappedText(float x, float y, const std::string &label, float size, ImU32 color,
+                     float maxWidth, float maxHeight) const {
+        const ImVec4 clip(origin.x + x * s, origin.y + y * s,
+                          origin.x + (x + maxWidth) * s, origin.y + (y + maxHeight) * s);
+        dl->AddText(fontFor(false), size * s, p(x, y), color, label.c_str(), nullptr,
+                    maxWidth * s, &clip);
+    }
     void centeredText(float x, float y, const std::string &label, float size, ImU32 color) const {
         const auto measured = textSize(label, size, false);
         text(x - measured.x / 2, y - measured.y / 2, label, size, color);
+    }
+    void alignedIconLabel(Icon type, float iconX, float textX, float centerY,
+                          const std::string &label, float size, float iconSize,
+                          ImU32 iconColor, ImU32 textColor = white) const {
+        icon(type, iconX, centerY, iconColor, iconSize);
+        const auto measured = textSize(label, size, true);
+        text(textX, centerY - measured.y / 2, label, size, textColor, true);
     }
     void centeredIconLabel(Icon type, float x, float y, const std::string &label, float size,
                            float iconSize, ImU32 iconColor, ImU32 textColor = white) const {
@@ -256,17 +302,30 @@ struct Canvas {
         dl->AddCircleFilled(p(x, y), 31 * s, ImGui::ColorConvertFloat4ToU32(v), 40);
         icon(type, x, y, color, 34);
     }
+    void infoMark(float x, float y, ImU32 color, float size = 18) const {
+        const float radius = size / 2;
+        dl->AddCircle(p(x, y), radius * s, color, 28, 1.7f * s);
+        const float fontSize = size * .72f;
+        const auto measured = textSize("i", fontSize, true);
+        text(x - measured.x / 2, y - measured.y / 2 - .5f, "i", fontSize, color, true);
+    }
     bool volume(const char *id, float x, float y, float width, float &gain) const {
         // Keep the native slider's keyboard navigation; replace its appearance.
         ImGui::SetCursorScreenPos(p(x, y));
         ImGui::SetNextItemWidth(width * s);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
-        float value = std::min(gain, 1.0f);
-        bool changed = ImGui::SliderFloat(id, &value, 0, 1, "", ImGuiSliderFlags_NoInput);
+        // The compact dashboard uses the familiar 0-100% range until a boosted
+        // value is configured in the editor. Keep boosted values adjustable
+        // instead of collapsing them to 100% on the next interaction.
+        const ImGuiID sliderId = ImGui::GetID(id);
+        const bool boostedDrag = ImGui::GetActiveID() == sliderId;
+        const float maxGain = gain > 1.0001f || boostedDrag ? 4.0f : 1.0f;
+        float value = std::clamp(gain, 0.0f, maxGain);
+        bool changed = ImGui::SliderFloat(id, &value, 0, maxGain, "", ImGuiSliderFlags_NoInput);
         ImGui::PopStyleVar();
         if (changed)
             gain = value;
-        float center = y + 18, end = x + 8 + (width - 16) * std::min(gain, 1.0f);
+        float center = y + 18, end = x + 8 + (width - 16) * std::clamp(gain / maxGain, 0.0f, 1.0f);
         line(x + 8, center, x + width - 8, center, IM_COL32(46, 51, 58, 255), 9);
         line(x + 8, center, end, center, purple, 9);
         dl->AddCircleFilled(p(end, center + 2), 14 * s, IM_COL32(0, 0, 0, 80), 28);
@@ -360,6 +419,42 @@ bool gainSlider(const Canvas &c, const char *id, float x, float y, float width, 
     if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
         c.dl->AddCircle(c.p(end, center), 16 * c.s, purple, 28, 2 * c.s);
     return changed;
+}
+bool gainPercentInput(const Canvas &c, const char *id, float x, float y, float width, float &gain) {
+    float percent = std::round(std::clamp(gain, 0.f, 4.f) * 100.f);
+    char preview[24];
+    std::snprintf(preview, sizeof(preview), "%.0f%%", percent);
+    const float horizontalPadding =
+        std::max(5.f * c.s, (width * c.s - ImGui::CalcTextSize(preview).x) / 2.f);
+    ImGui::SetCursorScreenPos(c.p(x, y));
+    ImGui::SetNextItemWidth(width * c.s);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        {horizontalPadding, ImGui::GetStyle().FramePadding.y});
+    const bool changed = ImGui::InputFloat(
+        id, &percent, 0.f, 0.f, "%.0f%%",
+        ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_AutoSelectAll);
+    ImGui::PopStyleVar();
+    if (changed)
+        gain = std::clamp(percent / 100.f, 0.f, 4.f);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Type a mix gain from 0%% to 400%%");
+    return changed;
+}
+bool checkboxWithDescription(const Canvas &c, const char *id, float x, float y, float width,
+                             bool &value, const char *label, const char *description) {
+    constexpr float box = 24.f, gap = 10.f;
+    c.rect(x, y, box, box, value ? purple : card, 7, !value);
+    if (value)
+        c.icon(Check, x + box / 2, y + box / 2, white, 17);
+    const float textX = x + box + gap;
+    c.text(textX, y + 1, label, 17, white);
+    c.wrappedText(textX, y + 29, description, 14, gray,
+                  std::max(width - box - gap, 1.f), 42);
+    if (c.hit(id, x, y, width, 64)) {
+        value = !value;
+        return true;
+    }
+    return false;
 }
 ImVec4 popupBounds(float scale) {
     const auto *viewport = ImGui::GetMainViewport();
@@ -527,16 +622,16 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
     auto color = sourceColor(source, index);
     auto icon = sourceIcon(source, index);
     c.badge(icon, 43, 52, color);
-    c.text(90, 23, sourceName(source), 23, white, true, width - 204);
+    c.scrollingText(90, 23, sourceName(source), 23, white, true, width - 204);
     auto subtitle = state.deviceName.empty() ? toUtf8(source.deviceNameMatch) : toUtf8(state.deviceName);
     if (source.kind == SourceKind::Application)
         subtitle = state.state == StreamState::Running ? "Application audio" : "Waiting for application";
     if (subtitle.empty())
         subtitle = "Choose a device";
-    c.text(90, 61, subtitle, 18, gray, false, width - 108);
+    c.scrollingText(90, 61, subtitle, 18, gray, false, width - 204);
     // Keep the full description available on hover without creating a keyboard stop.
     ImGui::SetCursorScreenPos(c.p(90, 59));
-    ImGui::Dummy({(width - 108) * scale_, 30 * scale_});
+    ImGui::Dummy({(width - 204) * scale_, 30 * scale_});
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", subtitle.c_str());
     c.rect(width - 107, 30, 34, 36, source.enabled ? purple : IM_COL32(43, 48, 55, 255), 7, false);
@@ -712,32 +807,12 @@ bool MixerWindow::draw(float dt, int width, int height) {
                   : i == 2 ? "Switch Stereo / Mono"
                            : "Open audio settings")) {
             if (i == 2)
-                ImGui::OpenPopup("Mix channels");
+                openChannels_ = true;
             else if (i == 3)
-                ImGui::OpenPopup("Audio status");
+                openStatus_ = true;
             else {
                 settingsPage_ = 0;
                 openSettings_ = true;
-            }
-        }
-        if (i == 2 && beginBoundedPopup("Mix channels", scale_)) {
-            for (int mode = 0; mode < 2; ++mode)
-                if (ImGui::Selectable(mode ? "Mono - same mix on both sides"
-                                           : "Stereo - separate left and right",
-                                      config_->mono == (mode == 1))) {
-                    config_->mono = mode == 1;
-                    engine_->setMono(config_->mono);
-                    changed = true;
-                }
-            ImGui::EndPopup();
-        }
-        if (i == 3) {
-            ImGui::SetNextWindowSize({490 * scale_, 0});
-            if (beginBoundedPopup("Audio status", scale_)) {
-                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(statusColor), "%s", status_.c_str());
-                ImGui::Separator();
-                ImGui::TextWrapped("%s", statusDetail_.c_str());
-                ImGui::EndPopup();
             }
         }
         ImGui::PopID();
@@ -746,16 +821,26 @@ bool MixerWindow::draw(float dt, int width, int height) {
     c.icon(Link, rightX + 49, outputY + 44, purple, 32);
     c.text(rightX + 82, outputY + 25, "Output Device", 25, white, true);
     c.rect(rightX + 18, outputY + 79, rightW - 38, 164, card, 16);
-    c.badge(Screen, rightX + 59, outputY + 127, purple);
-    auto outputName = !engine_->running() || out.deviceName.empty() ? toUtf8(config_->output.deviceNameMatch)
-                                                                    : toUtf8(out.deviceName);
-    if (outputName.empty())
-        outputName = "Choose output device";
-    c.text(rightX + 107, outputY + 97, outputName, 24, white, true, rightW - 318);
+    const auto outputIcon = iconFromKey(config_->output.icon, Screen);
+    // Screen is the output card's default icon and remains purple whether the
+    // implicit default or the explicit icon choice is stored.
+    const auto outputColor = config_->output.icon.empty() || config_->output.icon == "screen"
+                                 ? purple
+                                 : sourceColor(config_->output, 0);
+    c.badge(outputIcon, rightX + 59, outputY + 127, outputColor);
+    auto outputDeviceName = !engine_->running() || out.deviceName.empty()
+                                ? toUtf8(config_->output.deviceNameMatch)
+                                : toUtf8(out.deviceName);
+    if (outputDeviceName.empty())
+        outputDeviceName = "Choose output device";
+    const auto outputDisplayName = config_->output.label.empty() ? outputDeviceName : config_->output.label;
+    c.scrollingText(rightX + 107, outputY + 97, outputDisplayName, 24, white, true, rightW - 318);
     std::string outputSubtitle = engine_->running() && out.state == StreamState::Running
                                      ? (out.exclusive ? "Exclusive audio output" : "Shared audio output")
                                      : "Combined audio destination";
-    c.text(rightX + 107, outputY + 132, outputSubtitle, 19, gray);
+    if (!config_->output.label.empty())
+        outputSubtitle = outputDeviceName + " - " + outputSubtitle;
+    c.scrollingText(rightX + 107, outputY + 132, outputSubtitle, 19, gray, false, rightW - 318);
     bool active = engine_->running() && out.state == StreamState::Running;
     c.rect(rightX + rightW - 197, outputY + 102, 97, 46,
            active ? IM_COL32(20, 53, 31, 255) : IM_COL32(49, 42, 29, 255), 24, false);
@@ -763,25 +848,15 @@ bool MixerWindow::draw(float dt, int width, int height) {
                    active ? green : amber);
     c.rect(rightX + rightW - 83, outputY + 101, 46, 46, IM_COL32(40, 46, 53, 255), 11, false);
     c.icon(Down, rightX + rightW - 60, outputY + 124, white, 28);
-    if (c.hit("Select output device", rightX + rightW - 86, outputY + 98, 52, 52,
-              "Choose where the combined mix is sent")) {
+    if (c.hit("Configure output device", rightX + rightW - 86, outputY + 98, 52, 52,
+              "Configure the output device, name, icon, and mix gain")) {
         refreshDevices();
-        ImGui::OpenPopup("Output device");
-    }
-    if (beginBoundedPopup("Output device", scale_, {350 * scale_, 0}, {800 * scale_, 450 * scale_})) {
-        if (playback_.empty())
-            ImGui::TextUnformatted("No playback devices found. Connect one and refresh.");
-        for (const auto &device : playback_) {
-            ImGui::PushID(toUtf8(device.id).c_str());
-            if (ImGui::Selectable(toUtf8(device.name).c_str(), device.id == config_->output.deviceId)) {
-                config_->output.deviceId = device.id;
-                config_->output.deviceNameMatch = device.name;
-                engine_->setChannelDevice(-1, {device.id, device.name});
-                changed = true;
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndPopup();
+        outputDraft_ = config_->output;
+        outputDraft_.kind = SourceKind::Playback;
+        outputDraft_.processPath.clear();
+        outputDraft_.enabled = true;
+        std::snprintf(outputName_, sizeof(outputName_), "%s", config_->output.label.c_str());
+        openOutput_ = true;
     }
     c.icon(config_->output.muted ? Muted : Speaker, rightX + 54, outputY + 203,
            config_->output.muted ? red : white, 28);
@@ -843,6 +918,125 @@ bool MixerWindow::hitTitleBar(int x, int y, int width, int height) const {
 bool MixerWindow::drawDialogs() {
     bool changed = false;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24 * scale_, 24 * scale_});
+    if (openChannels_) {
+        ImGui::OpenPopup("Channels");
+        openChannels_ = false;
+    }
+    if (beginBoundedModal("Channels", 590, scale_,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+        constexpr float dialogW = 542.f, dialogH = 390.f;
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        Canvas c{ImGui::GetWindowDrawList(), start, scale_};
+        ImGui::Dummy({dialogW * scale_, dialogH * scale_});
+        ImGui::PushID("channels-dialog");
+
+        c.dl->AddCircleFilled(c.p(32, 30), 31 * scale_, IM_COL32(48, 37, 83, 255), 40);
+        c.icon(Link, 32, 30, purple, 34);
+        c.text(78, 4, "Channels", 30, white, true);
+        c.text(78, 43, "Configure how audio channels are handled", 17, gray);
+        c.rect(dialogW - 42, 1, 40, 40, card, 9);
+        c.icon(Close, dialogW - 22, 21, white, 25);
+        if (c.hit("Close channels", dialogW - 42, 1, 40, 40))
+            ImGui::CloseCurrentPopup();
+
+        c.rect(0, 91, dialogW, 202, panel, 14);
+        auto drawMode = [&](int mode, float y, const char *title, const char *description) {
+            const bool selected = config_->mono == (mode == 1);
+            if (selected)
+                c.rect(1, y, dialogW - 2, 100, IM_COL32(21, 28, 32, 255), 12, false);
+            c.dl->AddCircle(c.p(35, y + 47), 11 * scale_,
+                            selected ? purple : IM_COL32(74, 84, 93, 255), 24, 2.5f * scale_);
+            if (selected)
+                c.dl->AddCircleFilled(c.p(35, y + 47), 5 * scale_, white, 20);
+            c.text(72, y + 28, title, 18, white, true, 345);
+            c.text(72, y + 63, description, 16, gray, false, 345);
+
+            if (mode == 0) {
+                for (int channel = 0; channel < 2; ++channel) {
+                    const float x = 458 + channel * 28.f;
+                    c.rect(x, y + 25, 19, 45, IM_COL32(38, 44, 51, 255), 5, false);
+                    c.rect(x + 7, y + 42, 5, 17, purple, 1, false);
+                    c.centeredText(x + 9.5f, y + 83, channel ? "R" : "L", 14, gray);
+                }
+            } else {
+                c.rect(456, y + 25, 48, 45, IM_COL32(38, 44, 51, 255), 7, false);
+                c.rect(466, y + 48, 5, 12, gray, 1, false);
+                c.rect(477, y + 34, 5, 26, gray, 1, false);
+                c.rect(488, y + 44, 5, 16, gray, 1, false);
+                c.centeredText(480, y + 83, "L+R", 14, white);
+            }
+
+            ImGui::PushID(mode);
+            if (c.hit("Channel mode", 0, y, dialogW, 100) && !selected) {
+                config_->mono = mode == 1;
+                engine_->setMono(config_->mono);
+                changed = true;
+            }
+            ImGui::PopID();
+        };
+        drawMode(0, 92, "Stereo - separate left and right",
+                 "Left and right channels are kept separate.");
+        c.line(16, 192, dialogW - 16, 192, border, 1);
+        drawMode(1, 193, "Mono - same mix on both sides",
+                 "Left and right channels are mixed to mono.");
+
+        c.rect(14, 312, dialogW - 28, 78, card, 11);
+        constexpr const char *channelInfo =
+            "Changes apply to the output mix and what is sent to your output device.";
+        const float channelInfoWidth = dialogW - 108;
+        const float channelInfoHeight = c.fontFor(false)
+                                            ->CalcTextSizeA(16 * scale_, FLT_MAX,
+                                                            channelInfoWidth * scale_, channelInfo)
+                                            .y /
+                                        scale_;
+        c.infoMark(43, 351, purple, 22);
+        c.wrappedText(78, 351 - channelInfoHeight / 2, channelInfo, 16, gray,
+                      channelInfoWidth, channelInfoHeight + 2);
+
+        ImGui::PopID();
+        ImGui::EndPopup();
+    }
+
+    if (openStatus_) {
+        ImGui::OpenPopup("Status");
+        openStatus_ = false;
+    }
+    if (beginBoundedModal("Status", 620, scale_,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+        constexpr float dialogW = 572.f;
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        Canvas c{ImGui::GetWindowDrawList(), start, scale_};
+        const float detailHeight = std::max(
+            c.fontFor(false)->CalcTextSizeA(18 * scale_, FLT_MAX, 456 * scale_, statusDetail_.c_str()).y /
+                scale_,
+            50.f);
+        const float dialogH = 181 + detailHeight;
+        ImGui::Dummy({dialogW * scale_, dialogH * scale_});
+        ImGui::PushID("status-dialog");
+        const ImU32 statusColor = !engine_->running() || severity_ >= 2 ? red : severity_ ? amber : green;
+
+        auto badgeColor = ImGui::ColorConvertU32ToFloat4(statusColor);
+        badgeColor.w = .13f;
+        c.dl->AddCircleFilled(c.p(32, 30), 31 * scale_,
+                              ImGui::ColorConvertFloat4ToU32(badgeColor), 40);
+        c.icon(Bars, 32, 30, statusColor, 34);
+        c.text(78, 4, "Status", 30, white, true);
+        c.text(78, 43, "Overview of your audio monitoring system", 17, gray);
+        c.rect(dialogW - 42, 1, 40, 40, card, 9);
+        c.icon(Close, dialogW - 22, 21, white, 25);
+        if (c.hit("Close status", dialogW - 42, 1, 40, 40))
+            ImGui::CloseCurrentPopup();
+
+        c.line(0, 94, dialogW, 94, border, 1);
+        c.dl->AddCircle(c.p(36, 139), 16 * scale_, statusColor, 28, 2.5f * scale_);
+        c.icon(status_ == "Optimal" ? Check : Bars, 36, 139, statusColor, 23);
+        c.text(77, 119, status_, 21, statusColor, true, dialogW - 95);
+        c.wrappedText(77, 156, statusDetail_, 18, gray, 456, detailHeight);
+
+        ImGui::PopID();
+        ImGui::EndPopup();
+    }
+
     if (openSource_) {
         ImGui::OpenPopup("Configure source");
         openSource_ = false;
@@ -909,8 +1103,7 @@ bool MixerWindow::drawDialogs() {
             ImGui::CloseCurrentPopup();
 
         c.rect(0, 91, dialogW, 176, panel, 14);
-        c.icon(Wave, 28, 125, purple, 28);
-        c.text(58, 108, "1.  Select Source Type", 20, white, true);
+        c.alignedIconLabel(Wave, 28, 58, 125, "1.  Select Source Type", 20, 28, purple);
         if (drawSourceType("Audio Device", 18, "Audio Device", "Use a headset, speaker, or microphone",
                            Speaker, !isApp))
             selectKind(false);
@@ -919,8 +1112,9 @@ bool MixerWindow::drawDialogs() {
             selectKind(true);
 
         c.rect(0, 286, dialogW, 142, panel, 14);
-        c.icon(Speaker, 28, 319, purple, 28);
-        c.text(58, 302, isApp ? "2.  Choose Application" : "2.  Choose Device", 20, white, true);
+        c.alignedIconLabel(Speaker, 28, 58, 319,
+                           isApp ? "2.  Choose Application" : "2.  Choose Device",
+                           20, 28, purple);
         std::string selected = "Select a device...";
         if (isApp) {
             for (const auto &app : apps_)
@@ -991,10 +1185,9 @@ bool MixerWindow::drawDialogs() {
                16, gray, false, dialogW - 36);
 
         c.rect(0, 448, dialogW, 339, panel, 14);
-        c.icon(Sliders, 28, 482, purple, 27);
-        c.text(58, 465, "3.  Customize Source", 20, white, true);
+        c.alignedIconLabel(Sliders, 28, 58, 482, "3.  Customize Source", 20, 27, purple);
         c.text(18, 507, "Icon", 16, white);
-        c.line(348, 510, 348, 730, border, 1);
+        c.line(348, 510, 348, 654, border, 1);
         c.text(372, 507, "Display Name", 16, white);
         char count[24];
         std::snprintf(count, sizeof(count), "%zu / 128", std::strlen(name_));
@@ -1004,12 +1197,6 @@ bool MixerWindow::drawDialogs() {
         ImGui::InputTextWithHint("##Source name", "e.g. Microphone", name_, sizeof(name_));
 
         const char *selectedIcon = draft_.icon.empty() ? defaultIconKey(draft_.kind) : draft_.icon.c_str();
-        struct IconChoice {
-            const char *key;
-            Icon icon;
-        };
-        constexpr IconChoice iconChoices[] = {{"microphone", Mic}, {"speaker", Speaker}, {"chat", Chat},
-                                              {"headphones", Headphones}, {"screen", Screen}, {"wave", Wave}};
         for (int i = 0; i < 6; ++i) {
             const float ix = 18 + float(i % 3) * 55.f, iy = 531 + float(i / 3) * 55.f;
             const bool selectedIconChoice = std::strcmp(selectedIcon, iconChoices[i].key) == 0;
@@ -1023,23 +1210,18 @@ bool MixerWindow::drawDialogs() {
             ImGui::PopID();
         }
 
-        ImGui::SetCursorScreenPos(c.p(372, 590));
-        ImGui::Checkbox("Include in mix", &draft_.enabled);
-        c.text(401, 620, "This source will be mixed into the output.", 15, gray, false, 146);
-        ImGui::SetCursorScreenPos(c.p(552, 590));
-        ImGui::Checkbox("Muted", &draft_.muted);
-        c.text(581, 620, "Start this source muted", 15, gray, false, 120);
+        checkboxWithDescription(c, "Include in mix", 372, 590, 168, draft_.enabled,
+                                "Include in mix", "This source will be mixed into the output.");
+        checkboxWithDescription(c, "Source muted", 552, 590, 152, draft_.muted,
+                                "Muted", "Start this source muted");
 
         c.text(18, 671, "Mix Gain", 17, white);
-        c.icon(Info, 107, 682, gray, 18);
+        c.infoMark(107, 680, gray, 19);
         c.icon(Speaker, 28, 711, white, 24);
         float gain = draft_.gain;
         if (gainSlider(c, "##Gain boost", 58, 693, 500, gain))
             draft_.gain = gain;
-        c.rect(588, 690, 91, 36, card, 8);
-        char gainLabel[24];
-        std::snprintf(gainLabel, sizeof(gainLabel), "%.0f%%", draft_.gain * 100);
-        c.centeredText(633.5f, 708, gainLabel, 18, white);
+        gainPercentInput(c, "##Gain percentage", 588, 690, 91, draft_.gain);
         const char *gainMarks[] = {"0%", "100%", "200%", "300%", "400%"};
         for (int i = 0; i < 5; ++i)
             c.centeredText(58 + 500 * float(i) / 4.f, 749, gainMarks[i], 15, gray);
@@ -1073,6 +1255,142 @@ bool MixerWindow::drawDialogs() {
             else
                 config_->sources[editSource_] = draft_;
             restart();
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::PopID();
+        ImGui::EndPopup();
+    }
+    if (openOutput_) {
+        ImGui::OpenPopup("Configure output");
+        openOutput_ = false;
+    }
+    if (beginBoundedModal("Configure output", 770, scale_,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+        constexpr float dialogW = 722.f, dialogH = 658.f;
+        const ImVec2 start = ImGui::GetCursorScreenPos();
+        Canvas c{ImGui::GetWindowDrawList(), start, scale_};
+        ImGui::Dummy({dialogW * scale_, dialogH * scale_});
+        ImGui::PushID("output-dialog");
+
+        auto drawButton = [&](const char *id, float x, float y, float w, float h, const char *label,
+                              Icon icon, ImU32 fill, bool enabled = true) {
+            const ImU32 buttonFill = enabled ? fill : IM_COL32(42, 47, 54, 255);
+            c.rect(x, y, w, h, buttonFill, 10, false);
+            if (icon == Dot)
+                c.centeredText(x + w / 2, y + h / 2, label, 19, enabled ? white : gray);
+            else
+                c.centeredIconLabel(icon, x + w / 2, y + h / 2, label, 21, 27,
+                                    enabled ? white : gray, enabled ? white : gray);
+            if (!enabled) {
+                ImGui::SetCursorScreenPos(c.p(x, y));
+                ImGui::InvisibleButton(id, {w * scale_, h * scale_});
+                return false;
+            }
+            return c.hit(id, x, y, w, h);
+        };
+
+        c.dl->AddCircleFilled(c.p(32, 30), 31 * scale_, IM_COL32(66, 45, 130, 255), 40);
+        c.icon(Screen, 32, 30, white, 33);
+        c.text(78, 6, "Configure Output Device", 31, white, true);
+        c.text(78, 45, "Choose where the combined mix is sent and how it appears", 17, gray);
+        c.rect(dialogW - 42, 1, 40, 40, card, 9);
+        c.icon(Close, dialogW - 22, 21, white, 25);
+        if (c.hit("Close output dialog", dialogW - 42, 1, 40, 40))
+            ImGui::CloseCurrentPopup();
+
+        c.rect(0, 80, dialogW, 142, panel, 14);
+        c.alignedIconLabel(Screen, 28, 58, 113, "1.  Choose Device", 20, 28, purple);
+        std::string selected = outputDraft_.deviceNameMatch.empty()
+                                   ? "Select an output device..."
+                                   : toUtf8(outputDraft_.deviceNameMatch);
+        for (const auto &device : playback_)
+            if (device.id == outputDraft_.deviceId) {
+                selected = toUtf8(device.name);
+                break;
+            }
+        ImGui::SetCursorScreenPos(c.p(18, 134));
+        ImGui::SetNextItemWidth(542 * scale_);
+        if (ImGui::BeginCombo("##Output picker", selected.c_str())) {
+            if (playback_.empty())
+                ImGui::TextUnformatted("No playback devices found.");
+            for (const auto &device : playback_) {
+                ImGui::PushID(toUtf8(device.id).c_str());
+                if (ImGui::Selectable(toUtf8(device.name).c_str(), device.id == outputDraft_.deviceId)) {
+                    outputDraft_.deviceId = device.id;
+                    outputDraft_.deviceNameMatch = device.name;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        if (drawButton("Refresh output choices", 574, 131, 130, 47, "Refresh", Refresh, card))
+            refreshDevices();
+        c.text(18, 193, "Select the playback device that will receive the combined audio mix.",
+               16, gray, false, dialogW - 36);
+
+        c.rect(0, 240, dialogW, 350, panel, 14);
+        c.alignedIconLabel(Sliders, 28, 58, 274, "2.  Customize Output", 20, 27, purple);
+        c.text(18, 299, "Icon", 16, white);
+        c.line(260, 302, 260, 430, border, 1);
+        c.text(286, 299, "Display Name", 16, white);
+        char count[24];
+        std::snprintf(count, sizeof(count), "%zu / 128", std::strlen(outputName_));
+        c.text(dialogW - 91, 299, count, 15, gray);
+        ImGui::SetCursorScreenPos(c.p(286, 323));
+        ImGui::SetNextItemWidth(418 * scale_);
+        ImGui::InputTextWithHint("##Output name", "e.g. Stream Output", outputName_, sizeof(outputName_));
+
+        const char *selectedIcon = outputDraft_.icon.empty() ? "screen" : outputDraft_.icon.c_str();
+        for (int i = 0; i < 6; ++i) {
+            const float ix = 18 + float(i % 3) * 55.f, iy = 323 + float(i / 3) * 55.f;
+            const bool selectedIconChoice = std::strcmp(selectedIcon, iconChoices[i].key) == 0;
+            c.rect(ix, iy, 46, 46, selectedIconChoice ? IM_COL32(39, 30, 67, 255) : card, 7);
+            if (selectedIconChoice)
+                c.dl->AddRect(c.p(ix, iy), c.p(ix + 46, iy + 46), purple, 7 * scale_, 0,
+                              2 * scale_);
+            c.icon(iconChoices[i].icon, ix + 23, iy + 23,
+                   selectedIconChoice ? purple : white, 25);
+            ImGui::PushID(i + 1500);
+            if (c.hit("Output icon choice", ix, iy, 46, 46))
+                outputDraft_.icon = iconChoices[i].key;
+            ImGui::PopID();
+        }
+
+        checkboxWithDescription(c, "Output muted", 286, 379, 350, outputDraft_.muted,
+                                "Muted", "Start the combined output muted");
+
+        c.text(18, 455, "Mix Gain", 17, white);
+        c.infoMark(107, 464, gray, 19);
+        c.icon(Speaker, 28, 495, white, 24);
+        float outputGain = outputDraft_.gain;
+        if (gainSlider(c, "##Output gain boost", 58, 477, 500, outputGain))
+            outputDraft_.gain = outputGain;
+        gainPercentInput(c, "##Output gain percentage", 588, 474, 91, outputDraft_.gain);
+        const char *gainMarks[] = {"0%", "100%", "200%", "300%", "400%"};
+        for (int i = 0; i < 5; ++i)
+            c.centeredText(58 + 500 * float(i) / 4.f, 533, gainMarks[i], 15, gray);
+        c.text(18, 559, "Adjust the final output level. 100% is normal volume.",
+               15, gray, false, dialogW - 36);
+
+        const bool valid = !outputDraft_.deviceId.empty() || !outputDraft_.deviceNameMatch.empty();
+        if (drawButton("Cancel output dialog", 386, 610, 144, 48, "Cancel", Dot, card))
+            ImGui::CloseCurrentPopup();
+        if (drawButton("Save output dialog", 546, 610, 176, 48, "Save", Check,
+                       IM_COL32(109, 71, 231, 255), valid)) {
+            const bool deviceChanged = outputDraft_.deviceId != config_->output.deviceId ||
+                                       outputDraft_.deviceNameMatch != config_->output.deviceNameMatch;
+            outputDraft_.label = outputName_;
+            outputDraft_.kind = SourceKind::Playback;
+            outputDraft_.processPath.clear();
+            outputDraft_.enabled = true;
+            config_->output = outputDraft_;
+            engine_->setOutputGain(config_->output.gain);
+            engine_->setOutputMuted(config_->output.muted);
+            if (deviceChanged)
+                engine_->setChannelDevice(
+                    -1, {config_->output.deviceId, config_->output.deviceNameMatch});
             changed = true;
             ImGui::CloseCurrentPopup();
         }

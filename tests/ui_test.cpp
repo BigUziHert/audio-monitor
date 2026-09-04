@@ -35,6 +35,13 @@ int main() {
             const auto &stack = ImGui::GetCurrentContext()->OpenPopupStack;
             return stack.empty() ? nullptr : stack.back().Window;
         };
+        auto expectFixedModal = [&](ImGuiWindow *dialog, const char *label) {
+            expect(dialog && (dialog->Flags & ImGuiWindowFlags_Modal), label);
+            expect(dialog && (dialog->Flags & ImGuiWindowFlags_NoMove),
+                   "Custom dialog can be dragged");
+            expect(dialog && (dialog->Flags & ImGuiWindowFlags_NoTitleBar),
+                   "Custom dialog has a native title bar");
+        };
         auto frame = [&](int w, int h) {
             io.DisplaySize = {float(w), float(h)};
             io.DeltaTime = 1.f / 60;
@@ -79,13 +86,16 @@ int main() {
         };
         frame(1600, 986);
         click(1200, 488); // Channels
-        expect(popup() != nullptr, "Channels menu missing");
-        expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from a menu");
-        if (auto *menu = popup()) {
-            // Select the last row (Mono), then immediately use another control.
-            click(menu->DC.CursorStartPos.x + 20, menu->DC.CursorMaxPos.y - 10);
+        expect(popup() && std::strcmp(popup()->Name, "Channels") == 0, "Channels dialog missing");
+        expectFixedModal(popup(), "Channels is not modal");
+        expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from Channels");
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 100, dialog->DC.CursorStartPos.y + 240); // Mono
+            expect(config.mono && popup(), "Selecting Mono did not update the live mix");
+            dialog = popup();
+            click(dialog->DC.CursorStartPos.x + 520, dialog->DC.CursorStartPos.y + 21); // Close
         }
-        expect(config.mono && !popup(), "Selecting Mono did not finish the menu action");
+        expect(config.mono && !popup(), "Channels did not close cleanly");
         click(850, 785); // Master volume
         expect(config.output.gain < .9f, "Volume blocked after choosing channels");
         click(670, 900); // Settings
@@ -108,14 +118,24 @@ int main() {
         config.startMinimized = false;
         expect(mixer.hitTitleBar(700, 50, 1600, 986), "Title bar stays blocked after closing Settings");
         click(1200, 488); // Channels again, with no Escape between any actions.
-        expect(popup() != nullptr, "Channels blocked after closing Settings");
-        if (auto *menu = popup())
-            click(menu->DC.CursorStartPos.x + 20, menu->DC.CursorStartPos.y + 10); // Stereo
-        expect(!config.mono && !popup(), "Selecting Stereo did not finish the menu action");
+        expect(popup() && std::strcmp(popup()->Name, "Channels") == 0,
+               "Channels blocked after closing Settings");
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 100, dialog->DC.CursorStartPos.y + 140); // Stereo
+            expect(!config.mono && popup(), "Selecting Stereo did not update the live mix");
+            dialog = popup();
+            click(dialog->DC.CursorStartPos.x + 520, dialog->DC.CursorStartPos.y + 21); // Close
+        }
+        expect(!config.mono && !popup(), "Channels remained open after its close button");
         click(1440, 488); // Status
-        expect(popup() != nullptr, "Status menu missing");
-        click(700, 50); // Dismiss the menu by clicking the title bar.
-        expect(!popup(), "Title-bar click did not dismiss Status");
+        expect(popup() && std::strcmp(popup()->Name, "Status") == 0, "Status dialog missing");
+        expectFixedModal(popup(), "Status is not modal");
+        click(700, 50); // Modal backdrop clicks must not dismiss Status.
+        expect(popup() && std::strcmp(popup()->Name, "Status") == 0,
+               "Backdrop click dismissed Status");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 550, dialog->DC.CursorStartPos.y + 21); // Close
+        expect(!popup(), "Status close button did not dismiss the dialog");
         expect(mixer.hitTitleBar(700, 50, 1600, 986), "Title bar stays blocked after dismissing Status");
         click(670, 900);
         expect(popup() != nullptr, "Settings blocked after dismissing Status");
@@ -185,6 +205,47 @@ int main() {
         if (auto *dialog = popup())
             click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save Settings
         expect(!popup() && config.output.gain == 1.f, "Restore defaults was not committed by Save");
+
+        const size_t sourceCountBeforeOutputEdit = config.sources.size();
+        click(1514, 702); // Configure output device.
+        expect(popup() && std::strcmp(popup()->Name, "Configure output") == 0,
+               "Output editor did not open");
+        expectFixedModal(popup(), "Output editor is not modal");
+        dragAndResizePopup(false);
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 151, dialog->DC.CursorStartPos.y + 346); // Chat icon
+            click(dialog->DC.CursorStartPos.x + 400, dialog->DC.CursorStartPos.y + 340); // Name
+            io.AddInputCharactersUTF8("Stream Output");
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 308, dialog->DC.CursorStartPos.y + 495); // 200% gain
+            expect(config.output.icon.empty() && config.output.label.empty() && config.output.gain == 1.f,
+                   "Output editor applied its draft before Save");
+            click(dialog->DC.CursorStartPos.x + 458, dialog->DC.CursorStartPos.y + 634); // Cancel
+        }
+        expect(!popup() && config.output.icon.empty() && config.output.label.empty() &&
+                   config.output.gain == 1.f,
+               "Cancel did not discard output changes");
+
+        click(1514, 702); // Configure output again and commit.
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 151, dialog->DC.CursorStartPos.y + 346); // Chat icon
+            click(dialog->DC.CursorStartPos.x + 400, dialog->DC.CursorStartPos.y + 340); // Name
+            io.AddInputCharactersUTF8("Stream Output");
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 308, dialog->DC.CursorStartPos.y + 495); // 200% gain
+            click(dialog->DC.CursorStartPos.x + 634, dialog->DC.CursorStartPos.y + 492); // Gain field
+            io.AddInputCharactersUTF8("275");
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 634, dialog->DC.CursorStartPos.y + 634); // Save
+        }
+        expect(!popup() && config.output.icon == "chat" && config.output.label == "Stream Output" &&
+                   config.output.gain > 2.7f && config.output.gain < 2.8f,
+               "Typed output gain was not committed");
+        expect(config.sources.size() == sourceCountBeforeOutputEdit,
+               "Editing output accidentally changed the source list");
+        click(825, 785); // Lower boosted output to about 100% in one held interaction.
+        expect(config.output.gain > .75f && config.output.gain < 1.25f,
+               "Dashboard output slider changed scale before the boosted drag finished");
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
         dragAndResizePopup(false);

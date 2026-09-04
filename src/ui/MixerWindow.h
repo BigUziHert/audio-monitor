@@ -34,11 +34,14 @@ class MixerWindow {
     float scale_ = 1, refreshTimer_ = 0, clippingTimer_ = 0, dropoutTimer_ = 0;
     uint64_t lastUnderruns_ = 0, lastDropped_ = 0;
     bool exitRequested_ = false, openSettings_ = false, openSource_ = false;
+    bool openChannels_ = false, openStatus_ = false, openOutput_ = false;
     int settingsPage_ = 1;
     bool settingsRestoreAll_ = false;
     Config settingsDraft_;
     int editSource_ = -1;
     ChannelConfig draft_;
+    ChannelConfig outputDraft_;
     char name_[128]{};
+    char outputName_[128]{};
 };
 } // namespace audiomon::ui
