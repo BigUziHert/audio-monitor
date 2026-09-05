@@ -155,7 +155,7 @@ void applyPaletteToCurrentContext(const ThemePalette& palette, ColorTheme resolv
     colors[ImGuiCol_Separator] = color(palette.border);
     colors[ImGuiCol_TitleBg] = color(palette.panel);
     colors[ImGuiCol_TitleBgActive] = color(palette.panel);
-    colors[ImGuiCol_NavCursor] = ImVec4(0, 0, 0, 0);
+    colors[ImGuiCol_NavCursor] = color(palette.accent);
 }
 
 void applyRememberedTheme() {

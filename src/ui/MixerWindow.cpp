@@ -16,6 +16,94 @@
 #include <cstring>
 
 namespace audiomon::ui {
+
+// Score dashboard controls by actual on-screen distance. ImGui's default
+// scoring heavily discounts horizontal gaps during vertical moves, so a
+// far-left mute button can beat the percentage field directly below focus.
+// Only replace an existing directional move's result: ImGui still owns key
+// repeat, activation/editing, Tab, popup focus, clipping and scroll-to-focus.
+class SpatialNavigation {
+  public:
+    explicit SpatialNavigation(ImGuiWindow *dashboard) {
+        const auto &g = *ImGui::GetCurrentContext();
+        enabled_ = g.NavMoveScoringItems && g.NavMoveFlags == ImGuiNavMoveFlags_None &&
+                   g.NavMoveDir != ImGuiDir_None && g.NavWindow && g.NavId &&
+                   !g.ActiveId && g.OpenPopupStack.empty() && !g.NavWindowingTarget &&
+                   g.NavWindow->RootWindowForNav == dashboard;
+        if (!enabled_) return;
+        window_ = g.NavWindow;
+        direction_ = g.NavMoveDir;
+        origin_ = ImGui::WindowRectRelToAbs(window_, window_->NavRectRel[g.NavLayer]);
+    }
+
+    void considerLastItem() {
+        if (!enabled_) return;
+        const auto &g = *ImGui::GetCurrentContext();
+        const auto &item = g.LastItemData;
+        auto *window = g.CurrentWindow;
+        if (!item.ID || item.ID == g.NavId ||
+            (item.ItemFlags & (ImGuiItemFlags_Disabled | ImGuiItemFlags_NoNav)) ||
+            window->RootWindowForNav != window_->RootWindowForNav ||
+            window->DC.NavLayerCurrent != g.NavLayer)
+            return;
+        ImRect bounds = item.NavRect;
+        const bool vertical = direction_ == ImGuiDir_Up || direction_ == ImGuiDir_Down;
+        // Only vertical navigation within this same list may target a clipped
+        // card. The list clipper submits its next row so ImGui can scroll to it.
+        if (window != window_ || !vertical) {
+            if (!window->ClipRect.Overlaps(bounds)) return;
+            bounds.ClipWithFull(window->ClipRect);
+        }
+        float forward = 0.f;
+        switch (direction_) {
+        case ImGuiDir_Left: forward = origin_.Min.x - bounds.Max.x; break;
+        case ImGuiDir_Right: forward = bounds.Min.x - origin_.Max.x; break;
+        case ImGuiDir_Up: forward = origin_.Min.y - bounds.Max.y; break;
+        case ImGuiDir_Down: forward = bounds.Min.y - origin_.Max.y; break;
+        default: return;
+        }
+        if (forward < 0.f) return; // Not beyond the focused control in this direction.
+        const float gapX = std::max({0.f, bounds.Min.x - origin_.Max.x, origin_.Min.x - bounds.Max.x});
+        const float gapY = std::max({0.f, bounds.Min.y - origin_.Max.y, origin_.Min.y - bounds.Max.y});
+        const float distance = gapX * gapX + gapY * gapY;
+        const auto a = bounds.GetCenter(), b = origin_.GetCenter();
+        const float centerDistance = (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
+        auto &best = window == window_ ? local_ : other_;
+        if (distance > best.DistBox || (distance == best.DistBox && centerDistance >= best.DistCenter))
+            return;
+        best.Window = window;
+        best.ID = item.ID;
+        best.FocusScopeId = g.CurrentFocusScopeId;
+        best.ItemFlags = item.ItemFlags;
+        best.RectRel = ImGui::WindowRectAbsToRel(window, item.NavRect);
+        best.DistBox = distance;
+        best.DistCenter = centerDistance;
+    }
+
+    void finish() const {
+        auto &g = *ImGui::GetCurrentContext();
+        if (!enabled_ || !g.NavMoveScoringItems || g.NavWindow != window_ ||
+            g.ActiveId || !g.OpenPopupStack.empty() || g.NavWindowingTarget)
+            return;
+        const bool stayInList = local_.ID && (window_->Flags & ImGuiWindowFlags_ChildWindow) &&
+                               (direction_ == ImGuiDir_Up || direction_ == ImGuiDir_Down);
+        const auto &best = stayInList || local_.DistBox < other_.DistBox ||
+                          (local_.DistBox == other_.DistBox && local_.DistCenter <= other_.DistCenter)
+                              ? local_ : other_;
+        if (!best.ID) return; // Preserve native fallback for overlapping/irregular layouts.
+        g.NavMoveResultLocal.Clear();
+        g.NavMoveResultOther.Clear();
+        (best.Window == window_ ? g.NavMoveResultLocal : g.NavMoveResultOther) = best;
+    }
+
+  private:
+    bool enabled_ = false;
+    ImGuiWindow *window_ = nullptr;
+    ImGuiDir direction_ = ImGuiDir_None;
+    ImRect origin_;
+    ImGuiNavItemData local_, other_;
+};
+
 namespace {
 // References remain valid because Theme owns one stable palette object and
 // updates its fields in place when Dark, Light, or System changes.
@@ -107,6 +195,7 @@ struct Canvas {
     ImDrawList *dl;
     ImVec2 origin;
     float s;
+    SpatialNavigation *navigation = nullptr;
     ImVec2 p(float x, float y) const {
         return {origin.x + x * s, origin.y + y * s};
     }
@@ -191,7 +280,12 @@ struct Canvas {
     }
     bool hit(const char *id, float x, float y, float w, float h, const char *tooltip = nullptr) const {
         ImGui::SetCursorScreenPos(p(x, y));
+        // Canvas buttons draw their own inset focus ring. Keep the native
+        // cursor enabled elsewhere for text fields, combos and popup items.
+        ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0, 0, 0, 0));
         bool clicked = ImGui::InvisibleButton(id, {w * s, h * s}, ImGuiButtonFlags_EnableNav);
+        ImGui::PopStyleColor();
+        if (navigation) navigation->considerLastItem();
         if (ImGui::IsItemHovered()) {
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             dl->AddRectFilled(p(x, y), p(x + w, y + h),
@@ -403,6 +497,7 @@ struct Canvas {
         float value = std::clamp(volume, 0.0f, 1.0f);
         bool changed = ImGui::SliderFloat(id, &value, 0, 1, "", ImGuiSliderFlags_NoInput);
         ImGui::PopStyleVar();
+        if (navigation) navigation->considerLastItem();
         if (changed)
             volume = value;
         float center = y + 18, end = x + 8 + (width - 16) * std::clamp(volume, 0.0f, 1.0f);
@@ -442,6 +537,7 @@ struct Canvas {
                 ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_AutoSelectAll);
             ImGui::PopStyleVar(2);
             ImGui::PopStyleColor(4);
+            if (navigation) navigation->considerLastItem();
             if (inputChanged) {
                 volume = std::clamp(percent / 100.f, 0.f, 1.f);
                 changed = true;
@@ -1019,11 +1115,11 @@ void MixerWindow::refreshDropoutStatus(StreamState outputState, uint64_t underru
         addStatusWarning("Audio dropouts",
                          "Audio dropouts were detected recently. Try increasing Buffer in Settings.");
 }
-bool MixerWindow::drawSource(size_t index, float width) {
+bool MixerWindow::drawSource(size_t index, float width, SpatialNavigation &navigation) {
     auto &source = config_->sources[index];
     const auto state = engine_->running() ? engine_->channelStatus(static_cast<int>(index)) : ChannelStatus{};
     const auto position = ImGui::GetCursorScreenPos();
-    Canvas c{ImGui::GetWindowDrawList(), position, scale_};
+    Canvas c{ImGui::GetWindowDrawList(), position, scale_, &navigation};
     bool changed = false;
     ImGui::PushID(static_cast<int>(index));
     c.rect(0, 0, width, 214, card, 17);
@@ -1101,7 +1197,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImGui::PopStyleVar(2);
-    Canvas c{ImGui::GetWindowDrawList(), {0, 0}, scale_};
+    SpatialNavigation navigation(ImGui::GetCurrentWindow());
+    Canvas c{ImGui::GetWindowDrawList(), {0, 0}, scale_, &navigation};
     c.rect(1, 1, w - 2, h - 2, background, 22);
     c.icon(Wave, 65, 54, purple, 40);
     c.text(109, 36, "Audio Monitor", 31, white, true);
@@ -1143,7 +1240,9 @@ bool MixerWindow::draw(float dt, int width, int height) {
         meters_[i].update(sourcePeak, dt);
     }
     ImGui::SetCursorScreenPos(c.p(44, 191));
-    ImGui::BeginChild("Source list", {434 * scale_, (h - 307) * scale_}, ImGuiChildFlags_None,
+    // Navigate directly between source controls and the rest of the dashboard,
+    // without an extra focus/activation stop on the scrolling container.
+    ImGui::BeginChild("Source list", {434 * scale_, (h - 307) * scale_}, ImGuiChildFlags_NavFlattened,
                       ImGuiWindowFlags_NoBackground);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 18 * scale_));
     const float sourceWidth = ImGui::GetContentRegionAvail().x / scale_;
@@ -1154,7 +1253,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
     sourceClipper.Begin(static_cast<int>(config_->sources.size()));
     while (sourceClipper.Step())
         for (int i = sourceClipper.DisplayStart; i < sourceClipper.DisplayEnd; ++i)
-            changed |= drawSource(static_cast<size_t>(i), sourceWidth);
+            changed |= drawSource(static_cast<size_t>(i), sourceWidth, navigation);
     if (config_->sources.empty())
         ImGui::TextWrapped("Add a playback device, microphone, or app to begin your mix.");
     ImGui::PopStyleVar();
@@ -1403,9 +1502,12 @@ bool MixerWindow::draw(float dt, int width, int height) {
     c.centeredIconLabel(running ? Stop : Play, stopX + stopW / 2, footerY + 37,
                         running ? "Stop Monitoring" : "Start Monitoring", 28, 34,
                         canMonitor ? onAccent : gray, canMonitor ? onAccent : gray);
-    if (c.hit("Toggle monitoring", stopX, footerY, stopW, 74,
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, !canMonitor);
+    const bool toggleMonitoring = c.hit("Toggle monitoring", stopX, footerY, stopW, 74,
               !canMonitor ? "Add an output device before starting monitoring" :
-              running ? "Stop sending audio; keep source meters active" : "Resume saved mix") && canMonitor) {
+              running ? "Stop sending audio; keep source meters active" : "Resume saved mix");
+    ImGui::PopItemFlag();
+    if (toggleMonitoring && canMonitor) {
         if (engine_->running())
             engine_->setMonitoring(!running);
         else
@@ -1425,6 +1527,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
     c.centeredIconLabel(Dot, stateX + stateW / 2, footerY + 36.5f,
                         running ? "Monitoring Active" : "Monitoring Stopped", 24, 16, running ? green : gray);
     changed |= drawDialogs();
+    navigation.finish();
     ImGui::End();
     ImGui::PopFont();
     // Apply after drawing and unwinding temporary styles. The next frame is

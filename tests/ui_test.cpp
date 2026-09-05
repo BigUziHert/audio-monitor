@@ -323,8 +323,8 @@ int main() {
         for (auto *window : ImGui::GetCurrentContext()->Windows)
             expect(std::isfinite(window->Size.x) && std::isfinite(window->Size.y),
                    "Zero-size dashboard produced a non-finite window size");
-        expect(ImGui::GetStyle().Colors[ImGuiCol_NavCursor].w == 0.f,
-               "Native navigation cursor is still visible under the custom focus ring");
+        expect(ImGui::GetColorU32(ImGuiCol_NavCursor) == ui::themePalette().accent,
+               "Native controls do not have a visible theme-colored keyboard focus ring");
 
         for (auto size : {ImVec2(1600, 986), ImVec2(1440, 890), ImVec2(960, 600), ImVec2(2200, 1200)}) {
             frame(int(size.x), int(size.y));
@@ -1002,14 +1002,15 @@ int main() {
         expect(!popup() && config.sources.size() == sourceCountBeforeDialogTests,
                "Remove source did not remove exactly one source");
 
+        int keyboardWidth = 1600, keyboardHeight = 986;
         auto pressKey = [&](ImGuiKey key) {
             io.AddKeyEvent(key, true);
-            frame(1600, 986);
+            frame(keyboardWidth, keyboardHeight);
             io.AddKeyEvent(key, false);
-            frame(1600, 986);
+            frame(keyboardWidth, keyboardHeight);
         };
         auto focusDashboardItem = [&](const char *label) {
-            frame(1600, 986);
+            frame(keyboardWidth, keyboardHeight);
             auto *dashboard = ImGui::FindWindowByName("Audio Monitor dashboard");
             expect(dashboard != nullptr, "Dashboard missing for keyboard test");
             if (!dashboard)
@@ -1022,8 +1023,115 @@ int main() {
             ImGui::SetNavID(itemId, ImGuiNavLayer_Main,
                             dashboard->NavRootFocusScopeId, ImRect());
             ImGui::GetCurrentContext()->NavCursorVisible = true;
-            frame(1600, 986);
+            frame(keyboardWidth, keyboardHeight);
         };
+
+        auto sourceList = [&]() -> ImGuiWindow * {
+            for (auto *window : ImGui::GetCurrentContext()->Windows)
+                if (std::strstr(window->Name, "/Source list_"))
+                    return window;
+            return nullptr;
+        };
+        auto sourceItemId = [&](int index, const char *label) {
+            auto *list = sourceList();
+            return list ? ImHashStr(label, 0, list->GetID(index)) : ImGuiID(0);
+        };
+        auto expectFocus = [&](ImGuiID id, const char *message) {
+            auto *context = ImGui::GetCurrentContext();
+            if (id != context->NavId && context->NavWindow) {
+                const auto &rect = context->NavWindow->NavRectRel[context->NavLayer];
+                std::printf("Focus expected %08X got %08X in %s at %.0f,%.0f-%.0f,%.0f\n",
+                            id, context->NavId, context->NavWindow->Name,
+                            rect.Min.x, rect.Min.y, rect.Max.x, rect.Max.y);
+            }
+            expect(id != 0 && context->NavId == id && context->NavCursorVisible, message);
+        };
+        auto hasFocusOutline = [&]() {
+            auto *context = ImGui::GetCurrentContext();
+            auto *window = context->NavWindow;
+            if (!window) return false;
+            ImRect bounds = window->NavRectRel[context->NavLayer];
+            bounds.Translate(window->Pos);
+            bounds.Expand(5.f);
+            int accentVertices = 0;
+            for (const auto &vertex : window->DrawList->VtxBuffer)
+                if (vertex.col == ui::themePalette().accent && bounds.Contains(vertex.pos))
+                    ++accentVertices;
+            return accentVertices >= 8;
+        };
+
+        // Cross the scrolling child border in one key press, landing on an
+        // actual control, not the list container. Exercise real nav scoring
+        // at multiple dashboard scales, including the user's screenshot size.
+        for (const auto size : {ImVec2(1600, 986), ImVec2(1440, 890), ImVec2(960, 600)}) {
+            keyboardWidth = static_cast<int>(size.x);
+            keyboardHeight = static_cast<int>(size.y);
+            for (const auto theme : {ColorTheme::Dark, ColorTheme::Light}) {
+                ui::applyTheme(theme);
+                focusDashboardItem("Refresh devices");
+                pressKey(ImGuiKey_DownArrow);
+                expectFocus(sourceItemId(0, "Configure source"),
+                            "Down from Refresh did not visibly focus the nearest source button");
+                expect(hasFocusOutline(), "Focused source button has no visible outline");
+                pressKey(ImGuiKey_LeftArrow);
+                expectFocus(sourceItemId(0, "Enable source"),
+                            "Left did not focus the adjacent source toggle");
+                pressKey(ImGuiKey_RightArrow);
+                expectFocus(sourceItemId(0, "Configure source"),
+                            "Right did not return to the adjacent source button");
+                pressKey(ImGuiKey_UpArrow);
+                expectFocus(ImGui::FindWindowByName("Audio Monitor dashboard")->GetID("Refresh devices"),
+                            "Up did not navigate out of the source list to Refresh");
+                pressKey(ImGuiKey_DownArrow);
+                pressKey(ImGuiKey_DownArrow);
+                expectFocus(sourceItemId(0, "##source-volume-percent"),
+                            "Down from Configure did not focus the nearest volume percentage field");
+                expect(hasFocusOutline(), "Focused native percentage field has no visible outline");
+            }
+        }
+        keyboardWidth = 1600;
+        keyboardHeight = 986;
+        ui::applyTheme(config.colorTheme);
+        focusDashboardItem("Refresh devices");
+        pressKey(ImGuiKey_DownArrow);
+        pressKey(ImGuiKey_RightArrow);
+        auto *keyboardDashboard = ImGui::FindWindowByName("Audio Monitor dashboard");
+        expectFocus(ImHashStr("Audio information", 0, keyboardDashboard->GetID(600)),
+                    "Right from a source did not reach the nearest dashboard information button");
+        pressKey(ImGuiKey_LeftArrow);
+        expectFocus(sourceItemId(1, "Configure source"),
+                    "Left from dashboard information did not reach the nearest source control");
+
+        focusDashboardItem("Refresh devices");
+        pressKey(ImGuiKey_DownArrow);
+        pressKey(ImGuiKey_DownArrow);
+        const float savedKeyboardVolume = config.sources.front().volume;
+        pressKey(ImGuiKey_Enter);
+        io.AddInputCharactersUTF8("73");
+        frame(1600, 986);
+        pressKey(ImGuiKey_LeftArrow);
+        expect(ImGui::GetCurrentContext()->ActiveId == sourceItemId(0, "##source-volume-percent"),
+               "Arrow navigation stole the caret from an active volume field");
+        pressKey(ImGuiKey_Enter);
+        expect(std::abs(config.sources.front().volume - .73f) < .001f,
+               "Keyboard-focused volume percentage could not be edited");
+        config.sources.front().volume = savedKeyboardVolume;
+
+        focusDashboardItem("Refresh devices");
+        pressKey(ImGuiKey_DownArrow);
+        pressKey(ImGuiKey_Enter);
+        expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0,
+               "Enter after Refresh/Down did not open the focused source");
+        for (auto key : {ImGuiKey_DownArrow, ImGuiKey_RightArrow, ImGuiKey_UpArrow, ImGuiKey_LeftArrow}) {
+            pressKey(key);
+            expect(popup() && ImGui::GetCurrentContext()->NavWindow &&
+                       ImGui::GetCurrentContext()->NavWindow->RootWindowForNav == popup(),
+                   "Dashboard arrow navigation escaped an open modal");
+        }
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 700,
+                  dialog->DC.CursorStartPos.y + 21);
+        expect(!popup(), "Keyboard-opened source configuration did not close");
 
         focusDashboardItem("Refresh devices");
         const ImGuiID firstTabId = ImGui::GetCurrentContext()->NavId;
@@ -1082,6 +1190,35 @@ int main() {
         while (config.sources.size() < kMaxSources)
             config.sources.push_back(config.sources.front());
         frame(1600, 986);
+        frame(1600, 986);
+        focusDashboardItem("Refresh devices");
+        pressKey(ImGuiKey_DownArrow);
+        for (int index = 0; index < kMaxSources; ++index) {
+            expectFocus(sourceItemId(index, "Configure source"),
+                        "Arrow navigation skipped a source card in the scrolling list");
+            pressKey(ImGuiKey_DownArrow);
+            expectFocus(sourceItemId(index, "##source-volume-percent"),
+                        "Arrow navigation stopped on a non-control in the scrolling list");
+            pressKey(ImGuiKey_DownArrow);
+        }
+        expect(sourceList() && sourceList()->Scroll.y > 0.f,
+               "Arrow navigation did not scroll clipped source cards into view");
+        expectFocus(ImGui::FindWindowByName("Audio Monitor dashboard")->GetID("Add Device"),
+                    "Down from the final source did not leave the list for Add Device");
+        pressKey(ImGuiKey_UpArrow);
+        expectFocus(sourceItemId(kMaxSources - 1, "##source-volume"),
+                    "Up from Add Device did not reach the nearest volume slider");
+        pressKey(ImGuiKey_RightArrow);
+        for (int index = kMaxSources - 1; index >= 0; --index) {
+            expectFocus(sourceItemId(index, "##source-volume-percent"),
+                        "Up did not return through the nearest volume percentage fields");
+            pressKey(ImGuiKey_UpArrow);
+            expectFocus(sourceItemId(index, "Configure source"),
+                        "Up did not reach the nearest source configuration button");
+            pressKey(ImGuiKey_UpArrow);
+        }
+        expectFocus(ImGui::FindWindowByName("Audio Monitor dashboard")->GetID("Refresh devices"),
+                    "Up from the first source did not return to Refresh after scrolling");
         click(260, 909);
         expect(popup() != nullptr, "Source limit popup did not open at the source cap");
         pressKey(ImGuiKey_Escape);
@@ -1192,6 +1329,11 @@ int main() {
         expect(!engine.monitoring() &&
                    ui::MixerWindowTestAccess::statusDetail(mixer).find("Add an output") != std::string::npos,
                "Empty outputs started forwarding or reported a healthy live route");
+        focusDashboardItem("Settings");
+        pressKey(ImGuiKey_RightArrow);
+        expect(ImGui::GetCurrentContext()->NavId !=
+                   ImGui::FindWindowByName("Audio Monitor dashboard")->GetID("Toggle monitoring"),
+               "Arrow navigation focused the unavailable Start Monitoring button");
         restorePreferences();
         expect(config.sources.empty() && config.outputCount() == 0,
                "Restore defaults failed to clear sources or recreated a removed output");

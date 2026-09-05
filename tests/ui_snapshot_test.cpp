@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_impl_dx11.h>
 
 #include <algorithm>
@@ -288,7 +289,16 @@ Config syntheticConfig(ColorTheme theme) {
     return config;
 }
 
-enum class Scene { Dashboard, AudioSettings, GeneralSettings, About, AddSource, ConfigureOutput };
+enum class Scene {
+    Dashboard,
+    FocusedSource,
+    FocusedPercentage,
+    AudioSettings,
+    GeneralSettings,
+    About,
+    AddSource,
+    ConfigureOutput
+};
 
 struct Shot {
     const wchar_t* fileName;
@@ -316,6 +326,8 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
 
     switch (shot.scene) {
         case Scene::Dashboard: break;
+        case Scene::FocusedSource: break;
+        case Scene::FocusedPercentage: break;
         case Scene::AudioSettings: ui::MixerWindowTestAccess::openSettings(mixer, 0); break;
         case Scene::GeneralSettings: ui::MixerWindowTestAccess::openSettings(mixer, 1); break;
         case Scene::About: ui::MixerWindowTestAccess::openSettings(mixer, 4); break;
@@ -325,22 +337,67 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
             break;
     }
 
-    bool rendered = false;
-    for (int frame = 0; frame < 2; ++frame) {
+    auto drawFrame = [&]() {
         for (size_t source = 0; source < config.sources.size(); ++source) {
             const float level = .18f + .13f * static_cast<float>(source);
             engine.channelPeak(static_cast<int>(source)).l.publish(level);
             engine.channelPeak(static_cast<int>(source)).r.publish(level * .86f);
         }
-        if (!renderer.beginFrame()) {
-            renderer.destroy();
-            return false;
-        }
+        if (!renderer.beginFrame()) return false;
         ImGui::GetIO().DeltaTime = 1.f / 60.f;
         mixer.draw(ImGui::GetIO().DeltaTime, static_cast<int>(shot.width),
                    static_cast<int>(shot.height));
-        rendered = ui::RendererTestAccess::renderWithoutPresent(renderer);
-        if (!rendered) break;
+        return ui::RendererTestAccess::renderWithoutPresent(renderer);
+    };
+
+    bool rendered = drawFrame();
+    bool navigationReady = true;
+    const bool focusedScene = shot.scene == Scene::FocusedSource ||
+                              shot.scene == Scene::FocusedPercentage;
+    if (rendered && focusedScene) {
+        // Let ImGui consume the dashboard's initial navigation request before
+        // assigning a deterministic starting item for the captured key move.
+        rendered = drawFrame();
+        auto* dashboard = ImGui::FindWindowByName("Audio Monitor dashboard");
+        if (!rendered || !dashboard) {
+            navigationReady = false;
+        } else {
+            ImGui::SetNavWindow(dashboard);
+            ImGui::SetNavID(dashboard->GetID("Refresh devices"), ImGuiNavLayer_Main,
+                            dashboard->NavRootFocusScopeId, ImRect());
+            ImGui::GetCurrentContext()->NavCursorVisible = true;
+            rendered = drawFrame();
+            if (rendered) {
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_DownArrow, true);
+                rendered = drawFrame();
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_DownArrow, false);
+                if (rendered) rendered = drawFrame();
+            }
+            if (rendered && shot.scene == Scene::FocusedPercentage) {
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_DownArrow, true);
+                rendered = drawFrame();
+                ImGui::GetIO().AddKeyEvent(ImGuiKey_DownArrow, false);
+                if (rendered) rendered = drawFrame();
+            }
+
+            ImGuiWindow* sourceList = nullptr;
+            for (auto* candidate : ImGui::GetCurrentContext()->Windows)
+                if (std::strstr(candidate->Name, "/Source list_")) {
+                    sourceList = candidate;
+                    break;
+                }
+            const char* expectedLabel = shot.scene == Scene::FocusedPercentage
+                                            ? "##source-volume-percent"
+                                            : "Configure source";
+            const ImGuiID expected = sourceList
+                                         ? ImHashStr(expectedLabel, 0, sourceList->GetID(0))
+                                         : ImGuiID(0);
+            navigationReady = expected != 0 &&
+                              ImGui::GetCurrentContext()->NavId == expected &&
+                              ImGui::GetCurrentContext()->NavCursorVisible;
+        }
+    } else if (rendered) {
+        rendered = drawFrame();
     }
 
     std::vector<uint8_t> rgba;
@@ -349,7 +406,8 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
     const bool readBack = rendered && ui::RendererTestAccess::readBackRgba(
                                       renderer, rgba, capturedWidth, capturedHeight);
     const std::filesystem::path output = directory / shot.fileName;
-    const bool saved = readBack && capturedWidth == shot.width && capturedHeight == shot.height &&
+    const bool saved = navigationReady && readBack && capturedWidth == shot.width &&
+                       capturedHeight == shot.height &&
                        writeBmp(output.wstring(), rgba, capturedWidth, capturedHeight);
     renderer.destroy();
 
@@ -406,6 +464,12 @@ int main() {
     const Shot shots[] = {
         {L"dashboard-dark-1440x890.bmp", ColorTheme::Dark, Scene::Dashboard, 1440, 890},
         {L"dashboard-light-1440x890.bmp", ColorTheme::Light, Scene::Dashboard, 1440, 890},
+        {L"navigation-source-focus-dark-1440x890.bmp", ColorTheme::Dark,
+         Scene::FocusedSource, 1440, 890},
+        {L"navigation-source-focus-light-1440x890.bmp", ColorTheme::Light,
+         Scene::FocusedSource, 1440, 890},
+        {L"navigation-percentage-focus-light-1440x890.bmp", ColorTheme::Light,
+         Scene::FocusedPercentage, 1440, 890},
         {L"settings-audio-dark-1440x890.bmp", ColorTheme::Dark, Scene::AudioSettings, 1440, 890},
         {L"settings-audio-light-1440x890.bmp", ColorTheme::Light, Scene::AudioSettings, 1440, 890},
         {L"settings-general-dark-1440x890.bmp", ColorTheme::Dark, Scene::GeneralSettings, 1440, 890},

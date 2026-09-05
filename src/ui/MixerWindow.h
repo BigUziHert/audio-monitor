@@ -8,6 +8,7 @@
 #include <future>
 
 namespace audiomon::ui {
+class SpatialNavigation;
 class MixerWindow {
   public:
     void init(AudioEngine *engine, Config *config, void *window);
@@ -36,7 +37,7 @@ class MixerWindow {
     void restart();
     void startDiagnosticExport(const std::wstring &directory);
     void pollDiagnosticExport();
-    bool drawSource(size_t index, float width);
+    bool drawSource(size_t index, float width, SpatialNavigation &navigation);
     bool drawDialogs();
     AudioEngine *engine_ = nullptr;
     Config *config_ = nullptr;
