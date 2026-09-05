@@ -49,31 +49,42 @@ struct App {
     bool             occluded = false;
     bool             quitting = false;
     bool             configDirty = false;
+    bool             saveFailureLogged = false;
+    unsigned         consecutiveBeginFailures = 0;
     std::chrono::steady_clock::time_point lastFrame{};
     std::chrono::steady_clock::time_point lastSave{};
+    std::chrono::steady_clock::time_point lastSaveAttempt{};
+    std::chrono::steady_clock::time_point lastRuntimeSync{};
 };
 
 App* g_app = nullptr;
 
+void showRendererError(HWND owner) {
+    MessageBoxW(owner, L"Could not create a Direct3D 11 device for the mixer window.\n"
+                       L"Audio mixing is unaffected and continues in the background.",
+                kWindowTitle, MB_OK | MB_ICONWARNING);
+}
+
 void showWindow(App& app) {
+    const bool wasIconic = IsIconic(app.hwnd) != FALSE;
+    if (wasIconic) ShowWindow(app.hwnd, SW_RESTORE);
     if (!app.renderer.ensureCreated(app.hwnd)) {
-        MessageBoxW(nullptr, L"Could not create a Direct3D 11 device for the mixer window.\n"
-                             L"Audio mixing is unaffected and continues in the background.",
-                    kWindowTitle, MB_OK | MB_ICONWARNING);
+        if (wasIconic) ShowWindow(app.hwnd, SW_HIDE);
+        showRendererError(app.hwnd);
         return;
     }
     app.visible = true;
-    ShowWindow(app.hwnd, SW_SHOW);
+    if (!wasIconic) ShowWindow(app.hwnd, SW_SHOW);
     SetForegroundWindow(app.hwnd);
     app.lastFrame = std::chrono::steady_clock::now();
+    app.consecutiveBeginFailures = 0;
 }
 
 void saveConfigIfDirty(App& app, bool force);
 
 void hideWindow(App& app) {
     // Every path into the tray flushes first. Putting it here rather than at
-    // each call site means a future hide path cannot forget -- the tray-icon
-    // toggle already had.
+    // each call site keeps future hide paths from forgetting.
     saveConfigIfDirty(app, true);
     app.visible = false;
     ShowWindow(app.hwnd, SW_HIDE);
@@ -82,19 +93,32 @@ void hideWindow(App& app) {
 }
 
 void saveConfigIfDirty(App& app, bool force) {
-    if (!app.configDirty) return;
     const auto now = std::chrono::steady_clock::now();
+    if (app.engine.running() &&
+        (force || std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now - app.lastRuntimeSync).count() >= 1500)) {
+        if (app.engine.updateConfigFromRuntime(app.config)) app.configDirty = true;
+        app.lastRuntimeSync = now;
+    }
+    if (!app.configDirty) return;
     // Coalesce: dragging a fader would otherwise write the file every frame.
     if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - app.lastSave).count() < 1500) {
         return;
     }
-    // Only fold runtime state back when the engine actually came up. If it
-    // failed to start, its atomics still hold construction defaults, and
-    // copying those over the loaded config would silently reset every fader
-    // and mute the user had saved.
-    if (app.engine.running()) app.engine.updateConfigFromRuntime(app.config);
-    if (!app.config.save()) return;  // retain dirty state and retry a failed save
+    if (app.saveFailureLogged &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - app.lastSaveAttempt).count() < 1500) {
+        return;
+    }
+    app.lastSaveAttempt = now;
+    if (!app.config.save()) {
+        if (!app.saveFailureLogged)
+            LOG_WARN("config: save failed; retrying no more than once every 1500 ms");
+        app.saveFailureLogged = true;
+        return;
+    }
     app.configDirty = false;
+    app.saveFailureLogged = false;
     app.lastSave    = now;
 }
 
@@ -168,10 +192,12 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // Redundant with the NIN_SELECT that follows it under
                     // VERSION_4; acting on both is exactly what caused the flash.
                     return 0;
-                case WM_CONTEXTMENU:
-                case WM_RBUTTONUP: {
+                case WM_RBUTTONUP:
+                    return 0;
+                case WM_CONTEXTMENU: {
                     if (!app) return 0;
-                    const UINT cmd = app->tray.showMenu(hwnd);
+                    POINT position{GET_X_LPARAM(wp), GET_Y_LPARAM(wp)};
+                    const UINT cmd = app->tray.showMenu(hwnd, position);
                     if (cmd == ui::kTrayCmdRestore) showWindow(*app);
                     else if (cmd == ui::kTrayCmdExit) { app->quitting = true; DestroyWindow(hwnd); }
                     return 0;
@@ -194,8 +220,12 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_SIZE:
-            if (app && wp != SIZE_MINIMIZED) {
-                app->renderer.onResize(LOWORD(lp), HIWORD(lp));
+            if (app) {
+                if (wp == SIZE_MINIMIZED) {
+                    if (app->visible) hideWindow(*app);
+                } else {
+                    app->renderer.onResize(LOWORD(lp), HIWORD(lp));
+                }
             }
             return 0;
 
@@ -233,6 +263,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     // Single instance: a second launch just raises the first one's window.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        AllowSetForegroundWindow(ASFW_ANY);
         PostMessageW(HWND_BROADCAST, g_showMessage, 0, 0);
         return 0;
     }
@@ -241,7 +272,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     //
     // AudioEngine::start runs on this thread and creates the
     // IMMDeviceEnumerator here, but that enumerator is then used from the
-    // three capture threads, the render thread and the supervisor thread --
+    // capture threads, the render thread and the supervisor thread --
     // all of which are MTA. An object created in an STA and called directly
     // from another apartment is an illegal cross-apartment call: it needs
     // marshalling through a proxy, and without one it may appear to work and
@@ -284,6 +315,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                                nullptr, nullptr, hInstance, nullptr);
     if (!app.hwnd) { CoUninitialize(); return 1; }
 
+    CHANGEFILTERSTRUCT filter{sizeof(filter)};
+    ChangeWindowMessageFilterEx(app.hwnd, g_showMessage, MSGFLT_ALLOW, &filter);
+    ChangeWindowMessageFilterEx(app.hwnd, ui::TrayIcon::taskbarCreatedMessage(),
+                                MSGFLT_ALLOW, &filter);
+
     SetWindowPos(app.hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
     const DWORD cornerPreference=2; // DWMWCP_ROUND, harmless on older Windows.
     DwmSetWindowAttribute(app.hwnd,33,&cornerPreference,sizeof(cornerPreference));
@@ -302,6 +338,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     app.lastFrame = std::chrono::steady_clock::now();
     app.lastSave  = app.lastFrame;
+    app.lastRuntimeSync = app.lastFrame;
 
     MSG msg{};
     bool running = true;
@@ -332,7 +369,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             RECT rc{};
             GetClientRect(app.hwnd, &rc);
 
-            if (!app.renderer.beginFrame()) { Sleep(100); continue; }
+            if (!app.renderer.beginFrame()) {
+                ++app.consecutiveBeginFailures;
+                if (app.consecutiveBeginFailures == 20) {
+                    LOG_ERR("renderer: beginFrame failed 20 consecutive times; hiding the window");
+                    hideWindow(app);
+                    showRendererError(app.hwnd);
+                } else {
+                    Sleep(100);
+                }
+                continue;
+            }
+            app.consecutiveBeginFailures = 0;
             if (app.mixer.draw(dt, rc.right - rc.left, rc.bottom - rc.top)) app.configDirty = true;
             app.occluded = app.renderer.endFrame(true);   // vsync paces the loop
 

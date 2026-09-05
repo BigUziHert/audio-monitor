@@ -71,6 +71,7 @@ private:
     void closeDevice();
     void renderLoop();
     void setError(const char* what, HRESULT hr);
+    void logOpenFailureOnce();
 
     DeviceManager* devices_ = nullptr;
     IMixSource*    mixer_   = nullptr;
@@ -90,6 +91,7 @@ private:
     FormatConverter            converter_;
     std::vector<float>         mixBuffer_;    // preallocated stereo float scratch
     UINT32                     bufferFrames_ = 0;
+    REFERENCE_TIME             devicePeriodHns_ = 0;
 
     std::atomic<StreamState> state_{StreamState::Stopped};
     std::atomic<bool>        exclusive_{false};
@@ -103,6 +105,7 @@ private:
     std::wstring       resolvedName_;
     std::wstring       resolvedId_;
     std::string        lastError_;
+    std::string        lastLoggedOpenError_;
 };
 
 } // namespace audiomon

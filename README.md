@@ -135,25 +135,32 @@ The binaries land in `build\Release\`:
 | `audio-monitor.exe` | the tray application |
 | `audiomon-cli.exe`  | a headless console tool, useful for bring-up |
 
-### Build and test the devchatgpt branch
+### Build and test
 
 Exit any running Audio Monitor instance first (tray menu > Exit). Windows
 cannot replace an executable that is still running, and launching a second
 instance only shows the first one's window.
 
 ```powershell
-git switch devchatgpt
-git pull --ff-only origin devchatgpt
-.\scripts\build.ps1 -BuildDir build-devchatgpt -Test
-.\build-devchatgpt\Release\audio-monitor.exe
+git switch main
+git pull --ff-only origin main
+.\scripts\build.ps1 -Test
+.\build\Release\audio-monitor.exe
 ```
 
-`-BuildDir` is optional and defaults to `build`. `-Test` runs DSP, configuration
-migration, headless dashboard, and process-capture activation/restart tests.
-The capture test only opens its own process; it does not play sound or modify
-Windows audio routing. It skips on systems without process capture support.
-The headless dashboard test exercises layouts and controls without a desktop
-window; audible behavior still needs a test with your devices.
+`-BuildDir` is optional and defaults to `build`. `-Test` runs the DSP and sample
+format checks, configuration persistence and migration tests, deterministic
+audio-engine tests, device-name matching, headless dashboard and D3D renderer
+tests, concurrent stream lifecycle stress, process-capture activation/restart,
+and loopback/shared-render integration.
+
+The process-capture test only opens its own process; it does not play sound or
+modify Windows audio routing, and it skips when process capture is unsupported.
+The loopback/render test opens the first active render endpoint, restarts its
+loopback capture three times, and renders silence in shared mode; it skips when
+no render endpoint exists. The dashboard and renderer tests exercise layouts,
+controls, and device recovery without a visible desktop window. Audible behavior
+still needs a test with your devices.
 
 To test overlap, add your speaker/headphone endpoint and add Discord as an
 Application audio source. Play Discord audio through that endpoint: Status
@@ -190,7 +197,7 @@ machine that is not Windows.
 
 ```bash
 ./scripts/crossbuild.sh        # builds both executables
-./scripts/run_tests.sh         # host-native tests for the DSP and config code
+./scripts/run_tests.sh         # host-native DSP, format, JSON and policy tests
 ```
 
 ## Configuration
@@ -202,11 +209,11 @@ whenever you change something in the UI.
 {
   "version": 2,
   "sources": [
-    { "label": "Headphones", "kind": "playback", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "enabled": true, "gain": 1, "muted": false },
-    { "label": "Chat Audio", "kind": "playback", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "enabled": true, "gain": 1, "muted": false },
-    { "label": "Microphone", "kind": "microphone", "deviceId": "", "deviceName": "USB Advanced Audio Device", "enabled": true, "gain": 1, "muted": false }
+    { "label": "Headphones", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "muted": false },
+    { "label": "Chat Audio", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "muted": false },
+    { "label": "Microphone", "kind": "microphone", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "USB Advanced Audio Device", "gain": 1, "muted": false }
   ],
-  "output": { "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "muted": false },
+  "output": { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "muted": false },
   "mono": false,
   "closeToTray": false,
   "exclusiveOutput": true,
@@ -218,8 +225,11 @@ whenever you change something in the UI.
 
 On the first save of a version 1 configuration, the original is preserved as
 `config.json.v1.bak` beside `config.json`. To return to an older build, exit the
-app and copy that backup over `config.json`. Application sources additionally
-store `processPath`; process IDs are deliberately not persisted.
+app and copy that backup over `config.json`. If an existing configuration is
+malformed, it is preserved as `config.json.corrupt.bak` before replacement.
+`processPath` is empty for device sources and contains the selected executable's
+full path for application sources. Process IDs are discovered at runtime and
+are deliberately not persisted.
 
 
 Each device is stored **twice**: as an exact endpoint ID and as a
@@ -233,7 +243,7 @@ A name substring must match **exactly one** endpoint. If it matches several the
 app refuses to attach and logs the candidates rather than picking one, because
 guessing wrong means audio silently goes somewhere plausible-looking with no
 error. This is not hypothetical: on a machine with Elgato Wave Link installed,
-`"Elgato"` matches three render endpoints and the shortest is Wave Link'''s
+`"Elgato"` matches three render endpoints and the shortest is Wave Link's
 *virtual driver* rather than the capture card. The defaults are chosen to be
 unambiguous, not merely plausible.
 
@@ -358,7 +368,7 @@ src/audio/     WASAPI capture and render, mixing, drift correction, metering
 src/ui/        ImGui mixer panel, tray icon, D3D11 renderer
 src/config/    JSON config in %APPDATA%
 src/util/      logging, COM smart pointer, autostart registration
-tests/         host-native tests for the platform-independent core
+tests/         DSP/unit, headless UI/renderer, and Windows audio integration tests
 ```
 
 ## Licence

@@ -33,8 +33,9 @@ public:
     // arrives. Returns the registered message to compare against.
     static UINT taskbarCreatedMessage();
 
-    // Shows the context menu at the cursor. Returns the chosen command, or 0.
-    UINT showMenu(HWND owner);
+    // Shows the context menu at the shell-provided position. Returns the chosen
+    // command, or 0.
+    UINT showMenu(HWND owner, POINT position);
 
 private:
     NOTIFYICONDATAW data_{};

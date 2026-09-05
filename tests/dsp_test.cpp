@@ -3,20 +3,25 @@
 #include "audio/Overlap.h"
 #include "audio/Spectrum.h"
 // Host-native tests for the parts of the mixer that are not Windows-specific:
-// the SPSC ring, the drift resampler, the rate controller and the config JSON.
+// the SPSC ring, resampler, rate controller, sample conversion and config JSON.
 //
-// These run on any platform (see scripts/run_tests.sh) and are the only part
-// of the project that can be executed without the real audio hardware.
+// These run on any platform through scripts/run_tests.sh without audio
+// hardware.
 
 #include "audio/RingBuffer.h"
 #include "audio/Resampler.h"
 #include "audio/RateController.h"
+#include "audio/RetryPolicy.h"
+#include "audio/SampleFormat.h"
 #include "audio/Meter.h"
 #include "audio/FadeEnvelope.h"
 #include "config/Json.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -408,7 +413,7 @@ static void testLiveSetpointChange(double fromMs, double toMs, const char* label
     CHECK(arrived, "never reached the new setpoint");
     CHECK(arriveSeconds < 120.0, "migration took %.1fs", arriveSeconds);
     // Gentleness must survive a setpoint step, not just steady state.
-    CHECK(maxRatioStep <= RateController::kMaxRatioStep + 1e-12,
+    CHECK(maxRatioStep <= RateController::kMaxRatioStep * 4 + 1e-12,
           "ratio jumped by %.2e during the change", maxRatioStep);
     // And the integrator must not have wound up: once settled the ratio has to
     // come back to the true clock error, not sit offset from it.
@@ -420,22 +425,47 @@ static void testFadeLandsOnTheStarvePoint() {
     std::printf("fade-out lands where the audio stops\n");
     const uint32_t frames = 480, rate = 48000;
 
-    for (uint32_t made : { 300u, 100u, 20u }) {
+    for (uint32_t made : { 300u, 100u, 20u, 5u, 0u }) {
         FadeEnvelope env;
         env.configure(uint32_t(rate * 0.005));
         env.reset(1.0f);                       // channel was fully live
         env.beginBlock(made, frames);
 
-        float atLastAudio = 1.0f;
+        float atLastAudio = 0.0f;
+        float previous = 0.0f;
+        float maxStep = 0.0f;
         for (uint32_t f = 0; f < frames; ++f) {
             const float a = env.next(f);
-            if (f == made - 1) atLastAudio = a;
+            if (f > 0) maxStep = std::max(maxStep, std::fabs(a - previous));
+            previous = a;
+            if (made > 0 && f == made - 1) atLastAudio = a;
             if (f >= made) CHECK(a <= 0.0001f, "made=%u: envelope %f is not silent past the audio", made, a);
         }
         std::printf("   made=%3u -> amplitude at the last real sample = %.4f\n", made, atLastAudio);
         // The step into silence is what clicks, so it must be tiny.
         CHECK(atLastAudio < 0.06f, "made=%u: steps to silence from %f", made, atLastAudio);
+        CHECK(maxStep < 0.01f, "made=%u: fade step %f is too abrupt", made, maxStep);
     }
+
+    // A deliberate stop must keep the configured fade slope even when the
+    // render period is shorter than the fade itself.
+    FadeEnvelope forced;
+    forced.configure(uint32_t(rate * 0.005));
+    forced.reset(1.0f);
+    float forcedPrevious = forced.value();
+    float forcedMaxStep = 0.0f;
+    for (int block = 0; block < 5; ++block) {
+        const uint32_t made = std::min(48u, forced.framesUntilSilent());
+        forced.beginBlock(made, 48, true);
+        for (uint32_t f = 0; f < 48; ++f) {
+            const float value = forced.next(f);
+            forcedMaxStep = std::max(forcedMaxStep, std::fabs(value - forcedPrevious));
+            forcedPrevious = value;
+        }
+        if (block < 4) CHECK(forced.value() > 0.0f, "forced fade ended before all short periods");
+    }
+    CHECK(forced.value() == 0.0f, "forced fade did not reach silence after one fade length");
+    CHECK(forcedMaxStep < 0.01f, "forced fade step %f is too abrupt", forcedMaxStep);
 
     // A full block must not be attenuated at all.
     FadeEnvelope full;
@@ -483,6 +513,159 @@ static void testMeter() {
     CHECK(m.levelDb() <= kMeterFloorDb + 0.01f, "release floor, got %f", m.levelDb());
 }
 
+static uint16_t bytesPerTestSample(SampleType type) {
+    switch (type) {
+        case SampleType::Float32: return 4;
+        case SampleType::Float64: return 8;
+        case SampleType::Int16: return 2;
+        case SampleType::Int24Packed: return 3;
+        case SampleType::Int32: return 4;
+        default: return 0;
+    }
+}
+
+static const char* sampleTypeName(SampleType type) {
+    switch (type) {
+        case SampleType::Float32: return "Float32";
+        case SampleType::Float64: return "Float64";
+        case SampleType::Int16: return "Int16";
+        case SampleType::Int24Packed: return "Int24Packed";
+        case SampleType::Int32: return "Int32";
+        default: return "Unknown";
+    }
+}
+
+static void testFormatConverterRoundTrips() {
+    std::printf("sample format round-trips\n");
+    constexpr uint32_t frames = 4;
+    constexpr size_t guard = 16;
+    const std::array<float, frames * 2> source{
+        -1.25f, 1.25f, -0.75f, 0.5f, 0.125f, -0.25f, 1.2f, -1.3f};
+    const std::array<SampleType, 5> types{
+        SampleType::Float32, SampleType::Float64, SampleType::Int16,
+        SampleType::Int24Packed, SampleType::Int32};
+
+    StreamFormat invalidStride{};
+    invalidStride.sampleRate = 48000;
+    invalidStride.channels = 2;
+    invalidStride.type = SampleType::Float32;
+    invalidStride.blockAlign = 7;
+    CHECK(!invalidStride.valid(), "format rejects a block stride smaller than one frame");
+
+    FormatConverter invalidConverter;
+    invalidConverter.configure(invalidStride);
+    std::array<uint8_t, 16> invalidDestination{};
+    invalidDestination.fill(0xA5);
+    const std::array<float, 2> invalidSource{0.5f, -0.5f};
+    invalidConverter.fromStereoFloat(invalidSource.data(), invalidDestination.data(), 1);
+    CHECK(std::all_of(invalidDestination.begin(), invalidDestination.end(),
+                      [](uint8_t byte) { return byte == 0xA5; }),
+          "invalid output stride is not written");
+    std::array<float, 2> invalidDecoded{1.0f, 1.0f};
+    invalidConverter.toStereoFloat(invalidDestination.data(), invalidDecoded.data(), 1);
+    CHECK(invalidDecoded[0] == 0.0f && invalidDecoded[1] == 0.0f,
+          "invalid input stride decodes as silence");
+
+    for (const SampleType type : types) {
+        for (const uint16_t channels : {uint16_t{1}, uint16_t{2}, uint16_t{8}}) {
+            StreamFormat format{};
+            format.sampleRate = 48000;
+            format.channels = channels;
+            format.type = type;
+            format.bitsPerSample = static_cast<uint16_t>(bytesPerTestSample(type) * 8);
+            format.validBits = format.bitsPerSample;
+            format.blockAlign = static_cast<uint16_t>(channels * bytesPerTestSample(type));
+            format.channelMask = channels == 8 ? 0x63Fu : (channels == 2 ? 0x3u : 0u);
+
+            FormatConverter converter;
+            converter.configure(format);
+            const size_t payload = static_cast<size_t>(frames) * format.blockAlign;
+            std::vector<uint8_t> encoded(guard + payload + guard, 0xA5);
+            converter.fromStereoFloat(source.data(), encoded.data() + guard, frames);
+
+            bool guardsIntact = true;
+            for (size_t i = 0; i < guard; ++i) {
+                guardsIntact &= encoded[i] == 0xA5;
+                guardsIntact &= encoded[guard + payload + i] == 0xA5;
+            }
+            CHECK(guardsIntact, "%s %u-channel conversion overwrote guard bytes",
+                  sampleTypeName(type), channels);
+
+            std::array<float, frames * 2> decoded{};
+            converter.toStereoFloat(encoded.data() + guard, decoded.data(), frames);
+            const float tolerance = type == SampleType::Int16 ? 7e-5f : 2e-6f;
+            for (uint32_t frame = 0; frame < frames; ++frame) {
+                float expectedLeft = std::clamp(source[frame * 2], -1.0f, 1.0f);
+                float expectedRight = std::clamp(source[frame * 2 + 1], -1.0f, 1.0f);
+                if (channels == 1) {
+                    expectedLeft = expectedRight = std::clamp(
+                        (source[frame * 2] + source[frame * 2 + 1]) * 0.5f,
+                        -1.0f, 1.0f);
+                }
+                CHECK(std::fabs(decoded[frame * 2] - expectedLeft) <= tolerance &&
+                          std::fabs(decoded[frame * 2 + 1] - expectedRight) <= tolerance,
+                      "%s %u-channel frame %u round-trip = %.7f/%.7f, expected %.7f/%.7f",
+                      sampleTypeName(type), channels, frame, decoded[frame * 2],
+                      decoded[frame * 2 + 1], expectedLeft, expectedRight);
+            }
+        }
+    }
+
+    for (const SampleType type : types) {
+        StreamFormat format{};
+        format.sampleRate = 48000;
+        format.channels = 2;
+        format.type = type;
+        format.bitsPerSample = static_cast<uint16_t>(bytesPerTestSample(type) * 8);
+        format.validBits = format.bitsPerSample;
+        format.blockAlign = static_cast<uint16_t>(2 * bytesPerTestSample(type));
+        format.channelMask = 0x3u;
+
+        FormatConverter converter;
+        converter.configure(format);
+        const std::array<float, 6> nonFinite{
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity()};
+        std::vector<uint8_t> encoded(static_cast<size_t>(3) * format.blockAlign, 0xA5);
+        converter.fromStereoFloat(nonFinite.data(), encoded.data(), 3);
+        std::array<float, 6> decoded{};
+        converter.toStereoFloat(encoded.data(), decoded.data(), 3);
+        CHECK(std::all_of(decoded.begin(), decoded.end(),
+                          [](float value) { return value == 0.0f; }),
+              "%s non-finite samples encode as silence", sampleTypeName(type));
+    }
+
+    StreamFormat surround{};
+    surround.sampleRate = 48000;
+    surround.channels = 8;
+    surround.type = SampleType::Float32;
+    surround.bitsPerSample = surround.validBits = 32;
+    surround.blockAlign = 8 * sizeof(float);
+    surround.channelMask = 0x63Fu;
+    FormatConverter surroundConverter;
+    surroundConverter.configure(surround);
+    constexpr float kMinus3Db = 0.7071068f;
+    const std::array<std::array<float, 2>, 6> expectedSurround{{
+        {kMinus3Db, kMinus3Db}, {0.0f, 0.0f},
+        {kMinus3Db, 0.0f}, {0.0f, kMinus3Db},
+        {kMinus3Db, 0.0f}, {0.0f, kMinus3Db}}};
+    for (uint16_t channel = 2; channel < 8; ++channel) {
+        std::array<float, 8> frame{};
+        frame[channel] = 1.0f;
+        std::array<float, 2> decoded{};
+        surroundConverter.toStereoFloat(frame.data(), decoded.data(), 1);
+        const auto& expected = expectedSurround[channel - 2];
+        CHECK(std::fabs(decoded[0] - expected[0]) < 1e-6f &&
+                  std::fabs(decoded[1] - expected[1]) < 1e-6f,
+              "8-channel input %u downmix = %.7f/%.7f, expected %.7f/%.7f",
+              channel, decoded[0], decoded[1], expected[0], expected[1]);
+    }
+}
+
 static void testJson() {
     std::printf("json\n");
     JsonValue root = JsonValue::object();
@@ -520,6 +703,25 @@ static void testJson() {
     JsonValue u = JsonValue::parse("{\"k\":\"\\u00e9\\u0041\"}", &err);
     CHECK(err.empty(), "unicode parse: %s", err.c_str());
     CHECK(u.find("k")->asString("") == "\xc3\xa9" "A", "utf8 decode");
+
+    JsonValue bom = JsonValue::parse("\xEF\xBB\xBF{\"bufferMillis\":90}", &err);
+    CHECK(err.empty() && bom.find("bufferMillis") &&
+              bom.find("bufferMillis")->asNumber(0) == 90,
+          "UTF-8 BOM is accepted");
+}
+
+static void testRetryPolicy() {
+    std::printf("retry policy\n");
+    CHECK(!shouldRestart(StreamState::Running, true, false), "running stream must not restart");
+    CHECK(!shouldRestart(StreamState::Opening, true, true), "opening stream must not restart");
+    CHECK(!shouldRestart(StreamState::Stopped, true, true), "stopped stream must not restart");
+    CHECK(shouldRestart(StreamState::Failed, true, false), "retryable failure restarts");
+    CHECK(!shouldRestart(StreamState::Failed, false, false), "ambiguous failure waits");
+    CHECK(shouldRestart(StreamState::Failed, false, true), "device notification retries ambiguity");
+    CHECK(retryBackoffMillis(0) == 0 && retryBackoffMillis(1) == 2000 &&
+              retryBackoffMillis(2) == 4000 && retryBackoffMillis(5) == 30000 &&
+              retryBackoffMillis(20) == 30000,
+          "retry backoff doubles and caps at 30 seconds");
 }
 
 static void testMixModeAndRouting() {
@@ -565,9 +767,13 @@ int main() {
     testDisturbanceRecovery();
     testLiveSetpointChange(50.0, 150.0, "increase");
     testLiveSetpointChange(150.0, 40.0, "decrease");
+    testLiveSetpointChange(250.0, 20.0, "full decrease");
+    testLiveSetpointChange(150.0, 20.0, "decrease to minimum");
     testFadeLandsOnTheStarvePoint();
     testMeter();
+    testFormatConverterRoundTrips();
     testJson();
+    testRetryPolicy();
     testMixModeAndRouting();
 
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED",

@@ -16,6 +16,8 @@ jobs:
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
       - name: Build
         run: cmake --build build --config Release
+      - name: Run CTest suite except app capture
+        run: ctest --test-dir build -C Release --output-on-failure -E app-capture
       - name: Show artifacts
         run: Get-ChildItem build\Release -Filter *.exe
         shell: pwsh
@@ -24,15 +26,14 @@ jobs:
           name: audio-monitor-win64
           path: build/Release/*.exe
 
-  # Portability check plus the host-native DSP tests. These are the only tests
-  # that can run without real audio hardware, so they gate every push.
+  # Host-native platform-independent tests plus a Windows cross-compile check.
   linux-crosscheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install mingw-w64
         run: sudo apt-get update && sudo apt-get install -y mingw-w64 cmake
-      - name: Host-native DSP and config tests
+      - name: Host-native platform-independent tests
         run: ./scripts/run_tests.sh
       - name: Cross-compile for Windows
         run: ./scripts/crossbuild.sh ON

@@ -159,6 +159,8 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
         ch.priming      = true;
         ch.presence.configure(uint32_t(double(sampleRate) * kFadeSeconds));
         ch.presence.reset(0.0f);
+        ch.timelineBreakPending = false;
+        ch.lastObservedDepth = 0;
         ch.smoothedGain = ch.muted.load(std::memory_order_relaxed) ? 0.0f : ch.gain.load(std::memory_order_relaxed);
         // Ring holds stale audio from before the rebuild; start clean.
         ch.stream.ring().dropAllFromConsumer();
@@ -189,39 +191,58 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
 
     for (size_t i = 0; i < sourceCount_; ++i) {
         Channel& ch = *channels_[i];
+        StereoRing& ring = ch.stream.ring();
+        uint32_t made = 0;
+        bool forceFadeOut = false;
+
+        const auto resetTimeline = [&] {
+            ring.dropAllFromConsumer();
+            ch.rate.reset();
+            ch.resampler.reset();
+            ch.priming = true;
+            ch.lastObservedDepth = 0;
+            ch.timelineBreakPending = false;
+            ch.depthOut.store(0, std::memory_order_relaxed);
+        };
 
         // A timeline break (discontinuity, reconnect, overflow drop) makes the
         // controller's history meaningless.
         const uint32_t ep = ch.stream.epoch();
         if (ep != ch.lastEpoch) {
             ch.lastEpoch = ep;
-            ch.rate.reset();
-            ch.resampler.reset();
-            ch.priming = true;
-            // Everything buffered predates the break. Playing it out would be
-            // a burst of stale audio, and after a device restart it might not
-            // even be at the right sample rate. We are the consumer, so this
-            // is ours to drop.
-            ch.stream.ring().dropAllFromConsumer();
+            // If audio was already present, retain the old timeline until the
+            // configured fade has completed. Short render periods can require
+            // several calls to consume one fade length.
+            if (ch.presence.value() > 0.0f && ring.depth() >= 4) {
+                ch.timelineBreakPending = true;
+            } else {
+                resetTimeline();
+            }
         }
 
         const bool flowing = ch.stream.flowing();
+        const StreamState state = ch.stream.state();
+        const uint32_t observedDepth = ring.depth();
+        const bool stoppingFade = (ch.timelineBreakPending || state != StreamState::Running) &&
+                                  ch.presence.value() > 0.0f && observedDepth >= 4;
         // Loopback stops delivering packets when playback stops, but the ring
-        // may still hold the buffer's entire tail. Drain it before going idle.
-        const bool live = ch.stream.state() == StreamState::Running &&
-                          (flowing || ch.stream.ring().depth() > 0);
-        uint32_t   made = 0;
+        // may still hold the buffer's entire tail. A stopped/failed source also
+        // gets one fade of real samples rather than being cut off immediately.
+        const bool live = stoppingFade ||
+                          (!ch.timelineBreakPending && state == StreamState::Running &&
+                           (flowing || observedDepth > 0));
 
         if (live) {
-            const uint32_t depth = ch.stream.ring().depth();
+            const uint32_t depth = observedDepth;
             ch.depthOut.store(depth, std::memory_order_relaxed);
 
             const uint32_t srcRate = ch.stream.sampleRate();
-            ch.baseRatio = (srcRate && rate) ? double(srcRate) / double(rate) : 1.0;
+            if (!stoppingFade)
+                ch.baseRatio = (srcRate && rate) ? double(srcRate) / double(rate) : 1.0;
 
             const uint32_t bufMs = bufferMillis_.load(std::memory_order_relaxed);
 
-            if (srcRate && srcRate != ch.lastSrcRate) {
+            if (!stoppingFade && srcRate && srcRate != ch.lastSrcRate) {
                 // New clock: full reconfigure. Setpoint and controller are
                 // denominated in capture frames, matching the ring. dt is real
                 // elapsed time, which the RENDER device sets -- the two rates
@@ -232,7 +253,7 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                 const double dt = rate ? double(frames) / double(rate) : 0.01;
                 ch.rate.configure(double(srcRate), ch.targetDepth, dt);
                 ch.priming = true;
-            } else if (srcRate && bufMs != ch.lastBufferMs) {
+            } else if (!stoppingFade && srcRate && bufMs != ch.lastBufferMs) {
                 // Same clock, new setpoint: the user moved the buffer slider.
                 // setTarget rather than configure -- a reconfigure resets the
                 // controller and re-primes, which would drop audio for a
@@ -242,7 +263,7 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                 ch.targetDepth  = double(srcRate) * double(bufMs) / 1000.0;
                 ch.rate.setTarget(ch.targetDepth);
             }
-            if (ch.targetDepth <= 0.0) { ch.priming = true; }
+            if (!stoppingFade && ch.targetDepth <= 0.0) { ch.priming = true; }
 
             // Priming: wait for the ring to reach the setpoint before drawing
             // from it, so we do not immediately starve. This is also the path
@@ -250,23 +271,36 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             // again.
             // A short sound may end before it fills the target buffer. Once
             // capture is idle, waiting for more packets would strand it forever.
-            if (ch.priming && (depth >= ch.targetDepth || (!flowing && depth >= 4))) {
+            // Do not mistake frames published by a producer that has just
+            // resumed for an old idle tail. The idle bypass is valid only once
+            // the same depth has survived a complete render block.
+            const bool stableIdleTail = !stoppingFade && !flowing && depth >= 4 &&
+                                        depth == ch.lastObservedDepth;
+            ch.lastObservedDepth = depth;
+            if (!stoppingFade && ch.priming &&
+                (depth >= ch.targetDepth || stableIdleTail)) {
                 ch.priming = false;
                 ch.rate.reset();
             }
 
-            if (!ch.priming) {
+            if (stoppingFade) {
+                const uint32_t requested = std::min(frames, ch.presence.framesUntilSilent());
+                const double ratio = ch.baseRatio * ch.rate.ratio();
+                made = ch.resampler.produce(ring, ch.scratch.data(), requested, ratio);
+                forceFadeOut = made > 0;
+            } else if (!ch.priming) {
                 // The controller only ever corrects for drift; the base ratio
                 // handles a genuine rate difference and is not part of the
                 // correction the clamp applies to.
                 const double ratio = ch.baseRatio *
                     (flowing ? ch.rate.update(double(depth)) : ch.rate.ratio());
                 ch.ratioOut.store(ratio, std::memory_order_relaxed);
-                made = ch.resampler.produce(ch.stream.ring(), ch.scratch.data(), frames, ratio);
-                if (made < frames) ch.priming = true;   // starved: re-prime
+                made = ch.resampler.produce(ring, ch.scratch.data(), frames, ratio);
+                if (made < frames) ch.priming = true;
             }
         } else {
-            ch.depthOut.store(ch.stream.ring().depth(), std::memory_order_relaxed);
+            ch.depthOut.store(observedDepth, std::memory_order_relaxed);
+            ch.lastObservedDepth = observedDepth;
             // Hold the converged ratio while the source is idle. Letting the
             // controller integrate against a permanently empty ring would wind
             // it to an extreme that is wildly wrong when audio resumes.
@@ -288,7 +322,7 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
         // envelope is still near 1.0 when the samples run out, so the cut is
         // just as abrupt as no fade at all -- which defeats the entire point
         // of having one.
-        ch.presence.beginBlock(made, frames);
+        ch.presence.beginBlock(made, frames, forceFadeOut);
 
         const float gainTarget = ch.muted.load(std::memory_order_relaxed)
                                      ? 0.0f
@@ -307,6 +341,11 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             const float al = std::fabs(l), ar = std::fabs(r);
             if (al > peakL) peakL = al;
             if (ar > peakR) peakR = ar;
+        }
+
+        if ((ch.timelineBreakPending || state != StreamState::Running) &&
+            ch.presence.value() <= 0.0f) {
+            resetTimeline();
         }
         ch.smoothedGain = g;
 
@@ -358,6 +397,11 @@ void AudioEngine::supervisorMain() {
     const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool needsUninit = SUCCEEDED(coHr);
 
+    std::array<uint32_t, kMaxSources> captureFailures{};
+    std::array<std::chrono::steady_clock::time_point, kMaxSources> captureRetryAt{};
+    uint32_t outputFailures = 0;
+    std::chrono::steady_clock::time_point outputRetryAt{};
+
     while (!quit_.load(std::memory_order_relaxed)) {
         bool woken = false;
         {
@@ -370,11 +414,18 @@ void AudioEngine::supervisorMain() {
 
         if (woken) {
             // Coalesce the burst a driver reinstall produces.
-            std::this_thread::sleep_for(std::chrono::milliseconds(kRebuildDebounceMs));
-            std::lock_guard<std::mutex> lock(superMutex_);
+            std::unique_lock<std::mutex> lock(superMutex_);
+            superCv_.wait_for(lock, std::chrono::milliseconds(kRebuildDebounceMs),
+                              [this] { return quit_.load(std::memory_order_relaxed); });
             superWake_ = false;
+            captureFailures.fill(0);
+            captureRetryAt.fill({});
+            outputFailures = 0;
+            outputRetryAt = {};
         }
         if (quit_.load(std::memory_order_relaxed)) break;
+
+        const auto now = std::chrono::steady_clock::now();
 
         // Serialize reading each selection AND restarting it with UI changes.
         // Releasing the lock in between lets a stale restart undo a new choice.
@@ -382,11 +433,21 @@ void AudioEngine::supervisorMain() {
             std::lock_guard<std::mutex> lock(configMutex_);
             const auto& source = config_.sources[i];
             auto& ch = *channels_[i];
-            if (!source.enabled || ch.stream.state() != StreamState::Failed) continue;
+            if (!source.enabled || ch.stream.state() == StreamState::Running) {
+                captureFailures[i] = 0;
+                captureRetryAt[i] = {};
+                continue;
+            }
+            if (!shouldRestart(ch.stream.state(), ch.stream.retryable(), woken) ||
+                (!woken && now < captureRetryAt[i])) continue;
             ch.stream.start(devices_, source.kind == SourceKind::Application
                 ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
+            ++captureFailures[i];
+            captureRetryAt[i] = now + std::chrono::milliseconds(
+                retryBackoffMillis(captureFailures[i]));
         }
 
+        if (quit_.load(std::memory_order_relaxed)) break;
         std::lock_guard<std::mutex> outputLock(configMutex_);
         // Passivity check. If the endpoint we hold exclusively has since become
         // a system default -- the user changed it in the Sound control panel,
@@ -400,14 +461,22 @@ void AudioEngine::supervisorMain() {
                      "releasing exclusive mode and reopening shared");
             render_.start(devices_, {config_.output.deviceId, config_.output.deviceNameMatch},
                           this, config_.exclusiveOutput);
+            outputFailures = 0;
+            outputRetryAt = {};
         }
 
         // The Elgato commonly enumerates late on a cold boot, so a failed
         // output is a normal startup state that resolves itself.
-        if (render_.state() == StreamState::Failed || render_.wantsRetry()) {
+        if (render_.state() == StreamState::Running) {
+            outputFailures = 0;
+            outputRetryAt = {};
+        } else if (shouldRestart(render_.state(), render_.wantsRetry(), false) &&
+                   (woken || now >= outputRetryAt)) {
             LOG_INFO("supervisor: restarting output (%s)", render_.lastError().c_str());
             render_.start(devices_, {config_.output.deviceId, config_.output.deviceNameMatch},
                           this, config_.exclusiveOutput);
+            ++outputFailures;
+            outputRetryAt = now + std::chrono::milliseconds(retryBackoffMillis(outputFailures));
         }
     }
 
@@ -464,19 +533,25 @@ void AudioEngine::setChannelDevice(int channel, const DeviceRef& ref) {
     }
 }
 
-void AudioEngine::updateConfigFromRuntime(Config& config) const {
+bool AudioEngine::updateConfigFromRuntime(Config& config) const {
     // Persist any endpoint ID that was re-resolved by name, so the next launch
     // matches by ID again instead of re-scanning.
-    auto refresh = [](ChannelConfig& c, const std::wstring& id) {
-        if (!id.empty()) c.deviceId = id;
+    bool changed = false;
+    auto refresh = [&changed](ChannelConfig& c, const std::wstring& id) {
+        if (!id.empty() && c.deviceId != id) {
+            c.deviceId = id;
+            changed = true;
+        }
     };
     for (size_t i = 0; i < std::min(sourceCount_, config.sources.size()); ++i) {
-        if (config.sources[i].kind != SourceKind::Application)
+        if (config.sources[i].kind != SourceKind::Application &&
+            channels_[i]->stream.state() == StreamState::Running)
             refresh(config.sources[i], channels_[i]->stream.resolvedId());
     }
-    refresh(config.output, render_.resolvedId());
+    if (render_.state() == StreamState::Running)
+        refresh(config.output, render_.resolvedId());
     // UI owns faders and toggles, including edits made while monitoring is stopped.
-
+    return changed;
 }
 
 } // namespace audiomon

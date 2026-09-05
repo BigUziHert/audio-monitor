@@ -23,19 +23,31 @@ public:
 
     void reset(float value = 0.0f) noexcept { value_ = value; }
     float value() const noexcept { return value_; }
+    uint32_t fadeFrames() const noexcept { return fade_; }
+    uint32_t framesUntilSilent() const noexcept {
+        if (value_ <= 0.0f) return 0;
+        return std::min(fade_, static_cast<uint32_t>(value_ * float(fade_) + 0.999999f));
+    }
 
     // Call once per block before iterating frames. `made` is how many frames
-    // of real audio the block contains; `frames` is the block length.
-    void beginBlock(uint32_t made, uint32_t frames) noexcept {
+    // of real audio the block contains; `frames` is the block length. A planned
+    // stop uses forceFadeOut when those frames fill the whole render block.
+    void beginBlock(uint32_t made, uint32_t frames, bool forceFadeOut = false) noexcept {
         made_    = made;
-        frames_  = frames;
-        starved_ = (made < frames);
+        forced_  = forceFadeOut && made > 0;
+        starved_ = forced_ || (made < frames);
         rampLen_ = starved_ ? std::min(made, fade_) : 0;
-        start_   = starved_ ? (made - rampLen_) : frames;
+        start_   = forced_ ? 0 : (starved_ ? (made - rampLen_) : frames);
         rise_    = 1.0f / float(fade_);
-        // Fall fast enough to still reach zero by `made` when the block
-        // starved earlier than a full fade would allow.
-        fall_    = 1.0f / float(std::max<uint32_t>(1, rampLen_));
+        // A deliberate stop may span several short render periods. Keep the
+        // configured slope instead of compressing the whole fade into this
+        // block; the mixer will provide more stale audio on the next block.
+        fall_    = 1.0f / float(fade_);
+        // With fewer than one fade's worth of real samples there is no way to
+        // descend from unity without a large per-frame step. Cap the starting
+        // level so the remaining samples still taper at the configured rate.
+        if (!forced_ && starved_ && made < fade_)
+            value_ = std::min(value_, float(made) / float(fade_));
     }
 
     // Advance one frame and return the amplitude to apply.
@@ -43,21 +55,27 @@ public:
         float target = 1.0f;
         if (starved_) {
             if (f >= made_)        target = 0.0f;
-            else if (f >= start_)  target = 1.0f - float(f - start_) / float(rampLen_);
+            else if (forced_)      target = 0.0f;
+            else if (f >= start_)  target = float(made_ - f) / float(fade_);
         }
-        if (value_ < target) value_ = std::min(target, value_ + rise_);
-        else                 value_ = std::max(target, value_ - fall_);
+        if (value_ < target) {
+            value_ = std::min(target, value_ + rise_);
+        } else if (value_ - target <= fall_ + 1.0e-6f) {
+            value_ = target;
+        } else {
+            value_ -= fall_;
+        }
         return value_;
     }
 
 private:
     uint32_t fade_    = 240;
     uint32_t made_    = 0;
-    uint32_t frames_  = 0;
     uint32_t rampLen_ = 0;
     uint32_t start_   = 0;
     float    rise_    = 1.0f / 240.0f;
     float    fall_    = 1.0f / 240.0f;
+    bool     forced_  = false;
     bool     starved_ = false;
     float    value_   = 0.0f;
 };

@@ -55,6 +55,7 @@ public:
     // all while its endpoint is silent, so the mixer drains the buffered tail
     // and freezes the rate controller rather than chasing an empty ring.
     bool flowing() const noexcept { return flowing_.load(std::memory_order_acquire); }
+    bool retryable() const noexcept { return retryable_.load(std::memory_order_acquire); }
 
     // Bumped on any timeline break (discontinuity, reconnect, overflow drop).
     // The mixer resets that channel's rate controller when it changes.
@@ -109,6 +110,7 @@ private:
 
     std::atomic<StreamState> state_{StreamState::Stopped};
     std::atomic<bool>        flowing_{false};
+    std::atomic<bool>        retryable_{true};
     std::atomic<uint32_t>    epoch_{0};
     std::atomic<uint32_t>    sampleRate_{0};
     std::atomic<uint64_t>    dropped_{0};
@@ -118,6 +120,7 @@ private:
     std::wstring         resolvedName_;
     std::wstring         resolvedId_;
     std::string          lastError_;
+    std::string          lastLoggedOpenError_;
 
     // Wall-clock of the last packet, for the flowing/idle decision.
     LARGE_INTEGER qpcFreq_{};

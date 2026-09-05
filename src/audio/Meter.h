@@ -48,8 +48,7 @@ inline float dbToLinear(float db) noexcept {
     return std::pow(10.0f, db * 0.05f);
 }
 
-// Maps dB onto 0..1 for meter and fader geometry. Slightly expanded at the top
-// so the region that actually matters when mixing is not crushed into a sliver.
+// Maps the meter's -60..0 dB display range linearly onto 0..1.
 inline float dbToNorm(float db) noexcept {
     if (db <= kMeterFloorDb) return 0.0f;
     if (db >= 0.0f)          return 1.0f;

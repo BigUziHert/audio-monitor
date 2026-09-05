@@ -57,7 +57,7 @@ void TrayIcon::setTooltip(const wchar_t* tooltip) {
     Shell_NotifyIconW(NIM_MODIFY, &data_);
 }
 
-UINT TrayIcon::showMenu(HWND owner) {
+UINT TrayIcon::showMenu(HWND owner, POINT position) {
     HMENU menu = CreatePopupMenu();
     if (!menu) return 0;
 
@@ -66,8 +66,7 @@ UINT TrayIcon::showMenu(HWND owner) {
     AppendMenuW(menu, MF_STRING, kTrayCmdExit, L"E&xit");
     SetMenuDefaultItem(menu, kTrayCmdRestore, FALSE);
 
-    POINT pt;
-    GetCursorPos(&pt);
+    if (position.x == -1 && position.y == -1) GetCursorPos(&position);
 
     // Without this the menu will not dismiss when the user clicks elsewhere:
     // TrackPopupMenu only closes on an outside click if its owner window is in
@@ -77,7 +76,7 @@ UINT TrayIcon::showMenu(HWND owner) {
 
     const UINT cmd = TrackPopupMenu(menu,
                                     TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                                    pt.x, pt.y, 0, owner, nullptr);
+                                    position.x, position.y, 0, owner, nullptr);
     PostMessageW(owner, WM_NULL, 0, 0);
     DestroyMenu(menu);
     return cmd;

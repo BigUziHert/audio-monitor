@@ -107,9 +107,6 @@ public:
         const double raw     = 1.0 + kp_ * error + ki_ * integral_;
         const double clamped = std::clamp(raw, kMinRatio, kMaxRatio);
 
-        // Conditional integration. Freeze the integrator while saturated, but
-        // still allow it to unwind in the direction that leaves saturation --
-        // plain "freeze when clamped" would trap it at the rail forever.
         const bool saturated = (raw != clamped);
         const bool unwinding = (clamped >= kMaxRatio && error < 0.0) ||
                                (clamped <= kMinRatio && error > 0.0);
@@ -132,7 +129,12 @@ public:
 
         // Slew limit, then clamp again so the limiter can never carry the
         // ratio outside the legal range.
-        const double step = std::clamp(clamped - ratio_, -kMaxRatioStep, kMaxRatioStep);
+        // Returning toward unity is recovery, not a new audible correction.
+        // Let it unwind faster so a large downward setpoint move cannot drain
+        // the ring before the controller gets back from its upper rail.
+        const bool towardUnity = std::fabs(clamped - 1.0) < std::fabs(ratio_ - 1.0);
+        const double limit = kMaxRatioStep * (towardUnity ? 4.0 : 1.0);
+        const double step = std::clamp(clamped - ratio_, -limit, limit);
         ratio_ = std::clamp(ratio_ + step, kMinRatio, kMaxRatio);
         return ratio_;
     }

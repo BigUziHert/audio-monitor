@@ -314,6 +314,12 @@ std::string JsonValue::dump(int indent) const {
 JsonValue JsonValue::parse(const std::string& text, std::string* error) {
     Parser    p(text);
     JsonValue v;
+    if (text.size() >= 3 &&
+        static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB &&
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        p.i = 3;
+    }
     if (!p.parseValue(v, 0)) {
         if (error) *error = p.err.empty() ? "parse error" : p.err;
         return JsonValue();

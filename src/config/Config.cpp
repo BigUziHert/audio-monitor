@@ -56,23 +56,63 @@ ChannelConfig channelFromJson(const JsonValue* v, const ChannelConfig& fallback)
     return c;
 }
 
-bool readWholeFile(const std::wstring& path, std::string& out) {
+void logWin32Failure(const char* operation, DWORD error) {
+    LOG_WARN("config: %s failed (Win32 error %lu)", operation,
+             static_cast<unsigned long>(error));
+}
+
+DWORD closeReadHandle(HANDLE h) {
+    if (CloseHandle(h)) return ERROR_SUCCESS;
+    const DWORD error = GetLastError();
+    logWin32Failure("CloseHandle(existing file)", error);
+    return error;
+}
+
+bool readWholeFile(const std::wstring& path, std::string& out, DWORD* error = nullptr) {
+    if (error) *error = ERROR_SUCCESS;
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) {
+        if (error) *error = GetLastError();
+        return false;
+    }
 
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > (4 << 20)) {
-        CloseHandle(h);
+    if (!GetFileSizeEx(h, &size)) {
+        const DWORD sizeError = GetLastError();
+        closeReadHandle(h);
+        if (error) *error = sizeError;
+        return false;
+    }
+    if (size.QuadPart < 0 || size.QuadPart > (4 << 20)) {
+        closeReadHandle(h);
+        if (error) *error = ERROR_FILE_TOO_LARGE;
         return false;
     }
     out.resize(static_cast<size_t>(size.QuadPart));
     DWORD read = 0;
-    const BOOL ok = ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
-    CloseHandle(h);
-    if (!ok) return false;
+    const BOOL ok = out.empty() ||
+                    ReadFile(h, out.data(), static_cast<DWORD>(out.size()), &read, nullptr);
+    const DWORD readError = ok ? ERROR_SUCCESS : GetLastError();
+    const DWORD closeError = closeReadHandle(h);
+    if (!ok) {
+        if (error) *error = readError;
+        return false;
+    }
+    if (closeError != ERROR_SUCCESS) {
+        if (error) *error = closeError;
+        return false;
+    }
     out.resize(read);
     return true;
+}
+
+void removeTempFile(const std::wstring& path) {
+    if (!DeleteFileW(path.c_str())) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND)
+            logWin32Failure("DeleteFileW(temp)", error);
+    }
 }
 
 } // namespace
@@ -126,10 +166,13 @@ std::wstring Config::configPath() {
 }
 
 Config Config::load(bool* usedDefaults) {
+    return load(configPath(), usedDefaults);
+}
+
+Config Config::load(const std::wstring& path, bool* usedDefaults) {
     Config def = defaults();
     if (usedDefaults) *usedDefaults = true;
 
-    const std::wstring path = configPath();
     if (path.empty()) return def;
 
     std::string text;
@@ -195,37 +238,81 @@ JsonValue Config::toJson() const {
 }
 
 bool Config::save() const {
-    const std::wstring path = configPath();
+    return save(configPath());
+}
+
+bool Config::save(const std::wstring& path) const {
     if (path.empty()) return false;
     const std::string text = toJson().dump(2);
-    // Keep the original settings when migrating the three-input app. This also
-    // provides a way back if the user tests this branch then runs an older build.
-    std::string previous;
-    if (readWholeFile(path, previous)) {
-        const auto old = JsonValue::parse(previous);
-        if (old.isObject() && !old.find("sources")) {
-            if (!CopyFileW(path.c_str(), (path + L".v1.bak").c_str(), TRUE) &&
-                GetLastError() != ERROR_FILE_EXISTS) {
-                LOG_WARN("config: could not preserve version 1 settings; save deferred");
-                return false;
+
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        // Preserve an invalid file for diagnosis before replacing it. Keep the
+        // original v1 backup as well so an older build can still be restored.
+        std::string previous;
+        DWORD readError = ERROR_SUCCESS;
+        if (!readWholeFile(path, previous, &readError)) {
+            logWin32Failure("reading existing file", readError);
+            return false;
+        }
+        std::string parseError;
+        const auto old = JsonValue::parse(previous, &parseError);
+        if (!parseError.empty() || !old.isObject()) {
+            if (!CopyFileW(path.c_str(), (path + L".corrupt.bak").c_str(), TRUE)) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_FILE_EXISTS) {
+                    logWin32Failure("CopyFileW(corrupt backup)", error);
+                    return false;
+                }
+            }
+        } else if (!old.find("sources")) {
+            if (!CopyFileW(path.c_str(), (path + L".v1.bak").c_str(), TRUE)) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_FILE_EXISTS) {
+                    logWin32Failure("CopyFileW(version 1 backup)", error);
+                    return false;
+                }
             }
         }
+    } else {
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+            logWin32Failure("GetFileAttributesW", error);
+            return false;
+        }
     }
+
     // Write to a sibling temp file, then swap it in. A crash part-way through
     // leaves the previous config intact rather than a truncated one.
     const std::wstring tmp = path + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) {
+        logWin32Failure("CreateFileW(temp)", GetLastError());
+        return false;
+    }
 
     DWORD written = 0;
     const BOOL ok = WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    const DWORD writeError = ok ? ERROR_SUCCESS : GetLastError();
     const BOOL flushed = FlushFileBuffers(h);
-    CloseHandle(h);
-    if (!ok || written != text.size() || !flushed) { DeleteFileW(tmp.c_str()); return false; }
+    const DWORD flushError = flushed ? ERROR_SUCCESS : GetLastError();
+    const BOOL closed = CloseHandle(h);
+    const DWORD closeError = closed ? ERROR_SUCCESS : GetLastError();
+    if (!ok) logWin32Failure("WriteFile", writeError);
+    if (ok && written != text.size())
+        LOG_WARN("config: WriteFile wrote only %lu of %zu bytes",
+                 static_cast<unsigned long>(written), text.size());
+    if (!flushed) logWin32Failure("FlushFileBuffers", flushError);
+    if (!closed) logWin32Failure("CloseHandle(temp)", closeError);
+    if (!ok || written != text.size() || !flushed || !closed) {
+        removeTempFile(tmp);
+        return false;
+    }
 
     if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmp.c_str());
+        logWin32Failure("MoveFileExW", GetLastError());
+        removeTempFile(tmp);
         return false;
     }
     return true;

@@ -1,30 +1,11 @@
 #include "audio/DeviceManager.h"
+#include "audio/DeviceMatch.h"
 #include "util/Log.h"
 #include "util/Text.h"
 
 #include <functiondiscoverykeys_devpkey.h>
-#include <algorithm>
-#include <cwctype>
 
 namespace audiomon {
-namespace {
-
-std::wstring toLower(std::wstring s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-    return s;
-}
-
-bool containsNoCase(const std::wstring& haystack, const std::wstring& needle) {
-    if (needle.empty()) return false;
-    return toLower(haystack).find(toLower(needle)) != std::wstring::npos;
-}
-
-bool equalsNoCase(const std::wstring& a, const std::wstring& b) {
-    return !b.empty() && toLower(a) == toLower(b);
-}
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // IMMNotificationClient.
@@ -222,7 +203,7 @@ ResolveResult DeviceManager::resolve(const DeviceRef& ref, EDataFlow flow,
         UINT count = 0;
         coll->GetCount(&count);
 
-        // An exact (case-insensitive) full-name match wins outright.
+        // An exact (case-insensitive) full-name match wins when it is unique.
         // Otherwise collect every substring match and require exactly one.
         //
         // This used to prefer the shortest matching name, which is a guess --
@@ -231,38 +212,31 @@ ResolveResult DeviceManager::resolve(const DeviceRef& ref, EDataFlow flow,
         // the capture card. Silently attaching to the wrong endpoint is far
         // worse than refusing: the audio goes somewhere plausible-looking and
         // nothing reports an error.
-        ComPtr<IMMDevice>         exact;
-        std::wstring              exactName;
-        std::vector<ComPtr<IMMDevice>> partial;
-        std::vector<std::wstring>      partialNames;
+        std::vector<ComPtr<IMMDevice>> devices;
+        std::vector<std::pair<std::wstring, std::wstring>> candidates;
+        devices.reserve(count);
+        candidates.reserve(count);
 
         for (UINT i = 0; i < count; ++i) {
             ComPtr<IMMDevice> dev;
             if (FAILED(coll->Item(i, dev.put())) || !dev) continue;
-            const std::wstring name = friendlyName(dev.get());
-            if (equalsNoCase(name, ref.nameMatch)) { exact = dev; exactName = name; break; }
-            if (containsNoCase(name, ref.nameMatch)) {
-                partial.push_back(dev);
-                partialNames.push_back(name);
-            }
+            candidates.emplace_back(deviceId(dev.get()), friendlyName(dev.get()));
+            devices.push_back(std::move(dev));
         }
 
-        if (exact) {
-            if (outId)   *outId   = deviceId(exact.get());
-            if (outName) *outName = exactName;
-            out = exact;
+        const DeviceNameMatchDecision match = decideDeviceNameMatch(candidates, ref.nameMatch);
+        if (match.kind == DeviceNameMatchKind::Unique) {
+            if (outId)   *outId   = candidates[match.index].first;
+            if (outName) *outName = candidates[match.index].second;
+            out = devices[match.index];
             return ResolveResult::MatchedByName;
         }
-        if (partial.size() == 1) {
-            if (outId)   *outId   = deviceId(partial[0].get());
-            if (outName) *outName = partialNames[0];
-            out = partial[0];
-            return ResolveResult::MatchedByName;
-        }
-        if (partial.size() > 1) {
+        if (match.kind == DeviceNameMatchKind::Ambiguous) {
             LOG_WARN("'%s' matches %zu endpoints; refusing to guess. Choose one in Settings:",
-                     toUtf8(ref.nameMatch).c_str(), partial.size());
-            for (const auto& n : partialNames) LOG_WARN("    %s", toUtf8(n).c_str());
+                     toUtf8(ref.nameMatch).c_str(), match.matchingIndices.size());
+            for (const size_t index : match.matchingIndices) {
+                LOG_WARN("    %s", toUtf8(candidates[index].second).c_str());
+            }
             return ResolveResult::Ambiguous;
         }
     }

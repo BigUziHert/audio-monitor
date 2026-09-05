@@ -16,8 +16,14 @@ class MixerWindow {
     }
 
   private:
+    friend struct MixerWindowTestAccess;
     void refreshDevices();
     void refreshStatus(float dt);
+    bool updateDropoutTimer(StreamState outputState, uint64_t underruns, uint64_t dropped,
+                            float dt);
+    void addStatusWarning(const std::string &label, const std::string &detail, int severity = 1);
+    void refreshDropoutStatus(StreamState outputState, uint64_t underruns, uint64_t dropped,
+                              float dt);
     void restart();
     bool drawSource(size_t index, float width, float dt);
     bool drawDialogs();

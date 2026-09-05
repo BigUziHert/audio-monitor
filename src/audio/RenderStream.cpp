@@ -42,6 +42,13 @@ void RenderStream::setError(const char* what, HRESULT hr) {
     lastError_ = std::string(what) + ": " + log::hrString(hr);
 }
 
+void RenderStream::logOpenFailureOnce() {
+    std::lock_guard<std::mutex> lock(infoMutex_);
+    if (lastError_ == lastLoggedOpenError_) return;
+    LOG_ERR("render: open failed: %s", lastError_.c_str());
+    lastLoggedOpenError_ = lastError_;
+}
+
 void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
                          IMixSource* mixer, bool preferExclusive) {
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
@@ -61,6 +68,7 @@ void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
     quit_.store(false, std::memory_order_relaxed);
     underruns_.store(0, std::memory_order_relaxed);
     wantsRetry_.store(false, std::memory_order_release);
+    devicePeriodHns_ = 0;
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     state_.store(StreamState::Opening, std::memory_order_release);
     thread_ = std::thread(&RenderStream::threadMain, this, ref);
@@ -139,12 +147,21 @@ bool RenderStream::tryExclusive(IMMDevice* device) {
         LOG_INFO("render: probing %u Hz %u ch %u-bit tag=0x%X cbSize=%u",
                  wfx->nSamplesPerSec, wfx->nChannels, wfx->wBitsPerSample,
                  wfx->wFormatTag, wfx->cbSize);
-        if (client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wfx, nullptr) != S_OK) continue;
+        const HRESULT supportHr =
+            client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wfx, nullptr);
+        if (supportHr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED) {
+            LOG_WARN("render: exclusive mode is disabled for this endpoint in its "
+                     "Advanced properties; using shared mode");
+            setError("exclusive not allowed", supportHr);
+            return false;
+        }
+        if (supportHr != S_OK) continue;
         LOG_INFO("render: format accepted by IsFormatSupported");
 
         REFERENCE_TIME hnsDefault = 0, hnsMin = 0;
         client->GetDevicePeriod(&hnsDefault, &hnsMin);
         REFERENCE_TIME period = hnsDefault ? hnsDefault : 100000;
+        REFERENCE_TIME acceptedPeriod = period;
 
         // In exclusive event-driven mode buffer duration and periodicity must
         // be identical, or Initialize returns BUFDURATION_PERIOD_NOT_EQUAL.
@@ -167,6 +184,7 @@ bool RenderStream::tryExclusive(IMMDevice* device) {
                 hr = client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
                                         AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
                                         alignedPeriod, alignedPeriod, wfx, nullptr);
+                acceptedPeriod = alignedPeriod;
                 LOG_INFO("render: buffer alignment retry at %u frames -> %s",
                          aligned, log::hrString(hr).c_str());
             }
@@ -200,6 +218,7 @@ bool RenderStream::tryExclusive(IMMDevice* device) {
         if (FAILED(client->GetService(__uuidof(IAudioRenderClient), render_.putVoid()))) continue;
 
         client_ = client;
+        devicePeriodHns_ = acceptedPeriod;
         exclusive_.store(true, std::memory_order_release);
         LOG_INFO("render: exclusive mode, %s, %u frame buffer",
                  format_.describe().c_str(), bufferFrames_);
@@ -221,6 +240,7 @@ bool RenderStream::trySharedFallback(IMMDevice* device) {
 
     REFERENCE_TIME hnsDefault = 0, hnsMin = 0;
     client->GetDevicePeriod(&hnsDefault, &hnsMin);
+    if (hnsDefault <= 0) hnsDefault = 100000;
 
     // Shared mode: periodicity must be 0, and the buffer may be longer than
     // one period.
@@ -241,6 +261,7 @@ bool RenderStream::trySharedFallback(IMMDevice* device) {
     if (FAILED(hr)) { setError("GetService(IAudioRenderClient)", hr); return false; }
 
     client_ = client;
+    devicePeriodHns_ = hnsDefault;
     exclusive_.store(false, std::memory_order_release);
     LOG_INFO("render: shared mode, %s, %u frame buffer", format_.describe().c_str(), bufferFrames_);
     return true;
@@ -296,6 +317,17 @@ void RenderStream::renderLoop() {
     const bool excl     = exclusive_.load(std::memory_order_relaxed);
     HANDLE     waits[2] = { stopEvent_, bufferEvent_ };
 
+    LARGE_INTEGER qpcFrequency{};
+    LARGE_INTEGER lastWake{};
+    QueryPerformanceFrequency(&qpcFrequency);
+    const uint64_t periodTicks =
+        qpcFrequency.QuadPart > 0 && devicePeriodHns_ > 0
+            ? (static_cast<uint64_t>(qpcFrequency.QuadPart) *
+                   static_cast<uint64_t>(devicePeriodHns_) +
+               5000000ULL) /
+                  10000000ULL
+            : 0;
+
     // A GetBuffer failure that is not DEVICE_INVALIDATED would otherwise spin
     // here forever, once per event, counting underruns and never recovering.
     // Give up after a run of them and let the supervisor rebuild the device.
@@ -314,6 +346,26 @@ void RenderStream::renderLoop() {
             wantsRetry_.store(true, std::memory_order_release);
             break;
         }
+        if (wr != WAIT_OBJECT_0 + 1) {
+            const DWORD error = (wr == WAIT_FAILED) ? GetLastError() : ERROR_GEN_FAILURE;
+            setError("render event wait failed", HRESULT_FROM_WIN32(error));
+            wantsRetry_.store(true, std::memory_order_release);
+            break;
+        }
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        if (periodTicks > 0 && lastWake.QuadPart > 0 && now.QuadPart > lastWake.QuadPart) {
+            const uint64_t elapsed = static_cast<uint64_t>(now.QuadPart - lastWake.QuadPart);
+            // Round to the nearest device period. Small scheduler jitter around
+            // one period is normal; intervals around two or more mean one or
+            // more render opportunities were missed.
+            const uint64_t elapsedPeriods = (elapsed + periodTicks / 2) / periodTicks;
+            if (elapsedPeriods > 1) {
+                underruns_.fetch_add(elapsedPeriods - 1, std::memory_order_relaxed);
+            }
+        }
+        lastWake = now;
 
         UINT32 toWrite = bufferFrames_;
         if (!excl) {
@@ -383,9 +435,13 @@ void RenderStream::threadMain(DeviceRef ref) {
     }
 
     if (!openDevice(ref)) {
-        LOG_ERR("render: open failed: %s", lastError().c_str());
+        logOpenFailureOnce();
         state_.store(StreamState::Failed, std::memory_order_release);
     } else {
+        {
+            std::lock_guard<std::mutex> lock(infoMutex_);
+            lastLoggedOpenError_.clear();
+        }
         LOG_INFO("render: configuring converter for %s, %u frames/block",
                  format_.describe().c_str(), bufferFrames_);
         converter_.configure(format_);
@@ -432,7 +488,9 @@ void RenderStream::threadMain(DeviceRef ref) {
 
     closeDevice();
     if (state_.load(std::memory_order_acquire) == StreamState::Running) {
-        state_.store(StreamState::Stopped, std::memory_order_release);
+        state_.store(wantsRetry_.load(std::memory_order_acquire)
+                         ? StreamState::Failed : StreamState::Stopped,
+                     std::memory_order_release);
     }
 
     if (needsUninit) CoUninitialize();

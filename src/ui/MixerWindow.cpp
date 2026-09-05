@@ -501,6 +501,16 @@ bool beginBoundedModal(const char *name, float width, float scale, ImGuiWindowFl
     constrainNextPopup(bounds, {width * scale, 0}, {width * scale, FLT_MAX});
     return ImGui::BeginPopupModal(name, nullptr, ImGuiWindowFlags_AlwaysAutoResize | flags);
 }
+bool sourceDialogOpen() {
+    const auto *context = ImGui::GetCurrentContext();
+    if (!context)
+        return false;
+    return std::any_of(context->OpenPopupStack.begin(), context->OpenPopupStack.end(),
+                       [](const ImGuiPopupData &popup) {
+                           return popup.Window &&
+                                  std::strcmp(popup.Window->Name, "Configure source") == 0;
+                       });
+}
 } // namespace
 void MixerWindow::init(AudioEngine *engine, Config *config, void *window) {
     engine_ = engine;
@@ -514,7 +524,14 @@ void MixerWindow::refreshDevices() {
         playback_ = devices.list(eRender);
         microphones_ = devices.list(eCapture);
     }
-    apps_ = listAudioApps();
+    const bool hasApplicationSource =
+        std::any_of(config_->sources.begin(), config_->sources.end(), [](const ChannelConfig &source) {
+            return source.kind == SourceKind::Application;
+        });
+    if (hasApplicationSource || openSource_ || sourceDialogOpen())
+        apps_ = listAudioApps();
+    else
+        apps_.clear();
     refreshTimer_ = 0;
 }
 void MixerWindow::restart() {
@@ -528,10 +545,27 @@ void MixerWindow::restart() {
     lastUnderruns_ = lastDropped_ = 0;
     refreshTimer_ = 2;
 }
+void MixerWindow::addStatusWarning(const std::string &label, const std::string &detail,
+                                   int severity) {
+    if (severity > severity_) {
+        severity_ = severity;
+        status_ = label;
+    }
+    if (!statusDetail_.empty())
+        statusDetail_ += "\n\n";
+    statusDetail_ += detail;
+}
 void MixerWindow::refreshStatus(float dt) {
     refreshTimer_ += dt;
     if (refreshTimer_ >= 2) {
-        apps_ = listAudioApps();
+        const bool hasApplicationSource =
+            std::any_of(config_->sources.begin(), config_->sources.end(), [](const ChannelConfig &source) {
+                return source.kind == SourceKind::Application;
+            });
+        if (hasApplicationSource || openSource_ || sourceDialogOpen())
+            apps_ = listAudioApps();
+        else
+            apps_.clear();
         refreshTimer_ = 0;
     }
     severity_ = 0;
@@ -545,13 +579,7 @@ void MixerWindow::refreshStatus(float dt) {
     uint64_t dropped = 0;
     std::vector<SourceRoute> routes;
     auto warn = [&](const std::string &label, const std::string &detail, int severity = 1) {
-        if (severity > severity_) {
-            severity_ = severity;
-            status_ = label;
-        }
-        if (!statusDetail_.empty())
-            statusDetail_ += "\n\n";
-        statusDetail_ += detail;
+        addStatusWarning(label, detail, severity);
     };
     status_ = "Optimal";
     if (out.state != StreamState::Running)
@@ -603,17 +631,27 @@ void MixerWindow::refreshStatus(float dt) {
             if (confirmed && severity_ == 1)
                 status_ = "Duplicate audio";
         }
-    if (out.underruns > lastUnderruns_ || dropped > lastDropped_)
-        dropoutTimer_ = 4;
-    lastUnderruns_ = out.underruns;
-    lastDropped_ = dropped;
-    dropoutTimer_ = std::max(0.f, dropoutTimer_ - dt);
-    if (dropoutTimer_ > 0)
-        warn("Audio dropouts", "Audio buffers were missed recently. Try increasing Buffer in Settings.");
+    refreshDropoutStatus(out.state, out.underruns, dropped, dt);
     if (clippingTimer_ > 0)
         warn("Clipping", "The mix reached 0 dBFS. Lower a source or master volume to prevent distortion.", 2);
     if (!severity_)
         statusDetail_ = "Audio devices are running. No source overlap or recent dropouts detected.";
+}
+bool MixerWindow::updateDropoutTimer(StreamState outputState, uint64_t underruns,
+                                     uint64_t dropped, float dt) {
+    if (outputState == StreamState::Running &&
+        (underruns > lastUnderruns_ || dropped > lastDropped_))
+        dropoutTimer_ = 4;
+    lastUnderruns_ = underruns;
+    lastDropped_ = dropped;
+    dropoutTimer_ = std::max(0.f, dropoutTimer_ - dt);
+    return dropoutTimer_ > 0;
+}
+void MixerWindow::refreshDropoutStatus(StreamState outputState, uint64_t underruns,
+                                       uint64_t dropped, float dt) {
+    if (updateDropoutTimer(outputState, underruns, dropped, dt))
+        addStatusWarning("Audio dropouts",
+                         "Audio dropouts were detected recently. Try increasing Buffer in Settings.");
 }
 bool MixerWindow::drawSource(size_t index, float width, float dt) {
     auto &source = config_->sources[index];
@@ -683,6 +721,8 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
 }
 
 bool MixerWindow::draw(float dt, int width, int height) {
+    if (width <= 0 || height <= 0)
+        return false;
     dt = std::clamp(dt, .001f, .1f);
     scale_ = std::min(float(width) / 1600.f, float(height) / 986.f);
     const float w = width / scale_, h = height / scale_, rightX = 516, rightW = w - 542, footerY = h - 120,
@@ -696,6 +736,7 @@ bool MixerWindow::draw(float dt, int width, int height) {
     ImGui::Begin("Audio Monitor dashboard", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImGui::PopStyleVar(2);
     Canvas c{ImGui::GetWindowDrawList(), {0, 0}, scale_};
     c.rect(1, 1, w - 2, h - 2, background, 22);
     c.icon(Wave, 65, 54, purple, 40);
@@ -906,7 +947,6 @@ bool MixerWindow::draw(float dt, int width, int height) {
     changed |= drawDialogs();
     ImGui::End();
     ImGui::PopFont();
-    ImGui::PopStyleVar(2);
     return changed;
 }
 
@@ -1183,10 +1223,12 @@ bool MixerWindow::drawDialogs() {
         }
         if (drawButton("Refresh source choices", 574, 337, 130, 47, "Refresh", Refresh, card))
             refreshDevices();
-        c.text(18, 399,
-               isApp ? "Select the application audio session you want to monitor."
-                     : "Select the audio device you want to monitor.",
-               16, gray, false, dialogW - 36);
+        const bool applicationCaptureAvailable = processCaptureSupported();
+        if (!isApp || applicationCaptureAvailable)
+            c.text(18, 399,
+                   isApp ? "Select the application audio session you want to monitor."
+                         : "Select the audio device you want to monitor.",
+                   16, gray, false, dialogW - 36);
 
         c.rect(0, 448, dialogW, 339, panel, 14);
         c.alignedIconLabel(Sliders, 28, 58, 482, "3.  Customize Source", 20, 27, purple);
@@ -1217,7 +1259,7 @@ bool MixerWindow::drawDialogs() {
         checkboxWithDescription(c, "Include in mix", 372, 590, 168, draft_.enabled,
                                 "Include in mix", "This source will be mixed into the output.");
         checkboxWithDescription(c, "Source muted", 552, 590, 152, draft_.muted,
-                                "Muted", "Start this source muted");
+                                "Muted", "Mute this source when monitoring starts.");
 
         c.text(18, 671, "Mix Gain", 17, white);
         c.infoMark(107, 680, gray, 19);
@@ -1232,9 +1274,9 @@ bool MixerWindow::drawDialogs() {
         c.text(18, 780, "Adjust how much of this source is mixed into the output. 100% is normal volume.",
                15, gray, false, dialogW - 36);
 
-        const bool valid = isApp ? processCaptureSupported() && !draft_.processPath.empty()
+        const bool valid = isApp ? applicationCaptureAvailable && !draft_.processPath.empty()
                                  : !draft_.deviceId.empty() || !draft_.deviceNameMatch.empty();
-        if (isApp && !processCaptureSupported())
+        if (isApp && !applicationCaptureAvailable)
             c.text(18, 399, "Application capture requires Windows build 20348 or later.", 16, amber,
                    false, dialogW - 36);
 
@@ -1363,7 +1405,7 @@ bool MixerWindow::drawDialogs() {
         }
 
         checkboxWithDescription(c, "Output muted", 286, 379, 350, outputDraft_.muted,
-                                "Muted", "Start the combined output muted");
+                                "Muted", "Mute the combined output when monitoring starts.");
 
         c.text(18, 455, "Mix Gain", 17, white);
         c.infoMark(107, 464, gray, 19);

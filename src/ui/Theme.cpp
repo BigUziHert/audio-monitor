@@ -35,6 +35,7 @@ void applyTheme() {
     c[ImGuiCol_CheckMark] = ImVec4(.6f, .43f, 1, 1);
     c[ImGuiCol_Text] = ImVec4(.94f, .95f, .97f, 1);
     c[ImGuiCol_TextDisabled] = ImVec4(.63f, .67f, .71f, 1);
+    c[ImGuiCol_NavCursor] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_Separator] = c[ImGuiCol_Border];
     c[ImGuiCol_TitleBgActive] = c[ImGuiCol_PopupBg];
 }

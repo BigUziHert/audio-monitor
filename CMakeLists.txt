@@ -27,6 +27,17 @@ if(BUILD_TESTING)
   target_link_libraries(app-capture-test PRIVATE audiomon_core)
   add_test(NAME app-capture COMMAND app-capture-test)
   set_tests_properties(app-capture PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 35)
+  add_executable(device-match-test tests/device_match_test.cpp)
+  target_link_libraries(device-match-test PRIVATE audiomon_core)
+  add_test(NAME device-match COMMAND device-match-test)
+  add_executable(loopback-render-test tests/loopback_render_test.cpp)
+  target_link_libraries(loopback-render-test PRIVATE audiomon_core)
+  add_test(NAME loopback-render COMMAND loopback-render-test)
+  set_tests_properties(loopback-render PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45)
+  add_executable(lifecycle-test tests/lifecycle_test.cpp)
+  target_link_libraries(lifecycle-test PRIVATE audiomon_core)
+  add_test(NAME lifecycle COMMAND lifecycle-test)
+  set_tests_properties(lifecycle PROPERTIES TIMEOUT 60)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -70,6 +81,7 @@ add_library(audiomon_core STATIC
   src/audio/CaptureStream.cpp
   src/audio/RenderStream.cpp
   src/audio/AudioEngine.cpp
+  src/audio/SampleFormat.cpp
   src/audio/WaveFormat.cpp
   src/audio/Guids.cpp
   src/config/Config.cpp

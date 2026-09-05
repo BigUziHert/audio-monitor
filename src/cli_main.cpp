@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     bool usedDefaults = false;
     Config cfg = Config::load(&usedDefaults);
     std::printf("config: %s%s\n", u8(Config::configPath()).c_str(),
-                usedDefaults ? "  (not found -- using autodetected defaults)" : "");
+                usedDefaults ? "  (missing or unreadable -- using autodetected defaults)" : "");
     // Raw, unbuffered breadcrumbs. Deliberately not going through the logging
     // subsystem: we already learned the hard way that a crash here leaves no
     // trace, and this narrows it to a single statement.

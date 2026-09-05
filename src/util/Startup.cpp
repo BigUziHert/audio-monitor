@@ -40,9 +40,11 @@ bool isEnabled() {
 
 bool setEnabled(bool enable) {
     HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
-                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
-        LOG_WARN("startup: cannot open Run key (%lu)", GetLastError());
+    const LSTATUS createStatus =
+        RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (createStatus != ERROR_SUCCESS) {
+        LOG_WARN("startup: cannot open Run key (%ld)", createStatus);
         return false;
     }
 

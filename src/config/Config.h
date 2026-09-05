@@ -58,10 +58,12 @@ struct Config {
 
     // Missing or corrupt file -> defaults, reported via `usedDefaults`.
     static Config load(bool* usedDefaults = nullptr);
+    static Config load(const std::wstring& path, bool* usedDefaults = nullptr);
 
-    // Written via a temp file and ReplaceFile so a crash mid-write cannot
-    // leave a truncated config behind.
+    // Written via a sibling temp file and an atomic replacement so a crash
+    // mid-write cannot leave a truncated config behind.
     bool save() const;
+    bool save(const std::wstring& path) const;
 };
 
 } // namespace audiomon

@@ -5,9 +5,38 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 using namespace audiomon;
+
+namespace audiomon::ui {
+struct MixerWindowTestAccess {
+    static void resetDropoutState(MixerWindow &mixer) {
+        mixer.status_.clear();
+        mixer.statusDetail_.clear();
+        mixer.severity_ = 0;
+        mixer.dropoutTimer_ = 0;
+        mixer.lastUnderruns_ = 0;
+        mixer.lastDropped_ = 0;
+    }
+    static void refreshDropoutStatus(MixerWindow &mixer, StreamState outputState,
+                                     uint64_t underruns, uint64_t dropped) {
+        mixer.statusDetail_.clear();
+        mixer.severity_ = 0;
+        mixer.refreshDropoutStatus(outputState, underruns, dropped, 1.f / 60.f);
+    }
+    static const std::string &statusDetail(const MixerWindow &mixer) {
+        return mixer.statusDetail_;
+    }
+    static void makeSourceDraftValid(MixerWindow &mixer) {
+        mixer.draft_.kind = SourceKind::Playback;
+        mixer.draft_.deviceId = L"test-device-id";
+        mixer.draft_.deviceNameMatch = L"Test Device";
+    }
+};
+} // namespace audiomon::ui
+
 int main() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     int failed = 0;
@@ -52,6 +81,31 @@ int main() {
                 std::printf("No draw data at %dx%d frame %d\n",w,h,ImGui::GetFrameCount()); ++failed;
             }
         };
+
+        ui::MixerWindowTestAccess::resetDropoutState(mixer);
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Stopped, 0, 1);
+        expect(ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") ==
+                   std::string::npos,
+               "Stopped output attributed a dropped capture frame to an audio dropout");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 0, 2);
+        expect(ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") !=
+                   std::string::npos,
+               "Running output did not report a newly dropped capture frame");
+        ui::MixerWindowTestAccess::resetDropoutState(mixer);
+
+        io.DisplaySize = {1600, 986};
+        io.DeltaTime = 1.f / 60;
+        ImGui::NewFrame();
+        expect(!mixer.draw(io.DeltaTime, 0, 0), "Zero-size dashboard reported a change");
+        ImGui::Render();
+        for (auto *window : ImGui::GetCurrentContext()->Windows)
+            expect(std::isfinite(window->Size.x) && std::isfinite(window->Size.y),
+                   "Zero-size dashboard produced a non-finite window size");
+        expect(ImGui::GetStyle().Colors[ImGuiCol_NavCursor].w == 0.f,
+               "Native navigation cursor is still visible under the custom focus ring");
+
         for (auto size : {ImVec2(1600, 986), ImVec2(1440, 890), ImVec2(960, 600), ImVec2(2200, 1200)}) {
             frame(int(size.x), int(size.y));
             frame(int(size.x), int(size.y));
@@ -85,6 +139,18 @@ int main() {
             frame(1600, 986);
         };
         frame(1600, 986);
+
+        io.AddMousePosEvent(452, 153);
+        frame(1600, 986);
+        bool foundPaddedTooltip = false;
+        for (auto *window : ImGui::GetCurrentContext()->Windows)
+            if (window->Active && (window->Flags & ImGuiWindowFlags_Tooltip)) {
+                foundPaddedTooltip = true;
+                expect(window->WindowPadding.x > 0 && window->WindowPadding.y > 0,
+                       "Dashboard tooltip inherited zero root-window padding");
+            }
+        expect(foundPaddedTooltip, "Refresh tooltip did not appear");
+
         auto holdGainSlider = [&](float x, float y, float &gain, float expectedGain) {
             io.AddMousePosEvent(x, y);
             frame(1600, 986);
@@ -293,6 +359,142 @@ int main() {
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
         dragAndResizePopup(false);
+
+        const size_t sourceCountBeforeDialogTests = config.sources.size();
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 520,
+                  dialog->DC.CursorStartPos.y + 200); // Application Audio card
+            dialog = popup();
+            const float helperTop = dialog->DC.CursorStartPos.y + 395;
+            const float helperBottom = dialog->DC.CursorStartPos.y + 425;
+            const float helperLeft = dialog->DC.CursorStartPos.x + 15;
+            const float helperRight = dialog->DC.CursorStartPos.x + 707;
+            bool grayHelperText = false, amberHelperText = false;
+            for (const ImDrawVert &vertex : dialog->DrawList->VtxBuffer) {
+                if (vertex.pos.x < helperLeft || vertex.pos.x > helperRight ||
+                    vertex.pos.y < helperTop || vertex.pos.y > helperBottom)
+                    continue;
+                grayHelperText |= vertex.col == IM_COL32(173, 181, 190, 255);
+                amberHelperText |= vertex.col == IM_COL32(255, 174, 51, 255);
+            }
+            expect(grayHelperText != amberHelperText,
+                   "Source dialog drew two helper sentences at the same origin");
+            click(dialog->DC.CursorStartPos.x + 458,
+                  dialog->DC.CursorStartPos.y + 830); // Cancel edit
+        }
+        expect(!popup() && config.sources.size() == sourceCountBeforeDialogTests,
+               "Cancel source edit changed the source list");
+
+        click(260, 909); // Add Device.
+        expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0,
+               "Add Device did not open the source dialog");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 604,
+                  dialog->DC.CursorStartPos.y + 830); // Disabled Add Source
+        expect(popup() && config.sources.size() == sourceCountBeforeDialogTests,
+               "Invalid Add Source committed an empty source");
+        ui::MixerWindowTestAccess::makeSourceDraftValid(mixer);
+        frame(1600, 986);
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 604,
+                  dialog->DC.CursorStartPos.y + 830); // Valid Add Source
+        expect(!popup() && config.sources.size() == sourceCountBeforeDialogTests + 1,
+               "Valid Add Source did not commit the source");
+
+        click(260, 909); // Add Device, then cancel a valid draft.
+        ui::MixerWindowTestAccess::makeSourceDraftValid(mixer);
+        frame(1600, 986);
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 396,
+                  dialog->DC.CursorStartPos.y + 830); // Cancel add
+        expect(!popup() && config.sources.size() == sourceCountBeforeDialogTests + 1,
+               "Cancel Add Source changed the source list");
+
+        click(440, 239); // Remove the first source.
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 82,
+                  dialog->DC.CursorStartPos.y + 830); // Remove
+        expect(!popup() && config.sources.size() == sourceCountBeforeDialogTests,
+               "Remove source did not remove exactly one source");
+
+        auto pressKey = [&](ImGuiKey key) {
+            io.AddKeyEvent(key, true);
+            frame(1600, 986);
+            io.AddKeyEvent(key, false);
+            frame(1600, 986);
+        };
+        auto focusDashboardItem = [&](const char *label) {
+            frame(1600, 986);
+            auto *dashboard = ImGui::FindWindowByName("Audio Monitor dashboard");
+            expect(dashboard != nullptr, "Dashboard missing for keyboard test");
+            if (!dashboard)
+                return;
+            ImGui::SetNavWindow(dashboard);
+            ImGui::SetNavID(dashboard->GetID(label), ImGuiNavLayer_Main,
+                            dashboard->NavRootFocusScopeId, ImRect());
+            ImGui::GetCurrentContext()->NavCursorVisible = true;
+            frame(1600, 986);
+        };
+
+        focusDashboardItem("Refresh devices");
+        const ImGuiID firstTabId = ImGui::GetCurrentContext()->NavId;
+        pressKey(ImGuiKey_Tab);
+        const ImGuiID secondTabId = ImGui::GetCurrentContext()->NavId;
+        pressKey(ImGuiKey_Tab);
+        expect(firstTabId != 0 && secondTabId != 0 && firstTabId != secondTabId &&
+                   ImGui::GetCurrentContext()->NavId != secondTabId,
+               "Tab did not advance through dashboard controls in order");
+
+        focusDashboardItem("Add Device");
+        pressKey(ImGuiKey_Space);
+        expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0,
+               "Space did not activate a custom hit target");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 700,
+                  dialog->DC.CursorStartPos.y + 21); // Close source dialog
+        expect(!popup(), "Keyboard-opened source dialog did not close");
+
+        focusDashboardItem("Settings");
+        pressKey(ImGuiKey_Enter);
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
+               "Enter did not open Settings");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 700,
+                  dialog->DC.CursorStartPos.y + 21); // Close Settings
+        expect(!popup(), "Keyboard-opened Settings did not close");
+
+        config.output.gain = .5f;
+        frame(1600, 986);
+        focusDashboardItem("##master-volume");
+        pressKey(ImGuiKey_Space);
+        const float normalGainBefore = config.output.gain;
+        pressKey(ImGuiKey_RightArrow);
+        const float normalGainStep = config.output.gain - normalGainBefore;
+        expect(normalGainStep > 0.f && normalGainStep < .02f,
+               "Keyboard slider did not use its latched 0-100% range");
+        ImGui::ClearActiveID();
+
+        config.output.gain = 2.f;
+        frame(1600, 986);
+        focusDashboardItem("##master-volume");
+        pressKey(ImGuiKey_Space);
+        const float boostedGainBefore = config.output.gain;
+        pressKey(ImGuiKey_RightArrow);
+        const float boostedGainStep = config.output.gain - boostedGainBefore;
+        expect(boostedGainStep > normalGainStep * 3.f && boostedGainStep < .06f,
+               "Keyboard slider did not use its latched 0-400% range");
+        ImGui::ClearActiveID();
+
+        const auto savedSources = config.sources;
+        while (config.sources.size() < kMaxSources)
+            config.sources.push_back(config.sources.front());
+        frame(1600, 986);
+        click(260, 909);
+        expect(popup() != nullptr, "Source limit popup did not open at the source cap");
+        pressKey(ImGuiKey_Escape);
+        expect(!popup(), "Escape did not close the Source limit popup");
+        config.sources = savedSources;
+
         ImGui::DestroyContext();
     }
     CoUninitialize();

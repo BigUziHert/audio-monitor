@@ -28,8 +28,7 @@ void CaptureStream::configure(const char* label, CaptureMode mode, uint32_t ring
     label_      = label;
     mode_       = mode;
     ringMillis_ = ringMillis;
-    // Sized at the internal rate; the ring holds post-conversion stereo frames.
-    // Sized for the highest rate any endpoint might report, not for 48 kHz:
+    // Sized for the highest native rate any endpoint might report, not for 48 kHz:
     // the ring stores frames at the source's NATIVE rate (resampling happens
     // downstream), so a headset switched to 96 or 192 kHz in the Sound control
     // panel would otherwise overflow a ring built for 48. At 250 ms this is
@@ -81,6 +80,7 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
     // the epoch makes the mixer drop it and re-prime.
     epoch_.fetch_add(1, std::memory_order_release);
     dropped_.store(0, std::memory_order_relaxed);
+    retryable_.store(true, std::memory_order_release);
     quit_.store(false, std::memory_order_relaxed);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // manual reset: a stop stays stopped
     state_.store(StreamState::Opening, std::memory_order_release);
@@ -93,12 +93,24 @@ void CaptureStream::stop() {
 }
 
 void CaptureStream::stopLocked() {
+    {
+        std::lock_guard<std::mutex> info(infoMutex_);
+        resolvedId_.clear();
+        resolvedName_.clear();
+        lastError_.clear();
+    }
     quit_.store(true, std::memory_order_relaxed);
     if (stopEvent_) SetEvent(stopEvent_);
     if (thread_.joinable()) thread_.join();
     if (stopEvent_) { CloseHandle(stopEvent_); stopEvent_ = nullptr; }
     state_.store(StreamState::Stopped, std::memory_order_release);
     flowing_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> info(infoMutex_);
+        resolvedId_.clear();
+        resolvedName_.clear();
+        lastError_.clear();
+    }
 }
 
 bool CaptureStream::openDevice(const DeviceRef& ref) {
@@ -109,9 +121,11 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
     std::wstring      gotId, gotName;
     const ResolveResult rr = devices_->resolve(ref, flow, device, &gotId, &gotName);
     if (rr == ResolveResult::Ambiguous) {
+        retryable_.store(false, std::memory_order_release);
         setError("device name matches more than one endpoint -- pick one in Settings", E_FAIL);
         return false;
     }
+    retryable_.store(true, std::memory_order_release);
     if (rr == ResolveResult::NotFound || !device) {
         setError("device not found", E_FAIL);
         return false;
@@ -304,6 +318,10 @@ void CaptureStream::drainPackets() {
         for (uint32_t i = 0; i < w; ++i) {
             ring_.writeFrame(i, scratch_[i * 2], scratch_[i * 2 + 1]);
         }
+        // Publish liveness before publishing the frames. The render thread can
+        // then distinguish a newly resumed producer from a stable idle tail.
+        QueryPerformanceCounter(&lastPacketQpc_);
+        flowing_.store(true, std::memory_order_release);
         ring_.endWrite(w);
 
         if (w < n) {
@@ -322,8 +340,6 @@ void CaptureStream::drainPackets() {
             state_.store(StreamState::Failed, std::memory_order_release);
             return;
         }
-
-        QueryPerformanceCounter(&lastPacketQpc_);
 
         hr = capture_->GetNextPacketSize(&packetFrames);
         if (FAILED(hr)) {
@@ -354,9 +370,20 @@ void CaptureStream::threadMain(DeviceRef ref) {
     }
 
     if (!openDevice(ref)) {
-        LOG_ERR("%s: open failed: %s", label_.c_str(), lastError().c_str());
+        const std::string error = lastError();
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(infoMutex_);
+            changed = error != lastLoggedOpenError_;
+            if (changed) lastLoggedOpenError_ = error;
+        }
+        if (changed) LOG_ERR("%s: open failed: %s", label_.c_str(), error.c_str());
         state_.store(StreamState::Failed, std::memory_order_release);
     } else {
+        {
+            std::lock_guard<std::mutex> lock(infoMutex_);
+            lastLoggedOpenError_.clear();
+        }
         state_.store(StreamState::Running, std::memory_order_release);
         QueryPerformanceCounter(&lastPacketQpc_);
 

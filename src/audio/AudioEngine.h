@@ -20,6 +20,7 @@
 #include "audio/Meter.h"
 #include "audio/FadeEnvelope.h"
 #include "audio/MixMode.h"
+#include "audio/RetryPolicy.h"
 #include "config/Config.h"
 
 #include <array>
@@ -66,7 +67,7 @@ public:
     void stop();
 
     // Applied live from the UI thread; picked up by the audio thread on its
-    // next block. Gain is linear, 0..1 mapping is the caller's business.
+    // next block. Gain is linear, 0..4 mapping is the caller's business.
     void setGain(int channel, float linearGain) noexcept;
     void setMuted(int channel, bool muted) noexcept;
     void setOutputGain(float linearGain) noexcept;
@@ -98,7 +99,7 @@ public:
 
     // Writes back any device IDs that were re-resolved by name, so a driver
     // reinstall is persisted rather than re-matched every launch.
-    void updateConfigFromRuntime(Config& config) const;
+    bool updateConfigFromRuntime(Config& config) const;
 
     // For the settings UI.
     std::vector<DeviceInfo> listDevices(EDataFlow flow) const { return devices_.list(flow); }
@@ -138,6 +139,8 @@ private:
         double   targetDepth  = 0.0;
         uint32_t lastSrcRate  = 0;
         uint32_t lastBufferMs = 0;   // so a slider move retargets live
+        uint32_t lastObservedDepth = 0; // distinguishes a stable idle tail from a resume
+        bool     timelineBreakPending = false;
     };
 
     void supervisorMain();
