@@ -44,6 +44,8 @@ constexpr ThemePalette kDarkPalette{
     IM_COL32(255, 76, 27, 255),     // meterRed
     IM_COL32(0, 217, 57, 255),      // graphBarBottom
     IM_COL32(255, 255, 255, 255),   // onAccent
+    IM_COL32(255, 255, 255, 255),   // sliderThumb
+    IM_COL32(173, 181, 190, 255),   // sliderThumbBorder
 };
 
 constexpr ThemePalette kLightPalette{
@@ -85,6 +87,8 @@ constexpr ThemePalette kLightPalette{
     IM_COL32(220, 61, 25, 255),     // meterRed
     IM_COL32(0, 159, 49, 255),      // graphBarBottom
     IM_COL32(255, 255, 255, 255),   // onAccent
+    IM_COL32(103, 67, 220, 255),    // sliderThumb: visible on light cards and tracks
+    IM_COL32(66, 37, 151, 255),     // sliderThumbBorder
 };
 
 ColorTheme requestedTheme = ColorTheme::Dark;

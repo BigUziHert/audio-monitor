@@ -393,6 +393,31 @@ the bounded cadence using 16 synthetic sources and four outputs. This does
 not measure GPU cost or game FPS; real performance also depends on the driver,
 selected devices, display refresh rate and game workload.
 
+### Audio debugging reports
+
+Open **Settings > About > Export Debug Log** to save a timestamped UTF-8 report
+under `%APPDATA%\audio-monitor\reports`. **Open Log** opens the latest successful
+export. Report generation and writing run in a background task; audio keeps
+running. Reports stay local and can contain device identifiers, application
+paths and configuration, so review them before sharing.
+
+While the engine runs, the supervisor records bounded timing history every
+five seconds, including while monitoring from the tray. Reports include queue
+delay, target depth, sample rates, clock-correction ratios, starvation, dropped
+frames, latency corrections and missed mix-pump deadlines. Session boundaries
+separate restarts so counters from different audio sessions are not confused.
+Export after a long session or as soon as growing delay becomes noticeable.
+Recent queue-growth summaries use the latest five minutes of uninterrupted
+audio and require persistent increases across minute medians. A flagged trend
+is a possible buffer-delay issue, not proof of desynchronization; the full
+retained history is included for inspection. Last-sampled device details and
+timing remain available after stopping monitoring.
+
+Queue growth and clock corrections help diagnose accumulating buffer delay;
+they do **not** directly measure audio/video sync or the delay inside a driver,
+wireless link or physical device. Normal clock correction is expected when
+devices run from independent clocks and is not by itself a synchronization bug.
+
 ### Device resilience
 
 An `IMMNotificationClient` watches for endpoint changes. Its callbacks fire on

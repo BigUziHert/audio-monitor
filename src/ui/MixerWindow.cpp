@@ -1,6 +1,7 @@
 #include "ui/MixerWindow.h"
 #include "ui/Theme.h"
 #include "audio/DeviceMatch.h"
+#include "config/Json.h"
 #include "util/Log.h"
 #include "util/Startup.h"
 #include <windows.h>
@@ -50,6 +51,9 @@ const ImU32 &sliderTrack = themePalette().sliderTrack,
             &graphBarBottom = themePalette().graphBarBottom,
             &onAccent = themePalette().onAccent;
 constexpr float kStartupSettleSeconds = 1.5f;
+// Informational copy uses the same readable baseline as native controls.
+// Apply this to measurement as well as drawing so alignment stays correct.
+float readableTextSize(float size) { return std::max(20.f, size); }
 
 // Ordinary settings edits never own routing or faders. Copying the entire draft on Save
 // would overwrite device IDs re-resolved while the modal was open, and made
@@ -120,11 +124,13 @@ struct Canvas {
         return bold && fonts.Size > 1 ? fonts[1] : ImGui::GetFont();
     }
     ImVec2 textSize(const std::string &label, float size, bool bold) const {
+        size = readableTextSize(size);
         const auto measured = fontFor(bold)->CalcTextSizeA(size * s, FLT_MAX, 0, label.c_str());
         return {measured.x / s, measured.y / s};
     }
     void text(float x, float y, const std::string &label, float size = 21, ImU32 color = white,
               bool bold = false, float maxWidth = 0) const {
+        size = readableTextSize(size);
         ImVec4 clip(origin.x + x * s, origin.y + y * s, origin.x + (x + maxWidth) * s,
                     origin.y + (y + size + 8) * s);
         dl->AddText(fontFor(bold), size * s, p(x, y), color, label.c_str(), nullptr, 0,
@@ -132,6 +138,7 @@ struct Canvas {
     }
     void scrollingText(float x, float y, const std::string &label, float size, ImU32 color,
                        bool bold, float maxWidth) const {
+        size = readableTextSize(size);
         const auto measured = textSize(label, size, bold);
         if (measured.x <= maxWidth) {
             text(x, y, label, size, color, bold, maxWidth);
@@ -158,6 +165,7 @@ struct Canvas {
     }
     void wrappedText(float x, float y, const std::string &label, float size, ImU32 color,
                      float maxWidth, float maxHeight) const {
+        size = readableTextSize(size);
         const ImVec4 clip(origin.x + x * s, origin.y + y * s,
                           origin.x + (x + maxWidth) * s, origin.y + (y + maxHeight) * s);
         dl->AddText(fontFor(false), size * s, p(x, y), color, label.c_str(), nullptr,
@@ -372,8 +380,19 @@ struct Canvas {
         const float radius = size / 2;
         dl->AddCircle(p(x, y), radius * s, color, 28, 1.7f * s);
         const float fontSize = size * .72f;
-        const auto measured = textSize("i", fontSize, true);
-        text(x - measured.x / 2, y - measured.y / 2 - .5f, "i", fontSize, color, true);
+        const auto measured = fontFor(true)->CalcTextSizeA(fontSize * s, FLT_MAX, 0, "i");
+        dl->AddText(fontFor(true), fontSize * s,
+                    p(x - measured.x / s / 2, y - measured.y / s / 2 - .5f), color, "i");
+    }
+    void sliderThumb(float x, float y, float radius) const {
+        dl->AddCircleFilled(p(x, y + 2), (radius + 1) * s, shadow, 28);
+        dl->AddCircleFilled(p(x, y), radius * s, themePalette().sliderThumb, 28);
+        dl->AddCircle(p(x, y), radius * s, themePalette().sliderThumbBorder, 28,
+                      std::max(1.f, 1.5f * s));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+            dl->AddCircle(p(x, y), (radius + 3) * s, purple, 28, 2 * s);
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        }
     }
     bool volume(const char *id, float x, float y, float width, float &volume,
                 bool editablePercent = false) const {
@@ -389,8 +408,7 @@ struct Canvas {
         float center = y + 18, end = x + 8 + (width - 16) * std::clamp(volume, 0.0f, 1.0f);
         line(x + 8, center, x + width - 8, center, sliderTrack, 9);
         line(x + 8, center, end, center, purple, 9);
-        dl->AddCircleFilled(p(end, center + 2), 14 * s, shadow, 28);
-        dl->AddCircleFilled(p(end, center), 13 * s, onAccent, 28);
+        sliderThumb(end, center, 13);
         if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
             dl->AddCircle(p(end, center), 17 * s, purple, 28, 2 * s);
         const bool sliderHovered = ImGui::IsItemHovered();
@@ -578,8 +596,7 @@ bool gainSlider(const Canvas &c, const char *id, float x, float y, float width, 
         const float tx = x + 8 + (width - 16) * float(i) / 16.f;
         c.line(tx, center + 15, tx, center + (i % 4 == 0 ? 23 : 19), sliderTicks, 1);
     }
-    c.dl->AddCircleFilled(c.p(end, center + 2), 13 * c.s, shadow, 28);
-    c.dl->AddCircleFilled(c.p(end, center), 12 * c.s, onAccent, 28);
+    c.sliderThumb(end, center, 12);
     if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
         c.dl->AddCircle(c.p(end, center), 16 * c.s, purple, 28, 2 * c.s);
     return changed;
@@ -711,9 +728,50 @@ void MixerWindow::setVisible(bool visible) {
         engine_->stop();
 }
 void MixerWindow::shutdown() {
+    // Export owns an engine pointer, never ImGui or a window handle. Finish it
+    // before application teardown destroys the engine or logging service.
+    if (diagnosticExport_.valid()) diagnosticExport_.wait();
     // wWinMain shuts down the engine before releasing the COM apartment.
     if (engine_)
         engine_->stop();
+}
+void MixerWindow::startDiagnosticExport(const std::wstring &directory) {
+    if (!engine_ || !config_ || diagnosticExport_.valid()) return;
+    diagnosticExportFailed_ = false;
+    diagnosticMessage_ = "Collecting diagnostics...";
+    try {
+        // Copy mutable UI preferences now. All report formatting and disk I/O
+        // run off the UI/audio threads; subsequent edits cannot race the copy.
+        diagnosticExport_ = std::async(std::launch::async,
+            [engine = engine_, config = *config_, directory] {
+                auto report = engine->diagnosticReport();
+                report += "\n=== Saved/live UI configuration (not pending settings) ===\n";
+                report += config.toJson().dump(2);
+                report += '\n';
+                return writeDiagnosticReport(directory, report);
+            });
+    } catch (...) {
+        diagnosticExportFailed_ = true;
+        diagnosticMessage_ = "Could not start log export. Please try again.";
+    }
+}
+void MixerWindow::pollDiagnosticExport() {
+    if (!diagnosticExport_.valid() ||
+        diagnosticExport_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+    try {
+        const auto result = diagnosticExport_.get();
+        diagnosticExportFailed_ = result.path.empty();
+        if (!diagnosticExportFailed_) {
+            diagnosticPath_ = result.path;
+            diagnosticMessage_ = "Debug log saved locally. Use Open Log to view it.";
+        } else {
+            diagnosticMessage_ = "Log export failed: " + result.error;
+        }
+    } catch (...) {
+        diagnosticExportFailed_ = true;
+        diagnosticMessage_ = "Could not export the debug log. Please try again.";
+    }
 }
 void MixerWindow::syncMeteringVisibility() {
     // A null HWND is used by the headless UI harness; it injects meter samples
@@ -1191,8 +1249,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
         float x = rightX + 22 + i * (tileW + 15);
         c.rect(x, tileY, tileW, 111, card, 15);
         c.badge(tileIcons[i], x + 48, tileY + 56, tileColors[i]);
-        c.text(x + 95, tileY + 26, titles[i], 20, gray);
-        c.text(x + 95, tileY + 59, values[i], i == 3 && status_.size() > 14 ? 16.f : 22.f,
+        c.text(x + 95, tileY + 26, titles[i], 23, white, true);
+        c.scrollingText(x + 95, tileY + 59, values[i], 22,
                i == 3 ? statusColor : white, false, tileW - 106);
         ImGui::PushID(i + 600);
         if (c.hit("Audio information", x, tileY, tileW, 111,
@@ -1284,18 +1342,18 @@ bool MixerWindow::draw(float dt, int width, int height) {
         auto outputDeviceName = !engine_->monitoring() || out.deviceName.empty()
                                     ? toUtf8(selectedOutput.deviceNameMatch)
                                     : toUtf8(out.deviceName);
+        if (!engine_->monitoring() && !selectedOutput.deviceId.empty()) {
+            const auto device = std::find_if(playback_.begin(), playback_.end(), [&](const DeviceInfo &item) {
+                return item.id == selectedOutput.deviceId;
+            });
+            if (device != playback_.end()) outputDeviceName = toUtf8(device->name);
+        }
         if (outputDeviceName.empty())
             outputDeviceName = "Choose output device";
         const auto outputDisplayName = selectedOutput.label.empty() ? outputDeviceName : selectedOutput.label;
         c.scrollingText(rightX + 107, outputY + 97, outputDisplayName, 24, white, true, rightW - 318);
-        std::string outputSubtitle = engine_->monitoring() && out.state == StreamState::Running
-                                         ? (out.exclusive ? "Exclusive audio output" : "Shared audio output")
-                                         : "Combined audio destination";
-        if (!selectedOutput.label.empty())
-            outputSubtitle = outputDeviceName + " - " + outputSubtitle;
-        if (selectedOutput_ == 0 && config_->outputCount() > 1)
-            outputSubtitle = "Primary - " + outputSubtitle;
-        c.scrollingText(rightX + 107, outputY + 132, outputSubtitle, 19, gray, false, rightW - 318);
+        // Match source cards: custom/display name above, actual endpoint below.
+        c.scrollingText(rightX + 107, outputY + 132, outputDeviceName, 20, gray, false, rightW - 318);
         bool active = engine_->monitoring() && out.state == StreamState::Running;
         c.rect(rightX + rightW - 197, outputY + 102, 97, 46,
                active ? activeStatusBackground : idleStatusBackground, 24, false);
@@ -1377,16 +1435,25 @@ bool MixerWindow::draw(float dt, int width, int height) {
 }
 
 bool MixerWindow::hitTitleBar(int x, int y, int width, int height) const {
-    // Let clicks dismiss menus, and keep modal dialogs in charge of input.
-    if (!ImGui::GetCurrentContext() ||
-        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
-        return false;
+    const auto *context = ImGui::GetCurrentContext();
+    if (!context) return false;
     const float scale = std::min(float(width) / 1600.f, float(height) / 986.f);
-    return x >= 320 * scale && x < width - 200 * scale && y >= 12 * scale && y < 87 * scale;
+    if (!(x >= 12 * scale && x < width - 200 * scale && y >= 12 * scale && y < 87 * scale))
+        return false;
+    const ImVec2 point{float(x), float(y)};
+    for (const auto &popup : context->OpenPopupStack) {
+        const auto *window = popup.Window;
+        // Menus need outside clicks to dismiss. A modal backdrop, however,
+        // should not disable moving the main HWND from an uncovered header.
+        if (!window || !(window->Flags & ImGuiWindowFlags_Modal)) return false;
+        if (window->Rect().Contains(point)) return false;
+    }
+    return true;
 }
 
 bool MixerWindow::drawDialogs() {
     bool changed = false;
+    pollDiagnosticExport();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24 * scale_, 24 * scale_});
     if (openChannels_) {
         ImGui::OpenPopup("Channels");
@@ -1455,7 +1522,7 @@ bool MixerWindow::drawDialogs() {
             "Changes apply to the output mix and what is sent to your output device.";
         const float channelInfoWidth = dialogW - 108;
         const float channelInfoHeight = c.fontFor(false)
-                                            ->CalcTextSizeA(16 * scale_, FLT_MAX,
+                                            ->CalcTextSizeA(readableTextSize(16) * scale_, FLT_MAX,
                                                             channelInfoWidth * scale_, channelInfo)
                                             .y /
                                         scale_;
@@ -1477,7 +1544,7 @@ bool MixerWindow::drawDialogs() {
         const ImVec2 start = ImGui::GetCursorScreenPos();
         Canvas c{ImGui::GetWindowDrawList(), start, scale_};
         const float detailHeight = std::max(
-            c.fontFor(false)->CalcTextSizeA(18 * scale_, FLT_MAX, 456 * scale_, statusDetail_.c_str()).y /
+            c.fontFor(false)->CalcTextSizeA(readableTextSize(18) * scale_, FLT_MAX, 456 * scale_, statusDetail_.c_str()).y /
                 scale_,
             50.f);
         const float dialogH = 181 + detailHeight;
@@ -1537,7 +1604,7 @@ bool MixerWindow::drawDialogs() {
                 c.dl->AddRect(c.p(x, 153), c.p(x + 334, 246), purple, 10 * scale_, 0, 2 * scale_);
             c.icon(icon, x + 48, 199, selected ? white : gray, 40);
             c.text(x + 86, 178, title, 19, white, true, 205);
-            c.text(x + 86, 209, subtitle, 15, gray, false, 215);
+            c.wrappedText(x + 86, 202, subtitle, 20, gray, 215, 42);
             c.dl->AddCircle(c.p(x + 286, 200), 11 * scale_, selected ? purple : radioOutline,
                             24, 2 * scale_);
             if (selected)
@@ -1575,10 +1642,10 @@ bool MixerWindow::drawDialogs() {
 
         c.rect(0, 91, dialogW, 176, panel, 14);
         c.alignedIconLabel(Wave, 28, 58, 125, "1.  Select Source Type", 20, 28, purple);
-        if (drawSourceType("Audio Device", 18, "Audio Device", "Use a headset, speaker, or microphone",
+        if (drawSourceType("Audio Device", 18, "Audio Device", "Headset, speaker, or microphone",
                            Speaker, !isApp))
             selectKind(false);
-        if (drawSourceType("Application Audio", 370, "Application Audio", "Capture audio from an application",
+        if (drawSourceType("Application Audio", 370, "Application Audio", "Audio from an application",
                            Screen, isApp))
             selectKind(true);
 
@@ -1684,9 +1751,9 @@ bool MixerWindow::drawDialogs() {
         }
 
         checkboxWithDescription(c, "Include in mix", 372, 590, 168, draft_.enabled,
-                                "Include in mix", "This source will be mixed into the output.");
+                                "Include in mix", "Mixed into output.");
         checkboxWithDescription(c, "Source muted", 552, 590, 152, draft_.muted,
-                                "Muted", "Mute this source when monitoring starts.");
+                                "Muted", "Starts muted.");
 
         c.text(18, 671, "Mix Gain", 17, white);
         c.icon(Speaker, 28, 711, white, 24);
@@ -1697,7 +1764,7 @@ bool MixerWindow::drawDialogs() {
         const char *gainMarks[] = {"0%", "100%", "200%", "300%", "400%"};
         for (int i = 0; i < 5; ++i)
             c.centeredText(58 + 500 * float(i) / 4.f, 749, gainMarks[i], 15, gray);
-        c.text(18, 764, "Adjust how much of this source is mixed into the output. 100% is normal volume.",
+        c.text(18, 764, "Sets this source's mix level. 100% is normal volume.",
                15, gray, false, dialogW - 36);
 
         const bool valid = isApp ? applicationCaptureAvailable && !draft_.processPath.empty()
@@ -2004,13 +2071,13 @@ bool MixerWindow::drawDialogs() {
             c.text(contentX, 154, "Output format", 16, gray);
             c.rect(contentX, 181, 504, 76, card, 10);
             c.badge(Wave, contentX + 40, 219, green);
-            c.text(contentX + 83, 194, "Sample Rate", 15, gray);
+            c.text(contentX + 83, 194, "Sample Rate", 20, white, true);
             std::string sample = std::to_string(OutputBus::kSourceSampleRate);
             if (sample.size() == 5)
                 sample.insert(2, ",");
             c.text(contentX + 83, 221, sample + " Hz", 19, white);
             c.text(contentX + 264, 194, "Fixed internal mix rate", 15, gray);
-            c.text(contentX + 264, 221, "Change it in Windows Sound settings", 15, accentText);
+            c.text(contentX + 264, 221, "Windows Sound settings", 20, accentText);
             c.icon(Arrow, contentX + 488, 232, accentText, 17);
             if (c.hit("Open classic Windows Sound settings", contentX + 250, 210, 246, 38,
                       "Open the classic Windows Sound control panel") && window_ &&
@@ -2021,7 +2088,7 @@ bool MixerWindow::drawDialogs() {
                             L"Audio Monitor", MB_OK | MB_ICONWARNING);
             }
 
-            c.text(contentX, 282, "Buffer", 17, white);
+            c.text(contentX, 282, "Buffer", 20, white, true);
             char bufferLabel[24];
             std::snprintf(bufferLabel, sizeof(bufferLabel), "%u ms", settingsDraft_.bufferMillis);
             c.text(contentX + 443, 282, bufferLabel, 17, purple);
@@ -2039,19 +2106,18 @@ bool MixerWindow::drawDialogs() {
             const float bufferFraction = float(buffer - 20) / 230.f;
             c.line(contentX + 8, 327, contentX + 496, 327, sliderTrack, 8);
             c.line(contentX + 8, 327, contentX + 8 + 488 * bufferFraction, 327, purple, 8);
-            c.dl->AddCircleFilled(c.p(contentX + 8 + 488 * bufferFraction, 327), 11 * scale_,
-                                  onAccent, 24);
+            c.sliderThumb(contentX + 8 + 488 * bufferFraction, 327, 12);
             if (bufferFocused)
                 c.dl->AddRect(c.p(contentX, 309), c.p(contentX + 504, 345), purple, 8 * scale_, 0,
                               2 * scale_);
             c.text(contentX, 350,
-                   "Source buffer only; total delay also includes Windows and device buffers.",
+                   "Source buffer; Windows and devices add more delay.",
                    13, gray, false, 504);
-            c.text(contentX, 369, "The 20 ms minimum helps prevent audio glitches.",
+            c.text(contentX, 374, "20 ms minimum to help prevent audio glitches.",
                    13, gray, false, 504);
 
-            c.line(contentX, 389, contentX + 504, 389, border, 1);
-            c.text(contentX, 410, "Channels", 17, white);
+            c.line(contentX, 400, contentX + 504, 400, border, 1);
+            c.text(contentX, 410, "Channels", 20, white, true);
             c.rect(contentX, 440, 244, 60, card, 10);
             c.rect(contentX + 260, 440, 244, 60, card, 10);
             if (drawRadio("Stereo channels", contentX + 24, 470, "Stereo", !settingsDraft_.mono,
@@ -2063,35 +2129,35 @@ bool MixerWindow::drawDialogs() {
 
             c.line(contentX, 521, contentX + 504, 521, border, 1);
             drawCheck("Exclusive output", contentX, 544, "Use exclusive output when available",
-                      "System-default outputs remain shared so other apps keep their audio.",
+                      "Default outputs stay shared with other apps.",
                       settingsDraft_.exclusiveOutput);
         } else if (settingsPage_ == 1) {
             c.icon(Gear, contentX + 10, 124, white, 27);
             c.text(contentX + 38, 107, "General", 21, white, true);
             drawCheck("Start with Windows", contentX, 157, "Start with Windows (in tray)",
-                      "Start Audio Monitor automatically when Windows starts.",
+                      "Launch automatically in the Windows tray.",
                       settingsDraft_.startWithWindows);
             drawCheck("Start hidden", contentX, 219, "Start hidden when launched manually",
-                      "Launch Audio Monitor to the system tray.", settingsDraft_.startMinimized);
+                      "Open in the system tray.", settingsDraft_.startMinimized);
             drawCheck("Close to tray", contentX, 281, "Close button keeps monitoring in the tray",
-                      "Audio monitoring will continue running in the background.",
+                      "Keep monitoring when you close the window.",
                       settingsDraft_.closeToTray);
 
             c.line(contentX, 347, contentX + 504, 347, border, 1);
             c.text(contentX, 369, "Updates", 17, white);
             bool updatesUnavailable = false;
             drawCheck("Automatic updates", contentX, 399, "Check for updates automatically",
-                      "Automatic updates are not available in this build.", updatesUnavailable, false);
+                      "Not available in this build.", updatesUnavailable, false);
 
             c.line(contentX, 463, contentX + 504, 463, border, 1);
             c.text(contentX, 483, "Language", 17, white);
-            c.text(contentX + 363, 485, "System Default only", 14, gray);
+            c.text(contentX + 316, 485, "System Default only", 20, gray);
             c.rect(contentX, 510, 250, 42, card, 8);
             c.text(contentX + 14, 520, "System Default", 17, gray);
 
             c.line(contentX, 574, contentX + 504, 574, border, 1);
             c.text(contentX, 595, "Theme", 17, white);
-            c.text(contentX + 375, 597, "System follows Windows", 14, gray);
+            c.text(contentX + 270, 597, "System follows Windows", 20, gray);
             if (drawRadio("Dark theme", contentX + 10, 633, "Dark",
                           settingsDraft_.colorTheme == ColorTheme::Dark))
                 settingsDraft_.colorTheme = ColorTheme::Dark;
@@ -2115,11 +2181,48 @@ bool MixerWindow::drawDialogs() {
             c.centeredText(448, 365, "Keyboard shortcut controls will be added here later.", 17,
                            gray);
         } else if (settingsPage_ == 4) {
-            c.badge(Info, 448, 221, purple);
-            c.centeredText(448, 285, "Audio Monitor", 28, white);
-            c.centeredText(448, 323, "Version 0.1.0", 17, gray);
-            c.centeredText(448, 367, "A low-latency Windows audio monitor and mixer.", 17, gray);
-            if (drawButton("Exit application", 350, 421, 196, 48, "Exit Audio Monitor", card))
+            c.badge(Info, 448, 163, purple);
+            c.centeredText(448, 222, "Audio Monitor", 28, white);
+            c.centeredText(448, 258, "Version 0.1.0", 20, gray);
+            c.centeredText(448, 293, "Low-latency Windows audio monitoring and mixing.", 20, gray);
+            c.line(contentX, 320, contentX + 504, 320, border, 1);
+            c.text(contentX, 338, "Audio diagnostics", 23, white, true);
+            c.wrappedText(contentX, 373,
+                          "Tracks buffer delay, clock correction and dropouts over time, including in the tray.",
+                          20, gray, 504, 48);
+            ImGui::BeginDisabled(diagnosticExport_.valid());
+            if (drawButton("Export debug log", contentX, 433, 504, 48,
+                           diagnosticExport_.valid() ? "Exporting..." : "Export Debug Log",
+                           diagnosticExport_.valid() ? disabledControl : accentButton, onAccent)) {
+                const auto directory = Config::appDataDir();
+                if (directory.empty()) {
+                    diagnosticExportFailed_ = true;
+                    diagnosticMessage_ = "Cannot access the application data folder.";
+                } else {
+                    startDiagnosticExport(directory + L"\\reports");
+                }
+            }
+            ImGui::EndDisabled();
+            c.wrappedText(contentX, 495,
+                          diagnosticMessage_.empty()
+                              ? "Saved locally. Includes device/app names and paths; review before sharing."
+                              : diagnosticMessage_,
+                          20, diagnosticExportFailed_ ? red : gray, 504, 60);
+            if (!diagnosticMessage_.empty() && ImGui::IsWindowHovered() &&
+                ImGui::IsMouseHoveringRect(c.p(contentX, 495), c.p(contentX + 504, 555)))
+                ImGui::SetTooltip("%s", diagnosticMessage_.c_str());
+            ImGui::BeginDisabled(diagnosticPath_.empty());
+            if (drawButton("Open debug log", contentX, 580, 208, 48, "Open Log", card,
+                           diagnosticPath_.empty() ? gray : white) && window_) {
+                const auto opened = ShellExecuteW(static_cast<HWND>(window_), L"open",
+                                                  diagnosticPath_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                if (reinterpret_cast<INT_PTR>(opened) <= 32) {
+                    diagnosticExportFailed_ = true;
+                    diagnosticMessage_ = "Log saved, but Windows could not open it: " + toUtf8(diagnosticPath_);
+                }
+            }
+            ImGui::EndDisabled();
+            if (drawButton("Exit application", contentX + 224, 580, 280, 48, "Exit Audio Monitor", card))
                 exitRequested_ = true;
         }
 

@@ -96,6 +96,7 @@ void OutputBus::resetConsumer(uint32_t keepNewestFrames) noexcept {
     presence_.reset(0.0f);
     primingOut_.store(true, std::memory_order_relaxed);
     ratioOut_.store(baseRatio_, std::memory_order_relaxed);
+    depthOut_.store(ring_.depth(), std::memory_order_relaxed);
 }
 
 void OutputBus::finishTimelineBreak() noexcept {
@@ -159,6 +160,7 @@ void OutputBus::onRenderPeriod(uint32_t nominalFrames) noexcept {
 void OutputBus::renderMix(float* dst, uint32_t frames) noexcept {
     if (!dst || frames == 0) return;
     std::fill_n(dst, static_cast<size_t>(frames) * 2, 0.0f);
+    depthOut_.store(ring_.depth(), std::memory_order_relaxed);
 
     const uint32_t epoch = timelineEpoch_.load(std::memory_order_acquire);
     if (epoch != seenEpoch_ && !timelineBreakPending_) {

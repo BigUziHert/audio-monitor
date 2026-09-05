@@ -1,11 +1,13 @@
 #include "audio/AudioEngine.h"
 #include "audio/RealtimeThread.h"
 #include "util/Log.h"
+#include "util/Text.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <sstream>
 
 namespace audiomon {
 namespace {
@@ -62,6 +64,8 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
         {
             std::lock_guard<std::mutex> lock(configMutex_);
             config_ = config;
+            diagnosticSources_ = {};
+            diagnosticOutputs_ = {};
         }
         LOG_INFO("engine: config copied");
 
@@ -75,6 +79,8 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
             channel.muted.store(source.muted || !source.enabled);
             channel.peak.l.take(); channel.peak.r.take();
             channel.latencyTrimmed.store(0, std::memory_order_relaxed);
+            channel.shortfallFrames.store(0, std::memory_order_relaxed);
+            channel.shortfallEvents.store(0, std::memory_order_relaxed);
         }
         for (size_t i = 0; i < kMaxOutputs; ++i) {
             const bool configured = i < outputCount_;
@@ -113,6 +119,15 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
                                    2 + (monitoring ? 1 : 0), std::memory_order_release);
         pumpObservedState_.store(0, std::memory_order_relaxed);
         running_.store(true, std::memory_order_release);
+        ++diagnosticSession_;
+        try {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            // Runtime objects still describe the preceding session here;
+            // retain configured selections only until new streams resolve.
+            diagnostics_.beginSession(diagnosticSession_, diagnosticDevicesLocked(false));
+        }
+        catch (...) {} // Diagnostic retention must not prevent audio startup.
+        recordDiagnostics(false);
         if (!devices_.start([this] { requestRebuild(); })) {
             LOG_ERR("engine: device enumerator unavailable");
             stopLocked();
@@ -165,6 +180,9 @@ void AudioEngine::stopLocked() {
 
     if (mixPump_.joinable()) mixPump_.join();
     mixPumpScheduler_.close();
+    // The supervisor is joined, so this final retained observation cannot be
+    // spliced with its periodic sample. Capture identity still exists here.
+    recordDiagnostics();
     for (auto& render : renders_) render->stop();
     for (auto& ch : channels_) ch->stream.stop();
     devices_.stop();
@@ -276,6 +294,12 @@ void AudioEngine::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noex
         ch.lastSrcRate  = 0;             // force a recompute on the next block
         ch.lastBufferMs = 0;
         ch.targetDepth  = 0.0;
+        ch.targetOut.store(0, std::memory_order_relaxed);
+        ch.rateOut.store(0, std::memory_order_relaxed);
+        ch.epochOut.store(ch.stream.epoch(), std::memory_order_relaxed);
+        ch.primingOut.store(true, std::memory_order_relaxed);
+        ch.correctionPpmOut.store(0, std::memory_order_relaxed);
+        ch.depthOut.store(0, std::memory_order_relaxed);
         ch.resampler.reset();
         ch.priming      = true;
         ch.presence.configure(uint32_t(double(sampleRate) * kFadeSeconds));
@@ -323,6 +347,7 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             ch.lastObservedDepth = 0;
             ch.timelineBreakPending = false;
             ch.depthOut.store(0, std::memory_order_relaxed);
+            ch.primingOut.store(true, std::memory_order_relaxed);
         };
 
         // A timeline break (discontinuity, reconnect, overflow drop) makes the
@@ -440,7 +465,13 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                     (flowing ? ch.rate.update(double(depth)) : ch.rate.ratio());
                 ch.ratioOut.store(ratio, std::memory_order_relaxed);
                 made = ch.resampler.produce(ring, ch.scratch.data(), frames, ratio);
-                if (made < frames) ch.priming = true;
+                if (made < frames) {
+                    ch.priming = true;
+                    if (flowing) {
+                        ch.shortfallFrames.fetch_add(frames - made, std::memory_order_relaxed);
+                        ch.shortfallEvents.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
             }
         } else {
             ch.depthOut.store(observedDepth, std::memory_order_relaxed);
@@ -450,6 +481,15 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
             // it to an extreme that is wildly wrong when audio resumes.
             ch.priming = true;
         }
+
+        // Scalar mirrors only: no diagnostic locks, allocation, formatting or
+        // clocks in the audio path. Epoch equality lets observers reject the
+        // short interval before this pump has acknowledged a capture restart.
+        ch.targetOut.store(static_cast<uint32_t>(ch.targetDepth), std::memory_order_relaxed);
+        ch.rateOut.store(ch.lastSrcRate, std::memory_order_relaxed);
+        ch.primingOut.store(ch.priming, std::memory_order_relaxed);
+        ch.correctionPpmOut.store((ch.rate.ratio() - 1.0) * 1000000.0, std::memory_order_relaxed);
+        ch.epochOut.store(ch.lastEpoch, std::memory_order_release);
 
         if (made < frames) {
             std::fill_n(ch.scratch.data() + static_cast<size_t>(made) * 2,
@@ -746,6 +786,7 @@ void AudioEngine::supervisorMain() {
     std::array<uint32_t, kMaxOutputs> outputFailures{};
     std::array<std::chrono::steady_clock::time_point, kMaxOutputs> outputRetryAt{};
     uint64_t handledMonitoringState = 0;
+    auto diagnosticAt = std::chrono::steady_clock::now();
 
     const auto failSupervisor = [this](const char* error) {
         LOG_ERR("supervisor: worker restart failed: %s", error);
@@ -768,7 +809,8 @@ void AudioEngine::supervisorMain() {
             bool monitoringWoken = false;
             {
                 std::unique_lock<std::mutex> lock(superMutex_);
-                superCv_.wait_for(lock, std::chrono::milliseconds(kSupervisorPollMs),
+                superCv_.wait_until(lock, std::min(diagnosticAt, std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kSupervisorPollMs)),
                     [this] { return superWake_ || monitoringWake_ || quit_.load(std::memory_order_relaxed); });
                 woken = superWake_;
                 monitoringWoken = monitoringWake_;
@@ -802,6 +844,10 @@ void AudioEngine::supervisorMain() {
             }
 
             const auto now = std::chrono::steady_clock::now();
+            if (now >= diagnosticAt) {
+                recordDiagnostics(); // includes paused metering and tray operation
+                diagnosticAt = now + std::chrono::milliseconds(DiagnosticHistory::kSampleMillis);
+            }
 
             // Serialize reading each selection AND restarting it with UI changes.
             // Releasing the lock in between lets a stale restart undo a new choice.
@@ -871,6 +917,168 @@ void AudioEngine::supervisorMain() {
 }
 
 // ---------------------------------------------------------------------------
+
+DiagnosticSample AudioEngine::collectDiagnostics() const {
+    std::lock_guard<std::mutex> lock(configMutex_);
+    return collectDiagnosticsLocked();
+}
+
+DiagnosticSample AudioEngine::collectDiagnosticsLocked() const {
+    DiagnosticSample sample;
+    sample.session = diagnosticSession_;
+    sample.elapsedMillis = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - diagnosticOrigin_).count());
+    sample.utcMillis = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    sample.running = running();
+    sample.monitoringGeneration = monitoringState_.load(std::memory_order_acquire);
+    sample.monitoring = sample.running && (sample.monitoringGeneration & 1u) != 0;
+    sample.bufferMillis = bufferMillis_.load(std::memory_order_relaxed);
+    sample.pumpMissedPeriods = mixPumpMissedPeriods();
+    // Before the first start there is no configured audio session, regardless
+    // of the legacy default value of outputCount_. After stop retain topology.
+    if (!sample.session) return sample;
+    sample.sourceCount = sourceCount_;
+    sample.outputCount = outputCount_;
+    for (size_t i = 0; i < sourceCount_; ++i) {
+        const auto& ch = *channels_[i];
+        auto& s = sample.sources[i];
+        s.state = ch.stream.state();
+        s.epoch = ch.stream.epoch();
+        s.valid = sample.running && config_.sources[i].enabled && s.state == StreamState::Running &&
+                  s.epoch == ch.epochOut.load(std::memory_order_acquire);
+        s.flowing = ch.stream.flowing();
+        s.priming = ch.primingOut.load(std::memory_order_relaxed);
+        s.muted = ch.muted.load(std::memory_order_relaxed);
+        s.nativeRate = ch.stream.sampleRate();
+        s.queueRate = ch.rateOut.load(std::memory_order_relaxed);
+        s.queueFrames = ch.depthOut.load(std::memory_order_relaxed);
+        s.targetFrames = ch.targetOut.load(std::memory_order_relaxed);
+        // Ring capacity is immutable after configure, while this lifecycle is running.
+        s.capacityFrames = ch.stream.ringCapacityFrames();
+        s.correctionPpm = ch.correctionPpmOut.load(std::memory_order_relaxed);
+        s.overflowFrames = config_.sources[i].enabled ? ch.stream.droppedFrames() : 0;
+        s.trimmedFrames = ch.latencyTrimmed.load(std::memory_order_relaxed);
+        s.starvedFrames = ch.shortfallFrames.load(std::memory_order_relaxed);
+        s.starvationEvents = ch.shortfallEvents.load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < outputCount_; ++i) {
+        const auto& render = *renders_[i];
+        const auto& bus = *outputBuses_[i];
+        auto& s = sample.outputs[i];
+        s.state = render.state();
+        s.valid = sample.monitoring && s.state == StreamState::Running &&
+            outputReadyState_[i].load(std::memory_order_acquire) == sample.monitoringGeneration;
+        s.flowing = s.valid;
+        s.priming = bus.priming();
+        s.muted = outputMuted_[i].load(std::memory_order_relaxed);
+        s.exclusive = render.exclusive();
+        s.epoch = bus.diagnosticEpoch();
+        s.nativeRate = bus.renderSampleRate();
+        s.queueRate = kMixSampleRate;
+        s.queueFrames = bus.diagnosticDepthFrames();
+        s.targetFrames = bus.effectiveTargetFrames();
+        s.capacityFrames = bus.capacityFrames();
+        s.blockFrames = render.blockFrames();
+        s.correctionPpm = s.nativeRate
+            ? (bus.resamplingRatio() * double(s.nativeRate) / double(kMixSampleRate) - 1.0) * 1000000.0 : 0;
+        s.overflowFrames = bus.overflowFrames();
+        s.trimmedFrames = bus.trimmedFrames();
+        s.starvedFrames = bus.starvedFrames();
+        s.starvationEvents = bus.starvationEvents();
+        s.underrunEvents = render.underruns();
+        s.latencyCorrections = bus.latencyCorrections();
+    }
+    return sample;
+}
+
+void AudioEngine::recordDiagnostics(bool runtime) noexcept {
+    try {
+        DiagnosticSample sample;
+        std::string devices;
+        {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            sample = collectDiagnosticsLocked();
+            // The initial pre-open observation must not retain the preceding
+            // session's format/identity. Periodic and final samples replace
+            // one bounded per-session description, not every history row.
+            if (runtime)
+                devices = diagnosticDevicesLocked();
+        }
+        diagnostics_.record(sample, std::move(devices));
+    }
+    catch (...) {} // Optional diagnostics must never stop the mixer.
+}
+
+std::string AudioEngine::diagnosticDevicesLocked(bool runtime) const {
+    std::ostringstream out;
+    const auto retain = [](DiagnosticDeviceCache& cache, const ChannelConfig& configured,
+                           const StreamDiagnosticInfo& info, StreamState state, uint32_t processId) {
+        if (cache.selection.id != configured.deviceId ||
+            cache.selection.nameMatch != configured.deviceNameMatch ||
+            cache.processPath != configured.processPath) {
+            cache = {};
+            cache.selection = {configured.deviceId, configured.deviceNameMatch};
+            cache.processPath = configured.processPath;
+        }
+        if (state != StreamState::Stopped) {
+            if (!info.name.empty()) cache.info.name = info.name;
+            if (!info.id.empty()) cache.info.id = info.id;
+            if (!info.format.empty()) cache.info.format = info.format;
+            if (!info.error.empty() || state == StreamState::Running) cache.info.error = info.error;
+            if (processId) cache.processId = processId;
+        }
+    };
+    for (size_t i = 0; i < sourceCount_; ++i) {
+        const auto& configured = config_.sources[i];
+        out << "Source " << i << ": " << configured.label << "; enabled=" << configured.enabled
+            << "; kind=" << static_cast<int>(configured.kind) << "; selection="
+            << toUtf8(configured.deviceNameMatch) << "; pinned ID=" << toUtf8(configured.deviceId)
+            << "; application=" << toUtf8(configured.processPath);
+        if (!runtime) { out << '\n'; continue; }
+        const auto state = channels_[i]->stream.state();
+        const auto live = state == StreamState::Stopped ? StreamDiagnosticInfo{} : channels_[i]->stream.diagnosticInfo();
+        auto& cache = diagnosticSources_[i];
+        retain(cache, configured, live, state, channels_[i]->stream.processId());
+        out << "; state=" << streamStateName(state)
+            << "; last-known resolved=" << toUtf8(cache.info.name) << "; last-known ID=" << toUtf8(cache.info.id)
+            << "; last-known process ID=" << cache.processId
+            << "; last-known format=" << cache.info.format << "; last-known error=" << cache.info.error << '\n';
+    }
+    for (size_t i = 0; i < outputCount_; ++i) {
+        const auto& configured = config_.outputAt(i);
+        out << "Output " << i << ": " << configured.label << "; selection="
+            << toUtf8(configured.deviceNameMatch) << "; pinned ID=" << toUtf8(configured.deviceId);
+        if (!runtime) { out << '\n'; continue; }
+        const auto state = renders_[i]->state();
+        const auto live = state == StreamState::Stopped ? StreamDiagnosticInfo{} : renders_[i]->diagnosticInfo();
+        auto& cache = diagnosticOutputs_[i];
+        retain(cache, configured, live, state, 0);
+        out << "; state=" << streamStateName(state)
+            << "; last-known resolved=" << toUtf8(cache.info.name) << "; last-known ID=" << toUtf8(cache.info.id)
+            << "; last-known format=" << cache.info.format << "; last-known error=" << cache.info.error << '\n';
+    }
+    return out.str();
+}
+
+std::string AudioEngine::diagnosticReport() const {
+    DiagnosticSample current;
+    DiagnosticHistoryCopy history;
+    std::string devices;
+    {
+        // Do not let an export splice counts or labels from separate sessions.
+        // Supervisor snapshots intentionally do NOT take this lock: stop/start
+        // owns it while joining the supervisor, so that would deadlock.
+        std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+        {
+            std::lock_guard<std::mutex> lock(configMutex_);
+            current = collectDiagnosticsLocked();
+            if (current.session) devices = diagnosticDevicesLocked();
+        }
+        history = diagnostics_.copy();
+    }
+    return formatDiagnosticReport(current, history, devices, log::recentText());
+}
 
 ChannelStatus AudioEngine::channelStatus(int channel) const {
     ChannelStatus s;

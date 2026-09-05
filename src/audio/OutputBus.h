@@ -65,6 +65,12 @@ public:
     // stale frames trimmed after a scheduling hitch; starvedFrames counts
     // missing output frames after playback left its initial priming state.
     uint32_t depthFrames() const noexcept { return ring_.depth(); }
+    // An observer must not combine two independently changing SPSC cursors.
+    // The consumer publishes its own bounded pre-consume observation instead.
+    uint32_t diagnosticDepthFrames() const noexcept { return depthOut_.load(std::memory_order_relaxed); }
+    uint32_t diagnosticEpoch() const noexcept { return timelineEpoch_.load(std::memory_order_acquire); }
+    uint64_t overflowFrames() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+    uint64_t trimmedFrames() const noexcept { return latencyTrimmed_.load(std::memory_order_relaxed); }
     uint32_t capacityFrames() const noexcept { return ring_.capacity(); }
     uint32_t targetFrames() const noexcept { return targetFrames_; }
     uint32_t effectiveTargetFrames() const noexcept {
@@ -123,6 +129,7 @@ private:
 
     // Cross-thread diagnostics/status.
     std::atomic<uint32_t> renderRateOut_{0};
+    std::atomic<uint32_t> depthOut_{0};
     std::atomic<uint32_t> effectiveTargetOut_{kDefaultTargetFrames};
     std::atomic<double>   ratioOut_{1.0};
     std::atomic<bool>     primingOut_{true};

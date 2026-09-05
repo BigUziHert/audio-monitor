@@ -45,6 +45,13 @@ if(BUILD_TESTING)
   target_link_libraries(lifecycle-test PRIVATE audiomon_core)
   add_test(NAME lifecycle COMMAND lifecycle-test)
   set_tests_properties(lifecycle PROPERTIES TIMEOUT 60)
+  add_executable(diagnostics-test tests/diagnostics_test.cpp)
+  target_link_libraries(diagnostics-test PRIVATE audiomon_core)
+  add_test(NAME diagnostics COMMAND diagnostics-test)
+  set_tests_properties(diagnostics PROPERTIES TIMEOUT 60)
+  add_executable(diagnostic-export-test tests/diagnostic_export_test.cpp)
+  target_link_libraries(diagnostic-export-test PRIVATE audiomon_core)
+  add_test(NAME diagnostic-export COMMAND diagnostic-export-test)
 endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -90,16 +97,19 @@ add_library(audiomon_core STATIC
   src/audio/OutputBus.cpp
   src/audio/MixPumpScheduler.cpp
   src/audio/AudioEngine.cpp
+  src/audio/Diagnostics.cpp
   src/audio/SampleFormat.cpp
   src/audio/WaveFormat.cpp
   src/audio/Guids.cpp
   src/config/Config.cpp
   src/config/Json.cpp
   src/util/Log.cpp
+  src/util/DiagnosticExport.cpp
   src/util/Text.cpp
   src/util/Startup.cpp
 )
 target_include_directories(audiomon_core PUBLIC src)
+target_compile_definitions(audiomon_core PRIVATE AUDIOMON_VERSION="${PROJECT_VERSION}")
 target_link_libraries(audiomon_core PUBLIC
   audiomon_flags
   mmdevapi ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32
@@ -157,6 +167,10 @@ if(AUDIOMON_BUILD_GUI)
     target_link_libraries(renderer-test PRIVATE audiomon_core imgui)
     add_test(NAME renderer COMMAND renderer-test)
     set_tests_properties(renderer PROPERTIES TIMEOUT 30)
+    # Manual hidden-window capture helper, not an automated CTest test.
+    add_executable(ui-snapshot-test tests/ui_snapshot_test.cpp
+      src/ui/MixerWindow.cpp src/ui/Renderer.cpp src/ui/Theme.cpp)
+    target_link_libraries(ui-snapshot-test PRIVATE audiomon_core imgui)
   endif()
 
   # The entry point is wWinMain. MSVC resolves that from /SUBSYSTEM:WINDOWS

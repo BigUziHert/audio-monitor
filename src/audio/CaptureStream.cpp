@@ -61,6 +61,10 @@ std::string CaptureStream::lastError() const {
     std::lock_guard<std::mutex> lock(infoMutex_);
     return lastError_;
 }
+StreamDiagnosticInfo CaptureStream::diagnosticInfo() const {
+    std::lock_guard<std::mutex> lock(infoMutex_);
+    return {resolvedName_, resolvedId_, lastError_, diagnosticFormat_};
+}
 
 void CaptureStream::setError(const char* what, HRESULT hr) {
     std::lock_guard<std::mutex> lock(infoMutex_);
@@ -85,6 +89,7 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
         resolvedId_.clear();
         resolvedName_.clear();
         lastError_.clear();
+        diagnosticFormat_.clear();
     }
     // A restart is a timeline break: whatever is still sitting in the ring
     // predates this device and may even be at a different sample rate. Bumping
@@ -420,6 +425,10 @@ void CaptureStream::threadMain(DeviceRef ref) {
         {
             std::lock_guard<std::mutex> lock(infoMutex_);
             lastLoggedOpenError_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> info(infoMutex_);
+            diagnosticFormat_ = format_.describe() + (eventDriven_ ? ", event-driven" : ", polling fallback");
         }
         state_.store(StreamState::Running, std::memory_order_release);
         QueryPerformanceCounter(&lastPacketQpc_);

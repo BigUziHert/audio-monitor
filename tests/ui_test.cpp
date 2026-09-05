@@ -9,6 +9,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 using namespace audiomon;
 
 namespace audiomon {
@@ -96,6 +99,15 @@ struct MixerWindowTestAccess {
         mixer.spectrumRefreshTimer_ = 0;
         mixer.statusRefreshForced_ = true;
         mixer.spectrumWasActive_ = false;
+    }
+    static void setExportFuture(MixerWindow &mixer, std::future<DiagnosticExportResult> future) {
+        mixer.diagnosticExport_ = std::move(future);
+    }
+    static bool exportPending(const MixerWindow &mixer) { return mixer.diagnosticExport_.valid(); }
+    static const std::wstring &exportPath(const MixerWindow &mixer) { return mixer.diagnosticPath_; }
+    static bool exportFailed(const MixerWindow &mixer) { return mixer.diagnosticExportFailed_; }
+    static void startExport(MixerWindow &mixer, const std::wstring &directory) {
+        mixer.startDiagnosticExport(directory);
     }
 };
 } // namespace audiomon::ui
@@ -320,6 +332,8 @@ int main() {
             const float scale = std::min(size.x / 1600.f, size.y / 986.f);
             expect(mixer.hitTitleBar(int(700 * scale), int(50 * scale), int(size.x), int(size.y)),
                    "Title bar does not route dragging to Windows");
+            expect(mixer.hitTitleBar(int(100 * scale), int(50 * scale), int(size.x), int(size.y)),
+                   "Application title and logo cannot be used to move the main window");
             expect(mixer.hitTitleBar(int(size.x - 205 * scale), int(50 * scale),
                                     int(size.x), int(size.y)),
                    "Compact window controls left an unnecessary gap in the draggable title bar");
@@ -450,7 +464,7 @@ int main() {
         click(1200, 488); // Channels
         expect(popup() && std::strcmp(popup()->Name, "Channels") == 0, "Channels dialog missing");
         expectFixedModal(popup(), "Channels is not modal");
-        expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from Channels");
+        expect(mixer.hitTitleBar(700, 50, 1600, 986), "Channels blocks the uncovered main titlebar");
         if (auto *dialog = popup()) {
             click(dialog->DC.CursorStartPos.x + 100, dialog->DC.CursorStartPos.y + 240); // Mono
             expect(config.mono && popup(), "Selecting Mono did not update the live mix");
@@ -462,8 +476,72 @@ int main() {
         expect(config.output.volume < .9f, "Volume blocked after choosing channels");
         click(670, 900); // Settings
         expect(popup() != nullptr, "Settings blocked after adjusting volume");
-        expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from a modal");
+        expect(mixer.hitTitleBar(700, 50, 1600, 986), "Settings blocks the uncovered main titlebar");
         if (auto *dialog = popup()) {
+            const ImVec2 originalPosition = dialog->Pos;
+            // A modal may overlap the titlebar after resize. Its controls must
+            // retain input, but the uncovered app title remains draggable.
+            ImGui::SetWindowPos(dialog, {400, 20});
+            expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Titlebar steals a click inside Settings");
+            expect(mixer.hitTitleBar(100, 50, 1600, 986), "Modal backdrop disables dragging from app title");
+            expect(!mixer.hitTitleBar(1493, 53, 1600, 986), "Modal drag behavior overlaps maximize");
+            ImGui::SetWindowPos(dialog, originalPosition);
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 80, dialog->DC.CursorStartPos.y + 349); // About
+            expect(ui::MixerWindowTestAccess::settingsPage(mixer) == 4, "About did not open");
+            const int beforeExport = changedFrames;
+            std::promise<DiagnosticExportResult> exportResult;
+            ui::MixerWindowTestAccess::setExportFuture(mixer, exportResult.get_future());
+            click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 457);
+            expect(ui::MixerWindowTestAccess::exportPending(mixer), "Pending export was replaced by another click");
+            exportResult.set_value({L"test-debug-log.txt", {}});
+            frame(1600, 986);
+            expect(!ui::MixerWindowTestAccess::exportPending(mixer) &&
+                       ui::MixerWindowTestAccess::exportPath(mixer) == L"test-debug-log.txt" &&
+                       !ui::MixerWindowTestAccess::exportFailed(mixer), "Completed export was not shown");
+            std::promise<DiagnosticExportResult> failedExport;
+            ui::MixerWindowTestAccess::setExportFuture(mixer, failedExport.get_future());
+            failedExport.set_value({{}, "Test: access denied"});
+            frame(1600, 986);
+            expect(ui::MixerWindowTestAccess::exportFailed(mixer) &&
+                       ui::MixerWindowTestAccess::exportPath(mixer) == L"test-debug-log.txt",
+                   "Export failure was hidden or lost the previous log path");
+            expect(changedFrames == beforeExport, "Debug log export dirtied audio preferences");
+            // Exercise the real asynchronous report + config + file path in a
+            // unique temporary directory, never the user's application data.
+            wchar_t temporaryDirectory[MAX_PATH]{}, reservedPath[MAX_PATH]{};
+            const DWORD temporaryLength = GetTempPathW(MAX_PATH, temporaryDirectory);
+            const bool reserved = temporaryLength > 0 && temporaryLength < MAX_PATH &&
+                GetTempFileNameW(temporaryDirectory, L"amd", 0, reservedPath) != 0;
+            expect(reserved, "Could not reserve a temporary diagnostic export fixture");
+            if (reserved && DeleteFileW(reservedPath)) {
+                const std::wstring reportDirectory(reservedPath);
+                ui::MixerWindowTestAccess::startExport(mixer, reportDirectory);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (ui::MixerWindowTestAccess::exportPending(mixer) &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    frame(1600, 986);
+                    Sleep(1);
+                }
+                const auto reportPath = ui::MixerWindowTestAccess::exportPath(mixer);
+                const bool exported = !ui::MixerWindowTestAccess::exportPending(mixer) &&
+                    !ui::MixerWindowTestAccess::exportFailed(mixer) &&
+                    reportPath.starts_with(reportDirectory + L"\\");
+                expect(exported, "Real asynchronous debug log export failed or did not finish");
+                if (exported) {
+                    std::ifstream report(std::filesystem::path(reportPath), std::ios::binary);
+                    const std::string contents((std::istreambuf_iterator<char>(report)),
+                                               std::istreambuf_iterator<char>());
+                    expect(contents.find("Audio Monitor audio diagnostics") != std::string::npos &&
+                               contents.find("Saved/live UI configuration") != std::string::npos &&
+                               contents.find("Elgato 4K") != std::string::npos,
+                           "Export omitted engine diagnostics or the current UI configuration");
+                    report.close();
+                    expect(DeleteFileW(reportPath.c_str()) != 0, "Could not clean up generated test log");
+                }
+                expect(RemoveDirectoryW(reportDirectory.c_str()) != 0, "Could not clean up test report directory");
+                expect(changedFrames == beforeExport, "Real export changed audio preferences");
+            }
             click(dialog->DC.CursorStartPos.x + 80,
                   dialog->DC.CursorStartPos.y + 291); // Keybinds navigation row.
             expect(ui::MixerWindowTestAccess::settingsPage(mixer) == 3,
@@ -567,6 +645,14 @@ int main() {
             click(dialog->DC.CursorStartPos.x + 83, dialog->DC.CursorStartPos.y + 716); // Restore defaults
         expect(popup() && std::strcmp(popup()->Name, "Restore defaults?") == 0,
                "Confirmation popup missing");
+        expect(mixer.hitTitleBar(100, 50, 1600, 986), "Nested confirmation disables main window dragging");
+        if (auto &stack = ImGui::GetCurrentContext()->OpenPopupStack; stack.Size >= 2) {
+            auto *parent = stack[stack.Size - 2].Window;
+            const ImVec2 originalPosition = parent->Pos;
+            ImGui::SetWindowPos(parent, {400, 20});
+            expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Nested confirmation permits dragging through parent modal");
+            ImGui::SetWindowPos(parent, originalPosition);
+        }
         dragAndResizePopup(); // Nested confirmation.
         if (auto *dialog = popup())
             click(dialog->DC.CursorStartPos.x + 20, dialog->DC.CursorPosPrevLine.y + 10); // Reset
@@ -813,6 +899,7 @@ int main() {
         expect(dashboard && !popupStack.empty() &&
                    popupStack.back().PopupId == dashboard->GetID("Output limit"),
                "Output-limit interaction did not open its limit notice");
+        expect(!mixer.hitTitleBar(100, 50, 1600, 986), "Titlebar steals outside-click dismissal from a menu");
         pressEscape();
         config.additionalOutputs.clear();
         frame(1600, 986);
@@ -820,6 +907,8 @@ int main() {
         config.sources[0].volume = 1.f;
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
+        expect(mixer.hitTitleBar(100, 50, 1600, 986), "Source dialog blocks dragging from the app title");
+        expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Main titlebar steals clicks from tall source dialog");
         dragAndResizePopup(false);
 
         if (auto *dialog = popup()) {
@@ -1012,6 +1101,15 @@ int main() {
                        ui::themePalette().background != darkBackground &&
                        changedFrames > changedBeforeTheme,
                    "Theme selection did not immediately apply and request persistence");
+            const auto &palette = ui::themePalette();
+            expect(palette.sliderThumb != palette.onAccent && palette.sliderThumb != palette.card &&
+                       palette.sliderThumb != palette.sliderTrack && palette.sliderThumbBorder != palette.sliderThumb,
+                   "Light slider thumb has no distinct fill and outline");
+            bool foundThumb = false;
+            for (const auto *list : ImGui::GetDrawData()->CmdLists)
+                for (const auto &vertex : list->VtxBuffer)
+                    foundThumb |= vertex.col == palette.sliderThumbBorder;
+            expect(foundThumb, "Dashboard sliders did not draw the theme's visible thumb outline");
             dialog = popup();
             click(dialog->DC.CursorStartPos.x + 453,
                   dialog->DC.CursorStartPos.y + 716); // Cancel remaining settings.

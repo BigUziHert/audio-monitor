@@ -5,6 +5,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include <deque>
+#include <cstring>
 
 namespace audiomon::log {
 namespace {
@@ -12,6 +14,9 @@ namespace {
 std::mutex  g_mutex;
 FILE*       g_file = nullptr;
 bool        g_echo = false;
+constexpr size_t kRecentLimit = 128 * 1024;
+std::deque<std::string> g_recent;
+size_t g_recentBytes = 0;
 
 const char* wasapiName(long hr) {
     switch (hr) {
@@ -83,8 +88,27 @@ void write(const char* level, const char* fmt, ...) {
     OutputDebugStringA(line);
 
     std::lock_guard<std::mutex> lock(g_mutex);
+    // Diagnostic retention must never turn a best-effort logger into a worker
+    // failure if the process is under memory pressure.
+    try {
+        const size_t bytes = std::strlen(line);
+        g_recent.emplace_back(line);
+        g_recentBytes += bytes;
+        while (g_recentBytes > kRecentLimit && !g_recent.empty()) {
+            g_recentBytes -= g_recent.front().size();
+            g_recent.pop_front();
+        }
+    } catch (...) {}
     if (g_file) { fputs(line, g_file); fflush(g_file); }
     if (g_echo) { fputs(line, stdout); fflush(stdout); }
+}
+
+std::string recentText() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::string text;
+    text.reserve(g_recentBytes);
+    for (const auto& line : g_recent) text += line;
+    return text;
 }
 
 std::string hrString(long hr) {

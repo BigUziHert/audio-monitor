@@ -65,12 +65,14 @@ public:
     std::wstring resolvedName() const;
     std::wstring resolvedId() const;
     std::string  lastError() const;
+    StreamDiagnosticInfo diagnosticInfo() const;
 
     // True once the device has stopped for a reason that a retry might fix
     // (late enumeration on boot, cable replug, driver restart).
     bool wantsRetry() const noexcept { return wantsRetry_.load(std::memory_order_acquire); }
 
 private:
+    friend struct AudioEngineTestAccess;
     void stopLocked();          // caller holds lifecycleMutex_
     void threadMain(DeviceRef ref);
     bool openDevice(const DeviceRef& ref);
@@ -113,6 +115,7 @@ private:
     std::wstring       resolvedName_;
     std::wstring       resolvedId_;
     std::string        lastError_;
+    std::string        diagnosticFormat_;
     std::string        lastLoggedOpenError_;
 };
 

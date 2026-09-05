@@ -17,6 +17,8 @@ void shutdown();
 void setEcho(bool enabled);
 
 void write(const char* level, const char* fmt, ...);
+// Last 128 KiB, retained even when no log file is open. Non-real-time only.
+std::string recentText();
 
 #define LOG_INFO(...)  ::audiomon::log::write("INFO",  __VA_ARGS__)
 #define LOG_WARN(...)  ::audiomon::log::write("WARN",  __VA_ARGS__)

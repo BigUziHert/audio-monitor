@@ -3,8 +3,18 @@
 // Shared vocabulary for the capture and render streams.
 //
 #include <cstdint>
+#include <string>
 
 namespace audiomon {
+
+// Copied under one info lock. Setup/restart may still be in progress; callers
+// must qualify the identity/format with stream state and timeline generation.
+struct StreamDiagnosticInfo {
+    std::wstring name;
+    std::wstring id;
+    std::string error;
+    std::string format;
+};
 
 enum class StreamState : int {
     Stopped = 0,

@@ -52,6 +52,8 @@ struct ThemePalette {
     ImU32 meterRed;
     ImU32 graphBarBottom;
     ImU32 onAccent;
+    ImU32 sliderThumb;
+    ImU32 sliderThumbBorder;
 };
 
 // Meter zones, matching the convention OBS uses so the colours mean the same

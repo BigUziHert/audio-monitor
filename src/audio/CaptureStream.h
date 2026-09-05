@@ -49,6 +49,7 @@ public:
 
     // --- read by the mixer thread ---
     StereoRing& ring() noexcept { return ring_; }
+    uint32_t ringCapacityFrames() const noexcept { return ring_.capacity(); }
 
     StreamState state() const noexcept { return state_.load(std::memory_order_acquire); }
 
@@ -73,6 +74,7 @@ public:
     uint64_t            droppedFrames() const noexcept { return dropped_.load(std::memory_order_relaxed); }
     std::string         lastError() const;
     uint32_t processId() const { return processId_.load(std::memory_order_relaxed); }
+    StreamDiagnosticInfo diagnosticInfo() const;
 
 private:
     friend struct AudioEngineTestAccess;
@@ -122,6 +124,7 @@ private:
     std::wstring         resolvedName_;
     std::wstring         resolvedId_;
     std::string          lastError_;
+    std::string          diagnosticFormat_;
     std::string          lastLoggedOpenError_;
 
     // Wall-clock of the last packet, for the flowing/idle decision.

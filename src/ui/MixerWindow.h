@@ -3,7 +3,9 @@
 #include "audio/AppAudio.h"
 #include "audio/Spectrum.h"
 #include "audio/Overlap.h"
+#include "util/DiagnosticExport.h"
 #include <array>
+#include <future>
 
 namespace audiomon::ui {
 class MixerWindow {
@@ -32,6 +34,8 @@ class MixerWindow {
     void refreshDropoutStatus(StreamState outputState, uint64_t underruns, uint64_t dropped,
                               float dt);
     void restart();
+    void startDiagnosticExport(const std::wstring &directory);
+    void pollDiagnosticExport();
     bool drawSource(size_t index, float width);
     bool drawDialogs();
     AudioEngine *engine_ = nullptr;
@@ -71,5 +75,9 @@ class MixerWindow {
     ChannelConfig outputDraft_;
     char name_[128]{};
     char outputName_[128]{};
+    std::future<DiagnosticExportResult> diagnosticExport_;
+    std::wstring diagnosticPath_;
+    std::string diagnosticMessage_;
+    bool diagnosticExportFailed_ = false;
 };
 } // namespace audiomon::ui

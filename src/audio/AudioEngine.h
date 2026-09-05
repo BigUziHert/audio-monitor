@@ -23,11 +23,13 @@
 #include "audio/FadeEnvelope.h"
 #include "audio/MixMode.h"
 #include "audio/RetryPolicy.h"
+#include "audio/Diagnostics.h"
 #include "config/Config.h"
 
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -116,6 +118,10 @@ public:
     uint64_t      mixPumpMissedPeriods() const noexcept {
         return mixPumpMissedPeriods_.load(std::memory_order_relaxed);
     }
+    // Safe from a background export worker, including concurrent start/stop.
+    // Takes lifecycle/config locks only to copy; formatting never holds them.
+    // History is retained across engine sessions until this object is destroyed.
+    std::string diagnosticReport() const;
 
     // Writes back any device IDs that were re-resolved by name, so a driver
     // reinstall is persisted rather than re-matched every launch.
@@ -160,6 +166,13 @@ private:
         std::atomic<uint32_t> depthOut{0};
         std::atomic<double>   ratioOut{1.0};
         std::atomic<uint64_t> latencyTrimmed{0};
+        std::atomic<uint32_t> targetOut{0};
+        std::atomic<uint32_t> rateOut{0};
+        std::atomic<uint32_t> epochOut{0};
+        std::atomic<bool> primingOut{true};
+        std::atomic<double> correctionPpmOut{0};
+        std::atomic<uint64_t> shortfallFrames{0};
+        std::atomic<uint64_t> shortfallEvents{0};
 
         // Audio-thread-only state.
         float    smoothedGain = 1.0f;
@@ -183,6 +196,12 @@ private:
     void handleMixPumpDiscontinuity(uint64_t missedPeriods) noexcept;
     void requestRebuild();
     void stopLocked(); // lifecycleMutex_ is held
+    // Called with lifecycle held OR by the supervisor, which start/stop joins
+    // before counts/session change. Never take lifecycle from the supervisor.
+    DiagnosticSample collectDiagnostics() const;
+    DiagnosticSample collectDiagnosticsLocked() const; // configMutex_ also held
+    void recordDiagnostics(bool runtime = true) noexcept;
+    std::string diagnosticDevicesLocked(bool runtime = true) const; // configMutex_ held
 
     std::array<std::unique_ptr<Channel>, kMaxSources> channels_;
     std::array<std::unique_ptr<RenderStream>, kMaxOutputs> renders_;
@@ -207,7 +226,20 @@ private:
     // Serializes complete start/stop transitions. Public UI calls are normally
     // single-threaded, but this also makes teardown safe under lifecycle tests
     // and prevents a concurrent stop from racing partially-created workers.
-    std::mutex          lifecycleMutex_;
+    mutable std::mutex  lifecycleMutex_;
+    DiagnosticHistory diagnostics_;
+    struct DiagnosticDeviceCache {
+        DeviceRef selection;
+        std::wstring processPath;
+        StreamDiagnosticInfo info;
+        uint32_t processId = 0;
+    };
+    // Diagnostic-only last-known identities, never used to resolve/save audio
+    // routing. configMutex_ protects them; every engine session starts empty.
+    mutable std::array<DiagnosticDeviceCache, kMaxSources> diagnosticSources_{};
+    mutable std::array<DiagnosticDeviceCache, kMaxOutputs> diagnosticOutputs_{};
+    uint64_t diagnosticSession_ = 0; // lifecycle-owned, immutable while workers run
+    const std::chrono::steady_clock::time_point diagnosticOrigin_ = std::chrono::steady_clock::now();
 
     std::thread             supervisor_;
     std::thread             mixPump_;

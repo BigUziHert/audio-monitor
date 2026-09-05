@@ -37,6 +37,10 @@ std::string RenderStream::lastError() const {
     std::lock_guard<std::mutex> lock(infoMutex_);
     return lastError_;
 }
+StreamDiagnosticInfo RenderStream::diagnosticInfo() const {
+    std::lock_guard<std::mutex> lock(infoMutex_);
+    return {resolvedName_, resolvedId_, lastError_, diagnosticFormat_};
+}
 void RenderStream::setError(const char* what, HRESULT hr) {
     std::lock_guard<std::mutex> lock(infoMutex_);
     lastError_ = std::string(what) + ": " + log::hrString(hr);
@@ -64,6 +68,7 @@ void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
         resolvedId_.clear();
         resolvedName_.clear();
         lastError_.clear();
+        diagnosticFormat_.clear();
     }
     quit_.store(false, std::memory_order_relaxed);
     wantsRetry_.store(false, std::memory_order_release);
@@ -446,6 +451,11 @@ void RenderStream::threadMain(DeviceRef ref) {
         converter_.configure(format_);
         sampleRate_.store(format_.sampleRate, std::memory_order_release);
         blockFrames_.store(bufferFrames_, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> info(infoMutex_);
+            diagnosticFormat_ = format_.describe() + ", buffer=" + std::to_string(bufferFrames_) +
+                " frames, period=" + std::to_string(double(devicePeriodHns_) / 10000.0) + " ms";
+        }
         mixBuffer_.assign(static_cast<size_t>(bufferFrames_) * 2, 0.0f);
         LOG_INFO("render: mixBuffer %zu floats", mixBuffer_.size());
 
