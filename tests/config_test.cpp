@@ -102,8 +102,89 @@ int main() {
         R"({"version":2,"sources":[{"gain":4}],"output":{"gain":2}})"));
     check(previous.sources.size() == 1 && previous.sources[0].gain == 4.f &&
               previous.sources[0].volume == 1.f && previous.output.gain == 2.f &&
-              previous.output.volume == 1.f,
-          "version 2 mix gains load with full dashboard volume");
+              previous.output.volume == 1.f && previous.colorTheme == ColorTheme::Dark,
+          "version 2 mix gains load with full dashboard volume and dark theme");
+    check(Config::fromJson(JsonValue::parse(R"({})")).colorTheme == ColorTheme::Dark,
+          "missing theme remains backward-compatible dark");
+    check(Config::fromJson(JsonValue::parse(R"({"colorTheme":"sepia"})")).colorTheme ==
+              ColorTheme::Dark,
+          "unknown theme remains backward-compatible dark");
+    check(Config::fromJson(JsonValue::parse(R"({"colorTheme":"light"})")).colorTheme ==
+              ColorTheme::Light,
+          "light theme string loads");
+    const auto defaultJson = Config::defaults().toJson();
+    check(defaultJson.find("version") && defaultJson.find("version")->asNumber(0) == 5 &&
+              defaultJson.find("colorTheme") &&
+              defaultJson.find("colorTheme")->asString("") == "dark",
+          "version 5 writes the default dark theme string");
+
+    const auto legacySingleOutput = Config::fromJson(JsonValue::parse(
+        R"({"version":4,"output":{"label":"Legacy HDMI","deviceId":"legacy-id","deviceName":"Legacy Device","icon":"screen","gain":1.75,"volume":0.42,"muted":true}})"));
+    check(legacySingleOutput.outputCount() == 1 &&
+              legacySingleOutput.output.label == "Legacy HDMI" &&
+              legacySingleOutput.output.deviceId == L"legacy-id" &&
+              legacySingleOutput.output.deviceNameMatch == L"Legacy Device" &&
+              legacySingleOutput.output.icon == "screen" &&
+              legacySingleOutput.output.gain == 1.75f &&
+              legacySingleOutput.output.volume == 0.42f && legacySingleOutput.output.muted,
+          "version 4 single output migrates losslessly");
+
+    Config multipleOutputs = Config::defaults();
+    multipleOutputs.output.label = "Primary";
+    multipleOutputs.output.deviceId = L"primary-id";
+    multipleOutputs.output.deviceNameMatch = L"Primary Device";
+    multipleOutputs.output.gain = 1.25f;
+    multipleOutputs.output.volume = 0.8f;
+    ChannelConfig secondaryOutput;
+    secondaryOutput.label = "Headphones";
+    secondaryOutput.deviceId = L"secondary-id";
+    secondaryOutput.deviceNameMatch = L"Secondary Device";
+    secondaryOutput.icon = "headphones";
+    secondaryOutput.gain = 0.75f;
+    secondaryOutput.volume = 0.55f;
+    secondaryOutput.muted = true;
+    ChannelConfig tertiaryOutput;
+    tertiaryOutput.label = "Recorder";
+    tertiaryOutput.deviceId = L"tertiary-id";
+    tertiaryOutput.deviceNameMatch = L"Tertiary Device";
+    tertiaryOutput.icon = "wave";
+    multipleOutputs.additionalOutputs = {secondaryOutput, tertiaryOutput};
+
+    const JsonValue multipleJson = multipleOutputs.toJson();
+    const Config multipleCopy = Config::fromJson(JsonValue::parse(multipleJson.dump()));
+    check(multipleCopy.outputCount() == 3 && multipleCopy.outputAt(0).label == "Primary" &&
+              multipleCopy.outputAt(0).deviceId == L"primary-id" &&
+              multipleCopy.outputAt(1).label == "Headphones" &&
+              multipleCopy.outputAt(1).deviceId == L"secondary-id" &&
+              multipleCopy.outputAt(1).icon == "headphones" &&
+              multipleCopy.outputAt(1).gain == 0.75f &&
+              multipleCopy.outputAt(1).volume == 0.55f && multipleCopy.outputAt(1).muted &&
+              multipleCopy.outputAt(2).label == "Recorder" &&
+              multipleCopy.outputAt(2).deviceId == L"tertiary-id",
+          "multiple outputs round-trip in order with independent settings");
+
+    const JsonValue* legacyOutputMirror = multipleJson.find("output");
+    const JsonValue* outputArray = multipleJson.find("outputs");
+    check(legacyOutputMirror && outputArray && outputArray->isArray() &&
+              outputArray->items().size() == 3 &&
+              legacyOutputMirror->dump() == outputArray->items()[0].dump(),
+          "legacy output mirrors the first item in outputs");
+
+    const auto sanitizedOutputs = Config::fromJson(JsonValue::parse(
+        R"({"outputs":[false,{"label":"One","deviceId":"one","deviceName":"First"},{"label":"Duplicate ID","deviceId":"one","deviceName":"Other"},{"label":"Fallback","deviceName":"Fallback Name"},{"label":"Duplicate fallback","deviceName":"Fallback Name"},{},{"label":"Three","deviceId":"three"},{"label":"Four","deviceId":"four"},{"label":"Beyond cap","deviceId":"five"}]})"));
+    check(sanitizedOutputs.outputCount() == kMaxOutputs &&
+              sanitizedOutputs.outputAt(0).label == "One" &&
+              sanitizedOutputs.outputAt(1).label == "Fallback" &&
+              sanitizedOutputs.outputAt(2).label == "Three" &&
+              sanitizedOutputs.outputAt(3).label == "Four",
+          "malformed, empty, and duplicate outputs are skipped and output count is capped");
+
+    const auto malformedOutputsFallback = Config::fromJson(JsonValue::parse(
+        R"({"output":{"label":"Legacy fallback","deviceId":"legacy-fallback"},"outputs":[false,null,"bad"]})"));
+    check(malformedOutputsFallback.outputCount() == 1 &&
+              malformedOutputsFallback.output.label == "Legacy fallback" &&
+              malformedOutputsFallback.output.deviceId == L"legacy-fallback",
+          "an unusable outputs array falls back to the legacy output");
     ChannelConfig app;
     app.kind = SourceKind::Application;
     app.label = "Discord";
@@ -115,6 +196,7 @@ int main() {
     c.sources.push_back(app);
     c.mono = true;
     c.closeToTray = true;
+    c.colorTheme = ColorTheme::System;
     c.output.label = "Stream Output";
     c.output.icon = "screen";
     c.output.gain = 1.75f;
@@ -125,7 +207,9 @@ int main() {
               !copy.sources[3].enabled && copy.sources[3].gain == 4.0f &&
               copy.sources[3].volume == 0.65f,
           "app identity, icon, enabled state, mix gain, and volume persist");
-    check(copy.mono && copy.closeToTray && copy.output.muted, "mix and window preferences persist");
+    check(copy.mono && copy.closeToTray && copy.output.muted &&
+              copy.colorTheme == ColorTheme::System,
+          "mix, window, and theme preferences persist");
     check(copy.output.label == "Stream Output" && copy.output.icon == "screen" &&
               copy.output.gain == 1.75f && copy.output.volume == 0.35f,
           "output name, icon, mix gain, and volume persist");
@@ -152,11 +236,13 @@ int main() {
         Config saved = Config::defaults();
         saved.bufferMillis = 90;
         saved.mono = true;
+        saved.colorTheme = ColorTheme::Light;
         saved.output.label = "Temporary output";
         check(saved.save(path), "save to explicit path");
         bool usedDefaults = true;
         const Config loaded = Config::load(path, &usedDefaults);
         check(!usedDefaults && loaded.bufferMillis == 90 && loaded.mono &&
+                  loaded.colorTheme == ColorTheme::Light &&
                   loaded.output.label == "Temporary output",
               "load from explicit path");
         check(GetFileAttributesW(tmp.c_str()) == INVALID_FILE_ATTRIBUTES,

@@ -149,7 +149,8 @@ bool Renderer::beginFrame() {
 
 bool Renderer::endFrame(bool vsync) {
     ImGui::Render();
-    const float clear[4] = { kColBackground[0], kColBackground[1], kColBackground[2], 1.0f };
+    const ImVec4 background = ImGui::ColorConvertU32ToFloat4(themePalette().background);
+    const float clear[4] = { background.x, background.y, background.z, background.w };
     context_->OMSetRenderTargets(1, &rtv_, nullptr);
     context_->ClearRenderTargetView(rtv_, clear);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

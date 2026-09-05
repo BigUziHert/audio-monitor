@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
     // still receives everything.
     log::setEcho(false);
 
-    std::vector<MeterBallistics> ball(cfg.sources.size() + 1);
+    std::vector<MeterBallistics> ball(cfg.sources.size() + cfg.outputCount());
 
     auto last = std::chrono::steady_clock::now();
     while (!g_stop) {
@@ -179,19 +179,24 @@ int main(int argc, char** argv) {
         const float dt = std::chrono::duration<float>(now - last).count();
         last = now;
 
-        const OutputStatus os = engine.outputStatus();
-
         clearScreen();
         std::printf("audio-monitor  --  Ctrl+C to stop\n\n");
-        std::printf("OUTPUT  %-8s %s  %u Hz  %u frames  underruns=%llu\n",
-                    stateName(os.state), os.exclusive ? "exclusive" : "shared   ",
-                    os.sampleRate, os.blockFrames,
-                    static_cast<unsigned long long>(os.underruns));
-        std::printf("        %s\n",
-                    os.deviceName.empty() ? "(unresolved)" : u8(os.deviceName).c_str());
-        if (!os.error.empty() && os.state != StreamState::Running) {
-            std::printf("        last error: %s\n", os.error.c_str());
+        for (size_t output = 0; output < cfg.outputCount(); ++output) {
+            const OutputStatus os = engine.outputStatus(output);
+            std::printf("OUTPUT %zu  %-8s %s  %u Hz  %u frames  underruns=%llu  dropped=%llu\n",
+                        output + 1, stateName(os.state),
+                        os.exclusive ? "exclusive" : "shared   ",
+                        os.sampleRate, os.blockFrames,
+                        static_cast<unsigned long long>(os.underruns),
+                        static_cast<unsigned long long>(os.dropped));
+            std::printf("          %s\n",
+                        os.deviceName.empty() ? "(unresolved)" : u8(os.deviceName).c_str());
+            if (!os.error.empty() && os.state != StreamState::Running)
+                std::printf("          last error: %s\n", os.error.c_str());
         }
+        if (engine.mixPumpMissedPeriods() != 0)
+            std::printf("MIX PUMP  missed periods=%llu\n",
+                        static_cast<unsigned long long>(engine.mixPumpMissedPeriods()));
         std::printf("\n");
 
         for (int i = 0; i < static_cast<int>(cfg.sources.size()); ++i) {
@@ -212,11 +217,14 @@ int main(int argc, char** argv) {
             }
         }
 
-        ball[cfg.sources.size()].update(std::max(engine.outputPeak().l.take(),
-                                            engine.outputPeak().r.take()), dt);
-        std::printf("\nMIX  ");
-        printMeterBar(ball[cfg.sources.size()].levelDb());
-        std::printf(" %6.1f dB\n", ball[cfg.sources.size()].levelDb());
+        for (size_t output = 0; output < cfg.outputCount(); ++output) {
+            auto &meter = ball[cfg.sources.size() + output];
+            meter.update(std::max(engine.outputPeak(output).l.take(),
+                                  engine.outputPeak(output).r.take()), dt);
+            std::printf("\nMIX %zu  ", output + 1);
+            printMeterBar(meter.levelDb());
+            std::printf(" %6.1f dB\n", meter.levelDb());
+        }
     }
 
     std::printf("\nstopping...\n");

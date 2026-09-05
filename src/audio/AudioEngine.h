@@ -2,11 +2,11 @@
 //
 // The mixer.
 //
-// Topology: one capture thread per enabled source, each writing its own SPSC
-// ring, and one render thread that resamples them onto the render clock,
-// sums, and writes the Elgato. A supervisor thread handles every device
-// rebuild so neither the render thread nor a COM notification callback ever
-// does that work.
+// Topology: one capture thread per enabled source writes one SPSC ring. A
+// fixed-48 kHz pump is their sole consumer, mixes once, and fans the result to
+// one SPSC OutputBus per destination. Each output has its own render thread and
+// drift resampler, so several playback devices can run at independent clocks
+// without reading a capture ring more than once. A supervisor handles rebuilds.
 //
 // The alternative -- draining the captures on the render thread -- was
 // rejected: a single stalled capture device would then stall the output.
@@ -15,6 +15,8 @@
 //
 #include "audio/CaptureStream.h"
 #include "audio/RenderStream.h"
+#include "audio/OutputBus.h"
+#include "audio/MixPumpScheduler.h"
 #include "audio/RateController.h"
 #include "audio/Resampler.h"
 #include "audio/Meter.h"
@@ -26,6 +28,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -53,6 +56,8 @@ struct OutputStatus {
     uint32_t     sampleRate  = 0;
     uint32_t     blockFrames = 0;
     uint64_t     underruns   = 0;
+    uint64_t     dropped     = 0; // canonical frames rejected by this output bus
+    uint64_t     pumpMissedPeriods = 0; // global; count once when aggregating outputs
     std::wstring deviceId;
     std::wstring deviceName;
     std::string  error;
@@ -63,15 +68,24 @@ public:
     AudioEngine();
     ~AudioEngine() override;
 
-    bool start(const Config& config);
+    bool start(const Config& config, bool monitoring = true);
     void stop();
+
+    // Capture and source meters stay alive while forwarding is paused. This
+    // request never joins a worker: the supervisor owns output transitions.
+    void setMonitoring(bool enabled);
+    bool monitoring() const noexcept {
+        return running() && (monitoringState_.load(std::memory_order_acquire) & 1u) != 0;
+    }
 
     // Applied live from the UI thread; picked up by the audio thread on its
     // next block. Gain is linear, 0..4 mapping is the caller's business.
     void setGain(int channel, float linearGain) noexcept;
     void setMuted(int channel, bool muted) noexcept;
-    void setOutputGain(float linearGain) noexcept;
-    void setOutputMuted(bool muted) { outputMuted_.store(muted, std::memory_order_relaxed); }
+    void setOutputGain(size_t output, float linearGain) noexcept;
+    void setOutputMuted(size_t output, bool muted) noexcept;
+    void setOutputGain(float linearGain) noexcept { setOutputGain(0, linearGain); }
+    void setOutputMuted(bool muted) noexcept { setOutputMuted(0, muted); }
     void setEnabled(int channel, bool enabled);
     void setMono(bool mono) { mono_.store(mono, std::memory_order_relaxed); }
     bool running() const { return running_.load(std::memory_order_acquire); }
@@ -93,9 +107,15 @@ public:
 
     // UI polling. Reads atomics only; never blocks the audio path.
     StereoPeak&   channelPeak(int channel) noexcept { return channels_[channel]->peak; }
-    StereoPeak&   outputPeak() noexcept { return outputPeak_; }
+    StereoPeak&   outputPeak(size_t output = 0) noexcept {
+        return outputPeaks_[output < kMaxOutputs ? output : 0];
+    }
     ChannelStatus channelStatus(int channel) const;
-    OutputStatus  outputStatus() const;
+    OutputStatus  outputStatus(size_t output = 0) const;
+    size_t        outputCount() const noexcept { return outputCount_; }
+    uint64_t      mixPumpMissedPeriods() const noexcept {
+        return mixPumpMissedPeriods_.load(std::memory_order_relaxed);
+    }
 
     // Writes back any device IDs that were re-resolved by name, so a driver
     // reinstall is persisted rather than re-matched every launch.
@@ -108,13 +128,24 @@ public:
     // stream. channel < 0 means the output. Runs on the calling (UI) thread
     // only far enough to hand the work to the stream's own worker.
     void setChannelDevice(int channel, const DeviceRef& ref);
+    void setOutputDevice(size_t output, const DeviceRef& ref);
 
-    // --- IMixSource, called on the render thread ---
+    // Canonical mixer entry points. The fixed-rate pump calls renderMix;
+    // start() configures its fixed format before any audio worker begins.
     void renderMix(float* dst, uint32_t frames) noexcept override;
     void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept override;
 
 private:
     friend struct AudioEngineTestAccess;
+    class OutputGate final : public IMixSource {
+    public:
+        OutputGate(AudioEngine& engine, size_t output) : engine_(engine), output_(output) {}
+        void renderMix(float* dst, uint32_t frames) noexcept override;
+        void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept override;
+    private:
+        AudioEngine& engine_;
+        size_t output_;
+    };
     struct Channel {
         CaptureStream  stream;
         DriftResampler resampler;
@@ -144,37 +175,60 @@ private:
     };
 
     void supervisorMain();
+    void mixPumpMain();
+    void pumpBlock() noexcept;
+    bool synchronizeOutputs(uint64_t state);
+    void handleMixPumpDiscontinuity(uint64_t missedPeriods) noexcept;
     void requestRebuild();
+    void stopLocked(); // lifecycleMutex_ is held
 
     std::array<std::unique_ptr<Channel>, kMaxSources> channels_;
-    RenderStream  render_;
+    std::array<std::unique_ptr<RenderStream>, kMaxOutputs> renders_;
+    std::array<std::unique_ptr<OutputBus>, kMaxOutputs> outputBuses_;
+    std::array<std::unique_ptr<OutputGate>, kMaxOutputs> outputGates_;
     DeviceManager devices_;
-    StereoPeak    outputPeak_;
+    std::array<StereoPeak, kMaxOutputs> outputPeaks_;
 
     size_t sourceCount_ = 0; // changed only while every worker is stopped
+    size_t outputCount_ = 1; // changed only while every worker is stopped
     StereoRing visualSamples_;
     MixMode mixMode_;
-    std::atomic<bool> mono_{false}, outputMuted_{false};
-    std::atomic<float> outputGain_{1.0f};
-    float              smoothedOutputGain_ = 1.0f;
+    std::atomic<bool> mono_{false};
+    std::array<std::atomic<bool>, kMaxOutputs> outputMuted_{};
+    std::array<std::atomic<float>, kMaxOutputs> outputGains_{};
+    std::array<float, kMaxOutputs> smoothedOutputGains_{};
+    std::vector<float> mixPumpBuffer_;
+    std::array<std::vector<float>, kMaxOutputs> outputScratch_;
 
     Config             config_;
     mutable std::mutex configMutex_;
+    // Serializes complete start/stop transitions. Public UI calls are normally
+    // single-threaded, but this also makes teardown safe under lifecycle tests
+    // and prevents a concurrent stop from racing partially-created workers.
+    std::mutex          lifecycleMutex_;
 
     std::thread             supervisor_;
+    std::thread             mixPump_;
     std::mutex              superMutex_;
     std::condition_variable superCv_;
+    MixPumpScheduler        mixPumpScheduler_;
     bool                    superWake_ = false;
+    bool                    monitoringWake_ = false;
     std::atomic<bool>       quit_{false};
     std::atomic<bool>       running_{false};
+    // The low bit is requested forwarding; the other bits identify a unique
+    // transition, including off/on clicks that happen within one pump block.
+    std::atomic<uint64_t>   monitoringState_{0};
+    std::atomic<uint64_t>   pumpObservedState_{0};
+    std::array<std::atomic<uint64_t>, kMaxOutputs> outputReadyState_{};
+    std::atomic<uint64_t>   mixPumpMissedPeriods_{0};
 
     std::atomic<uint32_t> renderRate_{0};
     std::atomic<uint32_t> renderBlock_{0};
 
     // Held as an atomic rather than read from config_ under configMutex_:
-    // onRenderFormat runs on the render thread, and taking a lock there is
-    // both a real-time hazard and -- because a UI-thread device change joins
-    // that same thread -- a deadlock waiting to happen.
+    // renderMix runs on the pump thread, so taking configMutex_ there would be
+    // a real-time hazard. Keep the live setpoint atomic instead.
     std::atomic<uint32_t> bufferMillis_{50};
 };
 

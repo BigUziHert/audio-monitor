@@ -80,6 +80,8 @@ add_library(audiomon_core STATIC
   src/audio/DeviceManager.cpp
   src/audio/CaptureStream.cpp
   src/audio/RenderStream.cpp
+  src/audio/OutputBus.cpp
+  src/audio/MixPumpScheduler.cpp
   src/audio/AudioEngine.cpp
   src/audio/SampleFormat.cpp
   src/audio/WaveFormat.cpp

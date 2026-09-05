@@ -9,6 +9,8 @@ namespace audiomon::ui {
 class MixerWindow {
   public:
     void init(AudioEngine *engine, Config *config, void *window);
+    void setVisible(bool visible);
+    void shutdown();
     bool draw(float dt, int width, int height);
     bool hitTitleBar(int x, int y, int width, int height) const;
     bool exitRequested() const {
@@ -18,6 +20,7 @@ class MixerWindow {
   private:
     friend struct MixerWindowTestAccess;
     void refreshDevices();
+    void syncMeteringVisibility();
     void refreshStatus(float dt);
     bool updateDropoutTimer(StreamState outputState, uint64_t underruns, uint64_t dropped,
                             float dt);
@@ -32,6 +35,10 @@ class MixerWindow {
     Config *config_ = nullptr;
     void *window_ = nullptr;
     std::array<MeterBallistics, kMaxSources> meters_;
+    // Source capture and its meter stay on one continuous timeline while the
+    // dashboard is visible. Start/Stop changes output forwarding only.
+    bool visible_ = false;
+    bool meteringStartAttempted_ = false;
     MeterBallistics outputMeter_;
     Spectrum spectrum_;
     std::vector<DeviceInfo> playback_, microphones_;
@@ -48,6 +55,8 @@ class MixerWindow {
     bool settingsRestoreAll_ = false;
     Config settingsDraft_;
     int editSource_ = -1;
+    size_t selectedOutput_ = 0;
+    int editOutput_ = 0; // -1 while adding a destination
     ChannelConfig draft_;
     ChannelConfig outputDraft_;
     char name_[128]{};

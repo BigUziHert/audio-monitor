@@ -1,6 +1,8 @@
+#include "audio/AudioEngine.h"
 #include "audio/CaptureStream.h"
 #include "audio/DeviceManager.h"
 #include "audio/RenderStream.h"
+#include "config/Config.h"
 
 #include <algorithm>
 #include <atomic>
@@ -64,7 +66,44 @@ int main() {
         ++failures;
     }
 
-    std::printf("Concurrent stream lifecycle test: %s\n",
+    // AudioEngine owns several subordinate workers and its scheduler handles.
+    // Hammer complete transitions from two MTA callers to ensure one stop can
+    // never tear down resources underneath a partially-created start.
+    {
+        AudioEngine engine;
+        Config config;
+        config.sources.clear();
+        config.output = ChannelConfig{}; // resolves quickly without opening hardware
+        config.additionalOutputs.clear();
+        config.exclusiveOutput = false;
+
+        std::atomic<bool> engineBegin{false};
+        const auto hammerEngine = [&](int offset) {
+            const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            while (!engineBegin.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            for (int i = 0; i < 100; ++i) {
+                if (((i + offset) & 1) == 0)
+                    engine.start(config);
+                else
+                    engine.stop();
+            }
+            if (SUCCEEDED(coHr)) CoUninitialize();
+        };
+
+        std::thread firstEngine(hammerEngine, 0);
+        std::thread secondEngine(hammerEngine, 1);
+        engineBegin.store(true, std::memory_order_release);
+        firstEngine.join();
+        secondEngine.join();
+        engine.stop();
+        if (engine.running()) {
+            std::printf("AudioEngine was still Running after concurrent lifecycle stress\n");
+            ++failures;
+        }
+    }
+
+    std::printf("Concurrent stream/engine lifecycle test: %s\n",
                 failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;
 }

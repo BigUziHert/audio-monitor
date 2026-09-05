@@ -10,6 +10,22 @@
 #include <cstring>
 using namespace audiomon;
 
+namespace audiomon {
+// Supply a running meter session without opening hardware or worker threads.
+// The UI still consumes the engine's real peak hand-off and toggle API.
+struct AudioEngineTestAccess {
+    static void prepareMeterSession(AudioEngine &engine, const Config &config) {
+        engine.config_ = config;
+        engine.sourceCount_ = config.sources.size();
+        engine.running_.store(true);
+        engine.monitoringState_.store(2u);
+    }
+    static void setMonitoringState(AudioEngine &engine, bool monitoring) {
+        engine.monitoringState_.store(monitoring ? 3u : 2u);
+    }
+};
+} // namespace audiomon
+
 namespace audiomon::ui {
 struct MixerWindowTestAccess {
     static void resetDropoutState(MixerWindow &mixer) {
@@ -38,6 +54,31 @@ struct MixerWindowTestAccess {
         mixer.draft_.deviceId = L"test-device-id";
         mixer.draft_.deviceNameMatch = L"Test Device";
     }
+    static int settingsPage(const MixerWindow &mixer) {
+        return mixer.settingsPage_;
+    }
+    static void setPlaybackDevices(MixerWindow &mixer,
+                                   const std::vector<DeviceInfo> &devices) {
+        mixer.playback_ = devices;
+    }
+    static const ChannelConfig &outputDraft(const MixerWindow &mixer) {
+        return mixer.outputDraft_;
+    }
+    static void setOutputDraftDevice(MixerWindow &mixer, const std::wstring &id,
+                                     const std::wstring &name) {
+        mixer.outputDraft_.deviceId = id;
+        mixer.outputDraft_.deviceNameMatch = name;
+    }
+    static size_t selectedOutput(const MixerWindow &mixer) {
+        return mixer.selectedOutput_;
+    }
+    static void setSelectedOutput(MixerWindow &mixer, size_t output) {
+        mixer.selectedOutput_ = output;
+    }
+    static float sourceMeterLevelDb(const MixerWindow &mixer, size_t source) {
+        return mixer.meters_.at(source).levelDb();
+    }
+    static void resetSourceMeters(MixerWindow &mixer) { mixer.meters_ = {}; }
 };
 } // namespace audiomon::ui
 
@@ -86,6 +127,54 @@ int main() {
             }
         };
 
+        // Paused and forwarding source cards must consume the same engine
+        // peaks with identical attack/release. No hardware is opened here.
+        AudioEngineTestAccess::prepareMeterSession(engine, config);
+        mixer.setVisible(true);
+        for (bool monitoring : {false, true}) {
+            AudioEngineTestAccess::setMonitoringState(engine, monitoring);
+            ui::MixerWindowTestAccess::resetSourceMeters(mixer);
+            MeterBallistics expectedMeter;
+            for (float peak : {.02f, .2f, .8f, .4f, 0.f, 0.f}) {
+                engine.channelPeak(0).l.publish(peak * .75f);
+                engine.channelPeak(0).r.publish(peak);
+                expectedMeter.update(peak, 1.f / 60.f);
+                frame(1600, 986);
+                expect(std::abs(ui::MixerWindowTestAccess::sourceMeterLevelDb(mixer, 0) -
+                                expectedMeter.levelDb()) < .001f,
+                       "Source meter response differed between paused and forwarding audio");
+            }
+        }
+
+        // Exercise the actual Start/Stop Monitoring button, including its
+        // release frame: a reset there visibly freezes or blanks the meter.
+        AudioEngineTestAccess::setMonitoringState(engine, false);
+        ui::MixerWindowTestAccess::resetSourceMeters(mixer);
+        MeterBallistics continuousMeter;
+        auto meterFrame = [&](float peak) {
+            engine.channelPeak(0).l.publish(peak);
+            continuousMeter.update(peak, 1.f / 60.f);
+            frame(1600, 986);
+            expect(std::abs(ui::MixerWindowTestAccess::sourceMeterLevelDb(mixer, 0) -
+                            continuousMeter.levelDb()) < .001f,
+                   "Toggling monitoring reset or interrupted the source meter ballistics");
+        };
+        meterFrame(.8f);
+        io.AddMousePosEvent(1000, 900);
+        meterFrame(0.f);
+        for (bool monitoring : {true, false}) {
+            io.AddMouseButtonEvent(0, true);
+            meterFrame(0.f);
+            io.AddMouseButtonEvent(0, false);
+            meterFrame(0.f);
+            expect(engine.running() && engine.monitoring() == monitoring,
+                   "Monitoring toggle stopped the shared capture session");
+        }
+        mixer.setVisible(false);
+        expect(!engine.running() && !engine.monitoring(),
+               "Hiding the paused dashboard left its capture session running");
+        ui::MixerWindowTestAccess::resetSourceMeters(mixer);
+
         ui::MixerWindowTestAccess::resetDropoutState(mixer);
         ui::MixerWindowTestAccess::refreshDropoutStatus(
             mixer, StreamState::Stopped, 0, 1);
@@ -129,8 +218,13 @@ int main() {
             const float scale = std::min(size.x / 1600.f, size.y / 986.f);
             expect(mixer.hitTitleBar(int(700 * scale), int(50 * scale), int(size.x), int(size.y)),
                    "Title bar does not route dragging to Windows");
-            expect(!mixer.hitTitleBar(int(size.x - 140 * scale), int(50 * scale), int(size.x), int(size.y)),
-                   "Title bar overlaps window buttons");
+            expect(mixer.hitTitleBar(int(size.x - 205 * scale), int(50 * scale),
+                                    int(size.x), int(size.y)),
+                   "Compact window controls left an unnecessary gap in the draggable title bar");
+            for (int button = 0; button < 3; ++button)
+                expect(!mixer.hitTitleBar(int(size.x - (163 - button * 56) * scale),
+                                         int(53 * scale), int(size.x), int(size.y)),
+                       "Title bar overlaps a window button");
             expect(!mixer.hitTitleBar(int(700 * scale), int(150 * scale), int(size.x), int(size.y)),
                    "Title bar overlaps dashboard controls");
             bool found = false;
@@ -157,6 +251,17 @@ int main() {
         };
         frame(1600, 986);
 
+        auto typePercent = [&](float x, float y, const char *value) {
+            click(x, y);
+            io.AddInputCharactersUTF8(value);
+            frame(1600, 986);
+            io.AddKeyEvent(ImGuiKey_Enter, true);
+            frame(1600, 986);
+            io.AddKeyEvent(ImGuiKey_Enter, false);
+            frame(1600, 986);
+            ImGui::ClearActiveID();
+        };
+
         io.AddMousePosEvent(452, 153);
         frame(1600, 986);
         bool foundPaddedTooltip = false;
@@ -167,6 +272,15 @@ int main() {
                        "Dashboard tooltip inherited zero root-window padding");
             }
         expect(foundPaddedTooltip, "Refresh tooltip did not appear");
+        expect(ImGui::GetMouseCursor() == ImGuiMouseCursor_Hand,
+               "Clickable dashboard control did not show a hand cursor on hover");
+        bool foundHoverOutline = false;
+        if (auto *dashboard = ImGui::FindWindowByName("Audio Monitor dashboard"))
+            for (const ImDrawVert &vertex : dashboard->DrawList->VtxBuffer)
+                foundHoverOutline |= vertex.col == ui::themePalette().hoverOutline &&
+                                     vertex.pos.x >= 425 && vertex.pos.x <= 479 &&
+                                     vertex.pos.y >= 125 && vertex.pos.y <= 180;
+        expect(foundHoverOutline, "Clickable dashboard control had no visual hover outline");
 
         auto holdVolumeSlider = [&](float x, float y, float &volume, float expectedVolume) {
             io.AddMousePosEvent(x, y);
@@ -187,6 +301,27 @@ int main() {
         };
         holdVolumeSlider(1030, 785, config.output.volume, .5f);
         holdVolumeSlider(260, 365, config.sources[0].volume, .5f);
+        config.sources[0].gain = 2.f;
+        click(435, 365); // Editable percentage at the right of the first device fader.
+        io.AddInputCharactersUTF8("37");
+        frame(1600, 986);
+        io.AddKeyEvent(ImGuiKey_Enter, true);
+        frame(1600, 986);
+        io.AddKeyEvent(ImGuiKey_Enter, false);
+        frame(1600, 986);
+        expect(std::abs(config.sources[0].volume - .37f) < .001f,
+               "Typed device volume percentage was not applied");
+        expect(config.sources[0].gain == 2.f,
+               "Typing device volume changed its configured mix gain");
+        config.output.gain = 2.f;
+        typePercent(1485, 785, "43");
+        expect(std::abs(config.output.volume - .43f) < .001f && config.output.gain == 2.f,
+               "Typed primary output percentage did not update its independent volume");
+        expect(std::abs(config.sources[0].volume - .37f) < .001f,
+               "Editing output volume changed the source volume");
+        ImGui::ClearActiveID();
+        config.output.gain = 1.f;
+        config.sources[0].gain = 1.f;
         config.output.volume = config.sources[0].volume = 1.f;
         const auto originalBuffer = config.bufferMillis;
         click(650, 488); // Sample Rate opens the Audio settings page.
@@ -227,6 +362,13 @@ int main() {
         expect(popup() != nullptr, "Settings blocked after adjusting volume");
         expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from a modal");
         if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 80,
+                  dialog->DC.CursorStartPos.y + 291); // Keybinds navigation row.
+            expect(ui::MixerWindowTestAccess::settingsPage(mixer) == 3,
+                   "Keybinds settings category did not open");
+            dialog = popup();
+            click(dialog->DC.CursorStartPos.x + 80,
+                  dialog->DC.CursorStartPos.y + 117); // Return to General.
             click(dialog->DC.CursorStartPos.x + 220, dialog->DC.CursorStartPos.y + 231); // Start hidden
             expect(!config.startMinimized, "Settings draft applied before Save");
             click(dialog->DC.CursorStartPos.x + 453, dialog->DC.CursorStartPos.y + 716); // Cancel
@@ -372,6 +514,194 @@ int main() {
         expect(config.output.gain == 4.f,
                "Master volume changed the configured output mix gain");
 
+        const std::vector<DeviceInfo> outputFixtures{
+            // Saved defaults use a friendly-name substring; enumeration adds
+            // the endpoint ID and returns the device's full friendly name.
+            {L"primary-endpoint", L"Elgato 4K Pro Capture Device", true, true},
+            {L"secondary-endpoint", L"Studio Speakers", true, false},
+            {L"third-endpoint", L"Monitor Speakers", true, false},
+        };
+        auto injectOutputFixtures = [&] {
+            // Opening an output dialog refreshes real endpoints first. Inject
+            // only after it is open so the picker remains deterministic here.
+            ui::MixerWindowTestAccess::setPlaybackDevices(mixer, outputFixtures);
+            frame(1600, 986);
+        };
+        auto chooseOutputFixture = [&](size_t fixtureIndex) {
+            auto *dialog = popup();
+            expect(dialog && std::strcmp(dialog->Name, "Configure output") == 0,
+                   "Output picker had no parent dialog");
+            if (!dialog)
+                return;
+            click(dialog->DC.CursorStartPos.x + 250,
+                  dialog->DC.CursorStartPos.y + 152);
+            auto *picker = popup();
+            expect(picker && picker != dialog, "Output device combo did not open");
+            if (!picker || picker == dialog)
+                return;
+            const float rowStep = ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y;
+            click(picker->DC.CursorStartPos.x + 30,
+                  picker->DC.CursorStartPos.y + ImGui::GetTextLineHeight() * .5f +
+                      rowStep * float(fixtureIndex));
+        };
+        auto pressEscape = [&] {
+            io.AddKeyEvent(ImGuiKey_Escape, true);
+            frame(1600, 986);
+            io.AddKeyEvent(ImGuiKey_Escape, false);
+            frame(1600, 986);
+        };
+        auto sameChannel = [](const ChannelConfig &a, const ChannelConfig &b) {
+            return a.label == b.label && a.kind == b.kind && a.enabled == b.enabled &&
+                   a.processPath == b.processPath && a.deviceId == b.deviceId &&
+                   a.deviceNameMatch == b.deviceNameMatch && a.icon == b.icon &&
+                   a.gain == b.gain && a.volume == b.volume && a.muted == b.muted;
+        };
+
+        click(1480, 618); // Add Output.
+        expect(popup() && std::strcmp(popup()->Name, "Configure output") == 0,
+               "Add Output did not open the output dialog");
+        injectOutputFixtures();
+        chooseOutputFixture(1); // A second, distinct playback endpoint.
+        expect(ui::MixerWindowTestAccess::outputDraft(mixer).deviceId == L"secondary-endpoint",
+               "Output picker did not select the distinct second endpoint");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 634,
+                  dialog->DC.CursorStartPos.y + 634); // Add Output.
+        expect(!popup() && config.outputCount() == 2 &&
+                   config.additionalOutputs[0].deviceId == L"secondary-endpoint",
+               "Adding a second distinct output did not commit it");
+        expect(ui::MixerWindowTestAccess::selectedOutput(mixer) == 1,
+               "Newly added output was not selected on the dashboard");
+
+        click(1282, 618); // Previous output.
+        expect(ui::MixerWindowTestAccess::selectedOutput(mixer) == 0,
+               "Previous Output did not select the primary output");
+        click(1387, 618); // Next output.
+        expect(ui::MixerWindowTestAccess::selectedOutput(mixer) == 1,
+               "Next Output did not return to the second output");
+
+        const ChannelConfig primaryBeforePercentEdit = config.output;
+        const float sourceVolumeBeforeOutputEdit = config.sources[0].volume;
+        const float secondaryMixGain = config.additionalOutputs[0].gain;
+        typePercent(1485, 785, "135");
+        expect(config.additionalOutputs[0].volume == 1.f,
+               "Output percentage accepted a volume above 100%");
+        typePercent(1485, 785, "-12");
+        expect(config.additionalOutputs[0].volume == 0.f,
+               "Output percentage accepted a negative volume");
+        typePercent(1485, 785, "64");
+        expect(std::abs(config.additionalOutputs[0].volume - .64f) < .001f &&
+                   config.additionalOutputs[0].gain == secondaryMixGain,
+               "Typed secondary output percentage did not preserve its mix gain");
+        expect(sameChannel(config.output, primaryBeforePercentEdit) &&
+                   config.sources[0].volume == sourceVolumeBeforeOutputEdit,
+               "Editing the second output percentage changed another channel");
+
+        // Leave its percentage focused, then navigate between outputs. The
+        // input buffer must not transfer a value to a different destination.
+        click(1485, 785);
+        io.AddInputCharactersUTF8("57");
+        frame(1600, 986);
+        click(1282, 618); // Previous output while its sibling field is active.
+        expect(sameChannel(config.output, primaryBeforePercentEdit),
+               "Output navigation applied the previous percentage edit to the next device");
+        click(1387, 618);
+        expect(std::abs(config.additionalOutputs[0].volume - .57f) < .001f,
+               "Output navigation lost the selected output's percentage edit");
+
+        const ChannelConfig primaryBeforeSecondaryEdit = config.output;
+        click(1514, 702); // Configure the selected second output.
+        injectOutputFixtures();
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 400,
+                  dialog->DC.CursorStartPos.y + 340); // Display Name.
+            io.AddInputCharactersUTF8("Secondary Output");
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 634,
+                  dialog->DC.CursorStartPos.y + 634); // Save.
+        }
+        expect(!popup() && config.outputCount() == 2 &&
+                   config.additionalOutputs[0].label == "Secondary Output",
+               "Editing the second output did not commit to that output");
+        expect(sameChannel(config.output, primaryBeforeSecondaryEdit),
+               "Editing the second output mutated the primary output");
+
+        // Simulate a saved endpoint ID that became stale after a driver
+        // reinstall. Its friendly-name fallback still resolves to fixture 0,
+        // which must not be addable as a second copy of the same endpoint.
+        config.output.deviceId = L"stale-primary-endpoint";
+        click(1480, 618); // Begin adding a third output.
+        injectOutputFixtures();
+        chooseOutputFixture(0); // The primary endpoint is already in use.
+        const bool duplicatePickerDisabled =
+            ui::MixerWindowTestAccess::outputDraft(mixer).deviceId.empty() &&
+            ui::MixerWindowTestAccess::outputDraft(mixer).deviceNameMatch.empty() &&
+            config.outputCount() == 2 && popup() &&
+            std::strcmp(popup()->Name, "Configure output") != 0;
+        expect(duplicatePickerDisabled,
+               "Duplicate output endpoint was not disabled in the picker");
+        bool foundDuplicateTooltip = false;
+        for (auto *window : ImGui::GetCurrentContext()->Windows)
+            foundDuplicateTooltip |= window->Active &&
+                                     (window->Flags & ImGuiWindowFlags_Tooltip);
+        expect(!duplicatePickerDisabled || foundDuplicateTooltip,
+               "Disabled duplicate output had no explanatory tooltip");
+        if (duplicatePickerDisabled)
+            pressEscape(); // Close only the combo popup.
+        ui::MixerWindowTestAccess::setOutputDraftDevice(
+            mixer, L"primary-endpoint", L"Elgato 4K Pro Capture Device");
+        frame(1600, 986);
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 634,
+                  dialog->DC.CursorStartPos.y + 634); // Disabled Add Output.
+        const bool duplicateSaveRejected =
+            popup() && std::strcmp(popup()->Name, "Configure output") == 0 &&
+            config.outputCount() == 2;
+        expect(duplicateSaveRejected,
+               "Duplicate output endpoint bypassed dialog validation");
+        if (duplicateSaveRejected) {
+            auto *dialog = popup();
+            click(dialog->DC.CursorStartPos.x + 458,
+                  dialog->DC.CursorStartPos.y + 634); // Cancel.
+        } else {
+            // Keep the remaining checks independent if duplicate validation
+            // regresses and the invalid third destination was committed.
+            config.additionalOutputs.resize(1);
+            ui::MixerWindowTestAccess::setSelectedOutput(mixer, 1);
+            frame(1600, 986);
+        }
+        config.output.deviceId = primaryBeforeSecondaryEdit.deviceId;
+
+        click(1514, 702); // Configure the still-selected second output.
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 82,
+                  dialog->DC.CursorStartPos.y + 634); // Remove.
+        expect(!popup() && config.outputCount() == 1 &&
+                   sameChannel(config.output, primaryBeforeSecondaryEdit),
+               "Removing the second output did not leave the primary intact");
+        expect(ui::MixerWindowTestAccess::selectedOutput(mixer) == 0,
+               "Removing the selected output left an invalid selection");
+
+        for (int i = 0; i < kMaxOutputs - 1; ++i) {
+            ChannelConfig extra;
+            extra.deviceId = L"limit-endpoint-" + std::to_wstring(i);
+            extra.deviceNameMatch = L"Limit Output " + std::to_wstring(i);
+            config.additionalOutputs.push_back(std::move(extra));
+        }
+        frame(1600, 986);
+        click(1480, 618); // Output Limit at four configured destinations.
+        expect(config.outputCount() == kMaxOutputs &&
+                   config.additionalOutputs.size() == size_t(kMaxOutputs - 1),
+               "Output-limit interaction changed the configured output count");
+        auto *dashboard = ImGui::FindWindowByName("Audio Monitor dashboard");
+        const auto &popupStack = ImGui::GetCurrentContext()->OpenPopupStack;
+        expect(dashboard && !popupStack.empty() &&
+                   popupStack.back().PopupId == dashboard->GetID("Output limit"),
+               "Output-limit interaction did not open its limit notice");
+        pressEscape();
+        config.additionalOutputs.clear();
+        frame(1600, 986);
+
         config.sources[0].volume = 1.f;
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
@@ -481,7 +811,11 @@ int main() {
             if (!dashboard)
                 return;
             ImGui::SetNavWindow(dashboard);
-            ImGui::SetNavID(dashboard->GetID(label), ImGuiNavLayer_Main,
+            const ImGuiID itemId = std::strcmp(label, "##master-volume") == 0
+                                      ? ImHashStr(label, 0, dashboard->GetID(
+                                            static_cast<int>(ui::MixerWindowTestAccess::selectedOutput(mixer))))
+                                      : dashboard->GetID(label);
+            ImGui::SetNavID(itemId, ImGuiNavLayer_Main,
                             dashboard->NavRootFocusScopeId, ImRect());
             ImGui::GetCurrentContext()->NavCursorVisible = true;
             frame(1600, 986);
@@ -549,6 +883,33 @@ int main() {
         pressKey(ImGuiKey_Escape);
         expect(!popup(), "Escape did not close the Source limit popup");
         config.sources = savedSources;
+
+        const ImU32 darkBackground = ui::themePalette().background;
+        click(670, 900); // Settings, General.
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 316,
+                  dialog->DC.CursorStartPos.y + 633); // Light theme.
+            expect(config.colorTheme == ColorTheme::Dark,
+                   "Theme draft applied before Save");
+            dialog = popup();
+            click(dialog->DC.CursorStartPos.x + 633,
+                  dialog->DC.CursorStartPos.y + 716); // Save.
+        }
+        frame(1600, 986);
+        expect(config.colorTheme == ColorTheme::Light &&
+                   ui::themePalette().background != darkBackground,
+               "Light theme was not committed and applied");
+
+        click(670, 900); // Reopen General settings.
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 426,
+                  dialog->DC.CursorStartPos.y + 633); // System theme.
+            dialog = popup();
+            click(dialog->DC.CursorStartPos.x + 633,
+                  dialog->DC.CursorStartPos.y + 716); // Save.
+        }
+        expect(config.colorTheme == ColorTheme::System,
+               "System theme choice was not committed");
 
         ImGui::DestroyContext();
     }

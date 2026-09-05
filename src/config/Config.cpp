@@ -5,13 +5,49 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <algorithm>
+#include <climits>
 #include <cstdio>
+#include <iterator>
 #include <vector>
 
 namespace audiomon {
 namespace {
 
-constexpr int kConfigVersion = 3;
+constexpr int kConfigVersion = 5;
+
+const char* colorThemeName(ColorTheme theme) noexcept {
+    switch (theme) {
+    case ColorTheme::Light:  return "light";
+    case ColorTheme::System: return "system";
+    case ColorTheme::Dark:   return "dark";
+    }
+    return "dark";
+}
+
+ColorTheme colorThemeFromJson(const JsonValue* value) {
+    if (!value) return ColorTheme::Dark;
+    const std::string name = value->asString("");
+    if (name == "light") return ColorTheme::Light;
+    if (name == "system") return ColorTheme::System;
+    return ColorTheme::Dark;
+}
+
+bool equalInsensitive(const std::wstring& a, const std::wstring& b) noexcept {
+    if (a.size() != b.size() || a.size() > size_t(INT_MAX)) return false;
+    return CompareStringOrdinal(a.data(), static_cast<int>(a.size()), b.data(),
+                                static_cast<int>(b.size()), TRUE) == CSTR_EQUAL;
+}
+
+bool containsInsensitive(const std::wstring& text, const std::wstring& part) noexcept {
+    if (part.empty() || part.size() > text.size() || part.size() > size_t(INT_MAX))
+        return false;
+    for (size_t offset = 0; offset + part.size() <= text.size(); ++offset)
+        if (CompareStringOrdinal(text.data() + offset, static_cast<int>(part.size()),
+                                 part.data(), static_cast<int>(part.size()), TRUE) == CSTR_EQUAL)
+            return true;
+    return false;
+}
 
 JsonValue channelToJson(const ChannelConfig& c) {
     JsonValue v = JsonValue::object();
@@ -122,6 +158,15 @@ void removeTempFile(const std::wstring& path) {
 
 } // namespace
 
+bool sameEndpointSelection(const ChannelConfig& a, const ChannelConfig& b) noexcept {
+    if (!a.deviceId.empty() && !b.deviceId.empty())
+        return equalInsensitive(a.deviceId, b.deviceId);
+    if (a.deviceNameMatch.empty() || b.deviceNameMatch.empty())
+        return false;
+    return containsInsensitive(a.deviceNameMatch, b.deviceNameMatch) ||
+           containsInsensitive(b.deviceNameMatch, a.deviceNameMatch);
+}
+
 Config Config::defaults() {
     Config c;
     // First-run autodetection, chosen to be UNAMBIGUOUS on a real machine
@@ -210,13 +255,47 @@ Config Config::fromJson(const JsonValue& root) {
         c.sources[1] = channelFromJson(root.find("chat"), def.sources[1]);
         c.sources[2] = channelFromJson(root.find("mic"), def.sources[2]);
     }
-    c.output = channelFromJson(root.find("output"), def.output);
+    // Version 5 stores every simultaneous destination in `outputs`. Fall back
+    // to the original singular field so every older configuration migrates
+    // without changing its selected endpoint or fader.
+    const JsonValue* outputs = root.find("outputs");
+    if (outputs && outputs->isArray() && !outputs->items().empty()) {
+        std::vector<ChannelConfig> parsed;
+        parsed.reserve(std::min(outputs->items().size(), size_t(kMaxOutputs)));
+        for (const auto& value : outputs->items()) {
+            if (!value.isObject()) continue;
+            const ChannelConfig fallback = parsed.empty() ? def.output : ChannelConfig{};
+            ChannelConfig candidate = channelFromJson(&value, fallback);
+            candidate.kind = SourceKind::Playback;
+            candidate.processPath.clear();
+            candidate.enabled = true;
+            if (!parsed.empty() && candidate.deviceId.empty() &&
+                candidate.deviceNameMatch.empty())
+                continue;
+            const bool duplicate = std::any_of(
+                parsed.begin(), parsed.end(), [&](const ChannelConfig& existing) {
+                    return sameEndpointSelection(candidate, existing);
+                });
+            if (!duplicate) parsed.push_back(std::move(candidate));
+            if (parsed.size() == kMaxOutputs) break;
+        }
+        if (!parsed.empty()) {
+            c.output = std::move(parsed.front());
+            c.additionalOutputs.assign(std::make_move_iterator(parsed.begin() + 1),
+                                       std::make_move_iterator(parsed.end()));
+        } else {
+            c.output = channelFromJson(root.find("output"), def.output);
+        }
+    } else {
+        c.output = channelFromJson(root.find("output"), def.output);
+    }
     if (auto v = root.find("mono")) c.mono = v->asBool(false);
     if (auto v = root.find("closeToTray")) c.closeToTray = v->asBool(false);
 
     if (const JsonValue* v = root.find("exclusiveOutput"))  c.exclusiveOutput  = v->asBool(def.exclusiveOutput);
     if (const JsonValue* v = root.find("startWithWindows")) c.startWithWindows = v->asBool(def.startWithWindows);
     if (const JsonValue* v = root.find("startMinimized"))   c.startMinimized   = v->asBool(def.startMinimized);
+    c.colorTheme = colorThemeFromJson(root.find("colorTheme"));
     if (const JsonValue* v = root.find("bufferMillis")) {
         const double m = v->asNumber(def.bufferMillis);
         c.bufferMillis = static_cast<uint32_t>(m < 20 ? 20 : (m > 250 ? 250 : m));
@@ -234,9 +313,15 @@ JsonValue Config::toJson() const {
     root.set("mono", JsonValue(mono));
     root.set("closeToTray", JsonValue(closeToTray));
     root.set("output",           channelToJson(output));
+    JsonValue outputsJson = JsonValue::array();
+    outputsJson.push(channelToJson(output));
+    for (size_t i = 0; i < additionalOutputs.size() && i + 1 < kMaxOutputs; ++i)
+        outputsJson.push(channelToJson(additionalOutputs[i]));
+    root.set("outputs", outputsJson);
     root.set("exclusiveOutput",  JsonValue(exclusiveOutput));
     root.set("startWithWindows", JsonValue(startWithWindows));
     root.set("startMinimized",   JsonValue(startMinimized));
+    root.set("colorTheme",       JsonValue(colorThemeName(colorTheme)));
     root.set("bufferMillis",     JsonValue(static_cast<double>(bufferMillis)));
 
     return root;

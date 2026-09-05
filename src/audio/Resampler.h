@@ -9,7 +9,7 @@
 // a 48kHz mix) at ratio ~0.919.
 //
 // 4-point Catmull-Rom. Allocation-free; all state lives in the object, so it
-// is safe to drive from the render thread.
+// is safe to drive from its single real-time consumer thread.
 //
 #include "audio/RingBuffer.h"
 #include <cstdint>

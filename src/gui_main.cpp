@@ -9,6 +9,7 @@
 #include "config/Config.h"
 #include "ui/MixerWindow.h"
 #include "ui/Renderer.h"
+#include "ui/Theme.h"
 #include "ui/TrayIcon.h"
 #include "util/Log.h"
 #include "util/Startup.h"
@@ -74,6 +75,7 @@ void showWindow(App& app) {
         return;
     }
     app.visible = true;
+    app.mixer.setVisible(true);
     if (!wasIconic) ShowWindow(app.hwnd, SW_SHOW);
     SetForegroundWindow(app.hwnd);
     app.lastFrame = std::chrono::steady_clock::now();
@@ -86,6 +88,7 @@ void hideWindow(App& app) {
     // Every path into the tray flushes first. Putting it here rather than at
     // each call site keeps future hide paths from forgetting.
     saveConfigIfDirty(app, true);
+    app.mixer.setVisible(false);
     app.visible = false;
     ShowWindow(app.hwnd, SW_HIDE);
     // Give the GPU memory back: the machine is probably running a game.
@@ -172,6 +175,14 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOZORDER|SWP_NOACTIVATE);
             return 0;
         }
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+            // A System theme selection follows Windows immediately. When the
+            // renderer is torn down in the tray this still refreshes the
+            // remembered palette for the next show.
+            if (app && app->config.colorTheme == ColorTheme::System)
+                ui::applyTheme(app->config.colorTheme);
+            break;
         case ui::kTrayCallbackMessage: {
             // Under NOTIFYICON_VERSION_4 the event is in the low word of lParam.
             switch (LOWORD(lp)) {
@@ -399,6 +410,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     LOG_INFO("audio-monitor shutting down");
     saveConfigIfDirty(app, true);
     app.engine.stop();
+    app.mixer.shutdown();
     app.renderer.destroy();
     app.tray.remove();
     log::shutdown();

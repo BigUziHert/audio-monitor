@@ -1,7 +1,7 @@
 # audio-monitor
 
 A small Windows tray application that mixes several audio sources together and
-sends the mix to a capture card, **without installing a virtual audio driver
+sends the mix to one or more playback devices or capture cards, **without installing a virtual audio driver
 and without ever changing your system's audio devices.**
 
 It was built for a two-PC streaming setup: the gaming PC runs this, sums game
@@ -10,22 +10,30 @@ capture card. The streaming PC has no microphone of its own — everything
 arrives over HDMI as a single feed.
 
 ```
-  Arctis "Game"  endpoint ──(WASAPI loopback)──┐
-  Arctis "Chat"  endpoint ──(WASAPI loopback)──┼──► mix ──► Elgato HDMI (exclusive)
-  Blue Yeti      microphone ─(shared capture)──┘
+  Arctis "Game"  endpoint ──(WASAPI loopback)──┐              ┌──► Elgato HDMI
+  Arctis "Chat"  endpoint ──(WASAPI loopback)──┼──► mix bus ──┼──► Speakers
+  Blue Yeti      microphone ─(shared capture)──┘              └──► Recorder
 ```
 
 ## What it does
 
-- **Dashboard mixer.** A dark two-column layout with source cards, a live
-  frequency spectrum, output selection, and audio health status.
+- **Dashboard mixer.** A two-column layout with Dark, Light, and Windows-following
+  System themes, source cards, a live frequency spectrum, output selection, and
+  audio health status.
 - **Up to 16 sources.** Add playback devices, microphones, or individual
   applications such as Discord. The original Game, Chat, and Microphone
   selections are migrated automatically.
 - **Independent source controls.** The checkmark includes/excludes a source;
   the speaker mutes it while retaining its levels. The arrow opens source
-  selection, naming, mix gain boost, and removal. Card sliders provide a
-  separate 0-100% volume control without changing Windows or headset volumes.
+  selection, naming, mix gain boost, and removal. Card sliders and their editable
+  percentage fields provide a separate 0-100% volume control without changing
+  Windows or headset volumes.
+- **Continuous source meters.** Start/Stop Monitoring changes output forwarding
+  while source capture and metering continue on the same clock. Playback-device,
+  microphone, and application meters keep the same response without resetting
+  or reopening their streams. Output devices open and close in the background
+  so the dashboard stays responsive. With monitoring stopped, hiding the window
+  in the tray also closes source capture.
 - **Stereo / Mono.** Click the Channels card to switch live. Mono averages
   left and right and sends the same signal to both sides, with a short ramp
   to avoid a click. The selection is saved.
@@ -36,9 +44,12 @@ arrives over HDMI as a single feed.
   Warnings update about every two seconds and clear when sources are muted,
   disabled, removed, or routed separately. Detection uses Windows session
   routing; it does not analyze acoustic microphone echo.
-- **Master output controls.** Pick the destination, adjust its mix gain and
-  0-100% volume independently, or mute the combined output. Stop/Start
-  Monitoring preserves your configuration.
+- **Up to four simultaneous outputs.** Add playback destinations from the
+  Output Devices panel, cycle between their cards, and configure independent
+  device selection, naming, icon, mix gain, volume, and mute. Output percentages
+  can be typed directly from 0 to 100%, just like source percentages. Each output has
+  its own buffered clock-drift correction, so one stalled device cannot block
+  the others. Stop/Start Monitoring preserves the complete route.
 - **Tray support.** Minimize keeps audio running and releases the renderer.
   Close exits by default; Settings can make Close hide to the tray instead.
   Optional Windows startup and hidden manual launch remain available.
@@ -52,9 +63,11 @@ after an app update moves its executable, select it again. Multiple independent
 instances at the same path are reported as ambiguous; close extra instances.
 See Microsoft's [process loopback documentation](https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ns-audioclientactivationparams-audioclient_activation_params).
 
-Adding, removing, or replacing a source briefly restarts a running mix.
+Adding, removing, or replacing a source or output briefly restarts a running mix.
 Volume, mute, stereo/mono, and buffer changes apply live. Sample Rate displays
-the actual negotiated output rate; configure the device format in Windows Sound.
+the fixed 48,000 Hz internal mix rate; its Settings link opens the classic Windows
+Sound control panel for device-format changes. A Keybinds settings category is
+reserved for future shortcut controls.
 
 ## Why loopback instead of a virtual audio driver
 
@@ -158,8 +171,9 @@ and loopback/shared-render integration.
 The process-capture test only opens its own process; it does not play sound or
 modify Windows audio routing, and it skips when process capture is unsupported.
 The loopback/render test opens the first active render endpoint, restarts its
-loopback capture three times, and renders silence in shared mode; it skips when
-no render endpoint exists. The dashboard and renderer tests exercise layouts,
+loopback capture three times, and renders silence in shared mode. When two
+endpoints are available it also opens both through the multi-output engine; it
+skips hardware coverage when no render endpoint exists. The dashboard and renderer tests exercise layouts,
 controls, and device recovery without a visible desktop window. Audible behavior
 still needs a test with your devices.
 
@@ -167,8 +181,8 @@ To test overlap, add your speaker/headphone endpoint and add Discord as an
 Application audio source. Play Discord audio through that endpoint: Status
 should turn amber with Duplicate audio and identify both sources. Muting or
 disabling either source clears the overlap warning. Click Channels to compare
-Stereo and Mono; Stop Monitoring should silence the forwarded mix and leave
-its configuration ready to resume.
+Stereo and Mono; Stop Monitoring should silence the forwarded mix while the
+source meters continue to move, and leave its configuration ready to resume.
 
 ### Bring-up: get audio flowing before worrying about the UI
 
@@ -208,24 +222,32 @@ whenever you change something in the UI.
 
 ```json
 {
-  "version": 3,
+  "version": 5,
   "sources": [
     { "label": "Headphones", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "volume": 1, "muted": false },
     { "label": "Chat Audio", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "volume": 1, "muted": false },
     { "label": "Microphone", "kind": "microphone", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "USB Advanced Audio Device", "gain": 1, "volume": 1, "muted": false }
   ],
   "output": { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "volume": 1, "muted": false },
+  "outputs": [
+    { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "volume": 1, "muted": false }
+  ],
   "mono": false,
   "closeToTray": false,
   "exclusiveOutput": true,
   "startWithWindows": false,
   "startMinimized": false,
+  "colorTheme": "dark",
   "bufferMillis": 50
 }
 ```
 
 `gain` is the 0-400% mix gain configured in the editor. `volume` is the
 independent 0-100% dashboard fader; the effective level is their product.
+`colorTheme` accepts `dark`, `light`, or `system`; `system` follows the Windows
+app-theme preference. `outputs` is the ordered list of simultaneous destinations,
+up to four. `output` mirrors its first item so older builds can still load the
+primary destination.
 
 On the first save of a version 1 configuration, the original is preserved as
 `config.json.v1.bak` beside `config.json`. To return to an older build, exit the
@@ -312,17 +334,18 @@ game would tear down and rebuild the stream.
 
 ### Real-time safety
 
-The render thread is the master clock. It runs in the MMCSS **"Pro Audio"**
-task class so a fullscreen game cannot starve it, with denormal flushing (FTZ
-*and* DAZ) enabled per-thread, and it performs no allocation, no locking, no
-logging and no COM calls. Everything it touches is preallocated at startup.
+A fixed 48 kHz MMCSS **"Pro Audio"** pump is the single consumer of every
+capture ring. It creates the canonical mix once, then writes an independent
+lock-free SPSC bus for each output. Each WASAPI render thread consumes only its
+own bus and resamples gently onto that endpoint's clock. The pump and render
+callbacks perform no allocation, locking, logging, or COM calls; everything
+they touch is preallocated at startup.
 
-Thread topology is one capture thread per enabled source plus one render thread, communicating
-through lock-free SPSC ring buffers. The alternative — draining all three
-captures on the render thread — was rejected because `GetBuffer`/`ReleaseBuffer`
-are COM calls with no non-blocking guarantee, and one stalled capture device
-would then stall the output. Here a stalled capture simply stops filling its
-ring and the mixer emits silence for that channel alone.
+Thread topology is one capture thread per enabled source, one mix pump, and one
+render thread per configured output. Captures never run on the pump: their
+`GetBuffer`/`ReleaseBuffer` COM calls have no non-blocking guarantee, so a
+stalled source can only starve its own ring. Likewise, a stalled output can
+only overflow its own fan-out bus and cannot hold up another destination.
 
 Meters are polled by the UI from atomics. The audio thread only ever folds a
 new maximum into an atomic; all decay, hold and dB conversion happen on the UI
@@ -344,7 +367,7 @@ app attaches to it automatically when it appears.
 
 ### Spectrum display
 
-The render thread feeds a bounded visualization queue. A 2,048-point Hann-windowed
+The mix pump feeds a bounded visualization queue. A 2,048-point Hann-windowed
 FFT runs on the UI thread and displays 64 logarithmic bands (30 Hz to 20 kHz,
 limited by Nyquist). The two sides are analyzed separately so opposite-polarity
 stereo signals do not disappear from the graph. Visualization samples are

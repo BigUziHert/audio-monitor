@@ -318,7 +318,7 @@ void CaptureStream::drainPackets() {
         for (uint32_t i = 0; i < w; ++i) {
             ring_.writeFrame(i, scratch_[i * 2], scratch_[i * 2 + 1]);
         }
-        // Publish liveness before publishing the frames. The render thread can
+        // Publish liveness before publishing the frames. The mix pump can
         // then distinguish a newly resumed producer from a stable idle tail.
         QueryPerformanceCounter(&lastPacketQpc_);
         flowing_.store(true, std::memory_order_release);

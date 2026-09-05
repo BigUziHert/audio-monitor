@@ -1,4 +1,5 @@
 #include "audio/AudioEngine.h"
+#include "audio/OutputBus.h"
 #include "audio/WaveFormat.h"
 
 #include <algorithm>
@@ -9,6 +10,94 @@
 #include <vector>
 
 namespace audiomon {
+
+struct FakeMixPumpSchedulerApi {
+    static HANDLE stopHandle() noexcept {
+        return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(1));
+    }
+    static HANDLE timerHandle() noexcept {
+        return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(2));
+    }
+
+    bool failStop = false;
+    bool failHighResolution = false;
+    bool failNormalTimer = false;
+    bool failSetTimer = false;
+    DWORD waitResult = WAIT_OBJECT_0 + 1;
+    DWORD error = ERROR_GEN_FAILURE;
+    int stopCreates = 0;
+    int highTimerCreates = 0;
+    int normalTimerCreates = 0;
+    int setCalls = 0;
+    int waitCalls = 0;
+    int stopWaitCalls = 0;
+    int signalCalls = 0;
+    int cancelCalls = 0;
+    int stopCloses = 0;
+    int timerCloses = 0;
+    int64_t lastDueTime100ns = 0;
+    DWORD lastStopTimeoutMillis = 0;
+    DWORD stopWaitResult = WAIT_TIMEOUT;
+
+    static HANDLE createStop(void* context) noexcept {
+        auto& fake = *static_cast<FakeMixPumpSchedulerApi*>(context);
+        ++fake.stopCreates;
+        return fake.failStop ? nullptr : stopHandle();
+    }
+    static HANDLE createTimer(void* context, bool highResolution) noexcept {
+        auto& fake = *static_cast<FakeMixPumpSchedulerApi*>(context);
+        if (highResolution) {
+            ++fake.highTimerCreates;
+            if (fake.failHighResolution) return nullptr;
+        } else {
+            ++fake.normalTimerCreates;
+            if (fake.failNormalTimer) return nullptr;
+        }
+        return timerHandle();
+    }
+    static BOOL setTimer(void* context, HANDLE, int64_t dueTime100ns) noexcept {
+        auto& fake = *static_cast<FakeMixPumpSchedulerApi*>(context);
+        ++fake.setCalls;
+        fake.lastDueTime100ns = dueTime100ns;
+        return fake.failSetTimer ? FALSE : TRUE;
+    }
+    static DWORD wait(void* context, HANDLE, HANDLE) noexcept {
+        auto& fake = *static_cast<FakeMixPumpSchedulerApi*>(context);
+        ++fake.waitCalls;
+        return fake.waitResult;
+    }
+    static DWORD waitForStop(void* context, HANDLE, DWORD timeoutMillis) noexcept {
+        auto& fake = *static_cast<FakeMixPumpSchedulerApi*>(context);
+        ++fake.stopWaitCalls;
+        fake.lastStopTimeoutMillis = timeoutMillis;
+        return fake.stopWaitResult;
+    }
+    static BOOL signal(void* context, HANDLE) noexcept {
+        ++static_cast<FakeMixPumpSchedulerApi*>(context)->signalCalls;
+        return TRUE;
+    }
+    static BOOL cancel(void* context, HANDLE) noexcept {
+        ++static_cast<FakeMixPumpSchedulerApi*>(context)->cancelCalls;
+        return TRUE;
+    }
+    static BOOL close(void* context, HANDLE handle) noexcept {
+        auto& fake = *static_cast<FakeMixPumpSchedulerApi*>(context);
+        if (handle == stopHandle()) ++fake.stopCloses;
+        if (handle == timerHandle()) ++fake.timerCloses;
+        return TRUE;
+    }
+    static DWORD lastError(void* context) noexcept {
+        return static_cast<FakeMixPumpSchedulerApi*>(context)->error;
+    }
+
+    MixPumpScheduler::Api api() noexcept {
+        return {
+            this, &createStop, &createTimer, &setTimer, &wait, &waitForStop, &signal,
+            &cancel, &close, &lastError,
+        };
+    }
+};
+
 // Feed the mixer deterministically without opening real capture/render devices.
 struct AudioEngineTestAccess {
     static void prepare(AudioEngine& engine, uint32_t bufferMs) {
@@ -62,10 +151,43 @@ struct AudioEngineTestAccess {
         engine.supervisor_ = std::thread(&AudioEngine::supervisorMain, &engine);
     }
     static void requestRebuild(AudioEngine& engine) { engine.requestRebuild(); }
+    static void missPumpPeriods(AudioEngine& engine, uint64_t periods) {
+        engine.handleMixPumpDiscontinuity(periods);
+    }
+    static uint64_t pumpMisses(AudioEngine& engine) {
+        return engine.mixPumpMissedPeriods();
+    }
+    static uint64_t overflowOutput(AudioEngine& engine, const float* source,
+                                   uint32_t frames) {
+        engine.outputBuses_[0]->clearStatistics();
+        engine.outputBuses_[0]->publish(source, frames, 1.0f, false);
+        return engine.outputStatus(0).dropped;
+    }
     static bool invalidSelectionPreservesOutput(AudioEngine& engine) {
         engine.config_.output.deviceId = L"original";
         engine.setChannelDevice(500, {L"invalid", L"invalid"});
         return engine.config_.output.deviceId == L"original";
+    }
+    static void activateMeterSession(AudioEngine& engine) {
+        engine.running_.store(true);
+        engine.monitoringState_.store(2);
+    }
+    static void pumpBlock(AudioEngine& engine) { engine.pumpBlock(); }
+    static uint32_t sourceEpoch(AudioEngine& engine) {
+        return engine.channels_[0]->stream.epoch();
+    }
+    static OutputBus& outputBus(AudioEngine& engine) { return *engine.outputBuses_[0]; }
+    static void reopenOutputGate(AudioEngine& engine) {
+        engine.outputReadyState_[0].store(engine.monitoringState_.load());
+        engine.outputGates_[0]->onRenderFormat(48000, 480);
+    }
+    static void renderOutputGate(AudioEngine& engine, float* samples, uint32_t frames) {
+        engine.outputGates_[0]->renderMix(samples, frames);
+    }
+    static void toggleWithLifecycleLocksHeld(AudioEngine& engine) {
+        std::lock_guard<std::mutex> lifecycle(engine.lifecycleMutex_);
+        std::lock_guard<std::mutex> config(engine.configMutex_);
+        for (int i = 0; i < 1000; ++i) engine.setMonitoring((i & 1) != 0);
     }
 };
 } // namespace audiomon
@@ -82,6 +204,229 @@ int main() {
     std::vector<float> block(480 * 2);
     {
         AudioEngine engine;
+        AudioEngineTestAccess::prepare(engine, 20);
+        AudioEngineTestAccess::activateMeterSession(engine);
+        const uint32_t epoch = AudioEngineTestAccess::sourceEpoch(engine);
+        AudioEngineTestAccess::feed(engine, 2400);
+        AudioEngineTestAccess::pumpBlock(engine);
+        check(engine.channelPeak(0).l.take() > 0.45f && engine.running() && !engine.monitoring(),
+              "paused capture session meters source audio through the normal mixer");
+        bool continuous = true;
+        bool noOutput = true;
+        for (int i = 0; i < 20; ++i) {
+            engine.setMonitoring((i & 1) == 0);
+            AudioEngineTestAccess::feed(engine, 480);
+            AudioEngineTestAccess::pumpBlock(engine);
+            continuous = continuous && engine.channelPeak(0).l.take() > 0.45f &&
+                AudioEngineTestAccess::sourceEpoch(engine) == epoch &&
+                engine.channelStatus(0).state == StreamState::Running;
+            noOutput = noOutput && engine.outputPeak().l.take() == 0.0f &&
+                AudioEngineTestAccess::outputBus(engine).publishedFrames() == 0;
+        }
+        check(continuous, "rapid monitoring toggles preserve capture epoch and every source meter block");
+        check(noOutput, "paused or not-yet-open outputs receive no mix samples or peaks");
+        const uint32_t count = engine.visualSamples().beginRead();
+        bool silentVisual = true;
+        for (uint32_t i = 0; i < count; ++i) {
+            float l = 0, r = 0;
+            engine.visualSamples().readFrame(i, l, r);
+            silentVisual = silentVisual && l == 0.0f && r == 0.0f;
+        }
+        engine.visualSamples().endRead(count);
+        check(silentVisual, "paused or unopened forwarding publishes silent Live Mix samples");
+        const auto before = std::chrono::steady_clock::now();
+        AudioEngineTestAccess::toggleWithLifecycleLocksHeld(engine);
+        const auto elapsed = std::chrono::steady_clock::now() - before;
+        check(elapsed < std::chrono::milliseconds(100),
+              "monitoring requests never wait for stream/config lifecycle work");
+        engine.setMonitoring(false);
+        engine.setOutputDevice(0, {L"paused-selection", L"Paused selection"});
+        check(engine.outputStatus().state == StreamState::Stopped &&
+                  engine.outputStatus().sampleRate == 0,
+              "changing a paused output selection does not open a playback stream");
+    }
+    {
+        AudioEngine engine;
+        AudioEngineTestAccess::activateMeterSession(engine);
+        engine.setMonitoring(true);
+        AudioEngineTestAccess::reopenOutputGate(engine);
+        std::vector<float> oldMix(4800 * 2, 0.75f);
+        auto& bus = AudioEngineTestAccess::outputBus(engine);
+        bus.publish(oldMix.data(), 4800, 1.0f, false);
+        AudioEngineTestAccess::renderOutputGate(engine, block.data(), 480);
+        check(audible(block), "active forwarding gate consumes audible mix samples");
+        engine.setMonitoring(false);
+        AudioEngineTestAccess::renderOutputGate(engine, block.data(), 480);
+        check(std::all_of(block.begin(), block.end(), [](float v) { return v == 0.0f; }),
+              "pausing silences already-buffered output before supervisor shutdown");
+        engine.setMonitoring(true);
+        AudioEngineTestAccess::renderOutputGate(engine, block.data(), 480);
+        check(std::all_of(block.begin(), block.end(), [](float v) { return v == 0.0f; }) &&
+                  engine.outputStatus().state == StreamState::Opening,
+              "rapid resume cannot consume the preceding forwarding generation");
+        AudioEngineTestAccess::reopenOutputGate(engine);
+        check(bus.depthFrames() == 0, "resumed render consumer discards every queued old frame");
+        std::vector<float> newMix(2400 * 2, -0.25f);
+        bus.publish(newMix.data(), 2400, 1.0f, false);
+        AudioEngineTestAccess::renderOutputGate(engine, block.data(), 480);
+        check(audible(block) && std::all_of(block.begin(), block.end(),
+                  [](float v) { return v <= 0.0f; }),
+              "resumed forwarding fades in only fresh samples");
+    }
+    {
+        check(MixPumpScheduler::relativeDueTime100ns(std::chrono::nanoseconds(1)) == -1 &&
+                  MixPumpScheduler::relativeDueTime100ns(std::chrono::nanoseconds(101)) == -2 &&
+                  MixPumpScheduler::relativeDueTime100ns(std::chrono::milliseconds(10)) == -100000,
+              "mix-pump deadlines round up to relative 100 ns timer ticks");
+        check(MixPumpScheduler::timeoutMillis(std::chrono::nanoseconds(1)) == 1 &&
+                  MixPumpScheduler::timeoutMillis(std::chrono::milliseconds(10)) == 10,
+              "degraded mix-pump deadlines round up to millisecond timeouts");
+
+        FakeMixPumpSchedulerApi fake;
+        auto api = fake.api();
+        MixPumpScheduler scheduler(&api);
+        check(scheduler.open() && scheduler.highResolution() &&
+                  fake.highTimerCreates == 1 && fake.normalTimerCreates == 0,
+              "mix-pump scheduler prefers a high-resolution timer");
+        check(scheduler.waitFor(std::chrono::milliseconds(10)) ==
+                      MixPumpScheduler::WaitResult::Deadline &&
+                  fake.setCalls == 1 && fake.waitCalls == 1 &&
+                  fake.lastDueTime100ns == -100000,
+              "mix-pump scheduler arms a one-shot timer for each deadline");
+        fake.waitResult = WAIT_OBJECT_0;
+        check(scheduler.signalStop() &&
+                  scheduler.waitFor(std::chrono::milliseconds(10)) ==
+                      MixPumpScheduler::WaitResult::Stop &&
+                  fake.signalCalls == 1,
+              "mix-pump scheduler selects its independent stop event");
+        check(scheduler.open() && fake.cancelCalls == 1 && fake.stopCloses == 1 &&
+                  fake.timerCloses == 1,
+              "reopening the mix-pump scheduler closes its previous handles");
+        scheduler.close();
+        check(fake.cancelCalls == 2 && fake.stopCloses == 2 && fake.timerCloses == 2,
+              "closing the mix-pump scheduler releases both handles exactly once");
+    }
+    {
+        FakeMixPumpSchedulerApi fake;
+        fake.failSetTimer = true;
+        auto api = fake.api();
+        MixPumpScheduler scheduler(&api);
+        check(scheduler.open() &&
+                  scheduler.waitFor(std::chrono::milliseconds(10)) ==
+                      MixPumpScheduler::WaitResult::Deadline &&
+                  scheduler.degraded() && fake.setCalls == 1 &&
+                  fake.stopWaitCalls == 1 && fake.lastStopTimeoutMillis == 10 &&
+                  scheduler.lastError() == ERROR_GEN_FAILURE,
+              "timer-arm failure degrades to a stop-event timeout");
+        fake.failSetTimer = false;
+        fake.stopWaitResult = WAIT_OBJECT_0;
+        check(scheduler.waitFor(std::chrono::milliseconds(10)) ==
+                      MixPumpScheduler::WaitResult::Stop &&
+                  fake.setCalls == 1 && fake.stopWaitCalls == 2,
+              "degraded scheduling stays latched and remains immediately cancellable");
+    }
+    {
+        FakeMixPumpSchedulerApi fake;
+        fake.waitResult = WAIT_FAILED;
+        auto api = fake.api();
+        MixPumpScheduler scheduler(&api);
+        check(scheduler.open() &&
+                  scheduler.waitFor(std::chrono::milliseconds(7)) ==
+                      MixPumpScheduler::WaitResult::Deadline &&
+                  scheduler.degraded() && fake.waitCalls == 1 &&
+                  fake.stopWaitCalls == 1 && fake.lastStopTimeoutMillis == 7,
+              "timer-wait failure degrades without stopping the pump");
+    }
+    {
+        FakeMixPumpSchedulerApi fake;
+        fake.failHighResolution = true;
+        auto api = fake.api();
+        MixPumpScheduler scheduler(&api);
+        check(scheduler.open() && !scheduler.highResolution() &&
+                  fake.highTimerCreates == 1 && fake.normalTimerCreates == 1,
+              "mix-pump scheduler falls back to a normal waitable timer");
+    }
+    {
+        FakeMixPumpSchedulerApi fake;
+        fake.failHighResolution = true;
+        fake.failNormalTimer = true;
+        auto api = fake.api();
+        MixPumpScheduler scheduler(&api);
+        check(!scheduler.open() && !scheduler.ready() && fake.stopCloses == 1 &&
+                  fake.timerCloses == 0 && scheduler.lastError() == ERROR_GEN_FAILURE,
+              "failed timer creation closes the partially opened scheduler");
+    }
+    {
+        MixPumpScheduler scheduler;
+        const bool opened = scheduler.open();
+        const auto started = std::chrono::steady_clock::now();
+        const bool signalled = opened && scheduler.signalStop();
+        const auto result = opened
+            ? scheduler.waitFor(std::chrono::hours(1))
+            : MixPumpScheduler::WaitResult::Failed;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started);
+        check(opened && signalled && result == MixPumpScheduler::WaitResult::Stop &&
+                  elapsed.count() < 200,
+              "the real mix-pump stop event cancels a long deadline immediately");
+    }
+    {
+        OutputBus first(64, 8), second(64, 8), muted(64, 8);
+        first.onRenderFormat(48000, 4);
+        second.onRenderFormat(48000, 4);
+        muted.onRenderFormat(48000, 4);
+        std::vector<float> source(32 * 2);
+        for (size_t i = 0; i < source.size(); i += 2) {
+            source[i] = 0.8f;
+            source[i + 1] = -0.4f;
+        }
+        first.publish(source.data(), 32, 1.0f, false);
+        second.publish(source.data(), 32, 0.25f, false);
+        muted.publish(source.data(), 32, 1.0f, true);
+        std::vector<float> firstOut(8), secondOut(8), mutedOut(8);
+        first.renderMix(firstOut.data(), 4);
+        second.renderMix(secondOut.data(), 4);
+        muted.renderMix(mutedOut.data(), 4);
+        check(firstOut[0] > 0.0f && firstOut[6] > firstOut[0] &&
+                  std::fabs(firstOut[1] / firstOut[0] + 0.5f) < 0.0001f,
+              "first output bus fades the canonical mix in without changing stereo balance");
+        check(std::fabs(secondOut[0] / firstOut[0] - 0.25f) < 0.0001f &&
+                  std::fabs(secondOut[1] / firstOut[1] - 0.25f) < 0.0001f,
+              "output bus gain is independent per destination");
+        check(!audible(mutedOut), "muting one output bus emits silence");
+
+        OutputBus transitioning(1024, 8);
+        transitioning.onRenderFormat(48000, 4);
+        transitioning.publish(source.data(), 32, 1.0f, false);
+        std::vector<float> transitionOut(8);
+        // Four frames per call; replenish the deterministic source while the
+        // presence envelope reaches unity.
+        for (int i = 0; i < 60; ++i) {
+            transitioning.publish(source.data(), 4, 1.0f, false);
+            transitioning.renderMix(transitionOut.data(), 4);
+        }
+        transitioning.requestReset();
+        transitioning.renderMix(transitionOut.data(), 4);
+        check(transitionOut[0] > transitionOut[6] && transitionOut[6] > 0.0f,
+              "output timeline reset begins with real audio fading down");
+        for (int i = 1; i < 60; ++i) {
+            transitioning.publish(source.data(), 4, 1.0f, false);
+            transitioning.renderMix(transitionOut.data(), 4);
+        }
+        check(transitioning.priming() && transitioning.depthFrames() == 0,
+              "output timeline reset drops stale audio after the fade");
+
+        OutputBus stalled(8, 4);
+        stalled.onRenderFormat(48000, 2);
+        stalled.publish(source.data(), 16, 1.0f, false);
+        std::vector<float> overflowOut(4);
+        stalled.renderMix(overflowOut.data(), 2);
+        check(stalled.droppedFrames() == 8 && stalled.depthFrames() == 0 &&
+                  !audible(overflowOut),
+              "a stalled output drops only its branch and resets its stale timeline");
+    }
+    {
+        AudioEngine engine;
         AudioEngineTestAccess::prepare(engine, 250);
         AudioEngineTestAccess::feed(engine, 12000);
         engine.renderMix(block.data(), 480);
@@ -94,6 +439,28 @@ int main() {
         check(!audible(block), "drained source returns to silence");
         check(AudioEngineTestAccess::invalidSelectionPreservesOutput(engine),
               "invalid source index does not change the output device");
+    }
+    {
+        AudioEngine engine;
+        AudioEngineTestAccess::prepare(engine, 50);
+        AudioEngineTestAccess::feed(engine, 3000);
+        engine.renderMix(block.data(), 480);
+        AudioEngineTestAccess::feed(engine, 960);
+        check(AudioEngineTestAccess::depth(engine) > 0,
+              "pump-discontinuity fixture has queued capture audio");
+        AudioEngineTestAccess::missPumpPeriods(engine, 3);
+        check(AudioEngineTestAccess::depth(engine) == 2400 &&
+                  AudioEngineTestAccess::pumpMisses(engine) == 3,
+              "missed pump periods trim stale capture latency to its target and remain observable");
+        AudioEngineTestAccess::missPumpPeriods(engine, 2);
+        check(AudioEngineTestAccess::pumpMisses(engine) == 5,
+              "pump missed-period diagnostic is monotonic");
+
+        std::vector<float> oversized((OutputBus::kDefaultRingCapacityFrames + 1) * 2,
+                                     0.25f);
+        check(AudioEngineTestAccess::overflowOutput(
+                  engine, oversized.data(), OutputBus::kDefaultRingCapacityFrames + 1) == 1,
+              "output status exposes frames dropped by its fan-out bus");
     }
     {
         AudioEngine engine;

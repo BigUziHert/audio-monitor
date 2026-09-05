@@ -37,7 +37,7 @@ public:
     CaptureStream& operator=(const CaptureStream&) = delete;
 
     // Allocates the ring once, at startup. It cannot be resized later: the
-    // render thread reads the ring even while a stream is down (for the depth
+    // mix pump reads the ring even while a stream is down (for the depth
     // readout and to drop stale audio), so reallocating under it would race.
     void configure(const char* label, CaptureMode mode, uint32_t ringMillis = 250);
 

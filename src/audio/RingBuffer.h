@@ -3,10 +3,10 @@
 // Lock-free single-producer / single-consumer ring of interleaved stereo
 // float frames.
 //
-// Exactly one capture thread writes; exactly one render thread reads. No
+// Exactly one producer thread writes; exactly one consumer thread reads. No
 // mutexes, no allocation after construction, no blocking. The begin/commit
 // shape means each side touches the shared atomics twice per period rather
-// than once per frame, which matters because the render thread pulls frames
+// than once per frame, which matters because the consumer pulls frames
 // one at a time through the resampler.
 //
 #include <atomic>

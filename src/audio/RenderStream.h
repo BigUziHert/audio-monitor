@@ -1,12 +1,12 @@
 #pragma once
 //
-// The Elgato output. This is the master clock for the whole application: the
-// mixer runs on this thread, driven by this device's period, and every capture
-// source is resampled onto this timebase.
+// One playback destination. Its callback pulls from that destination's
+// OutputBus, which resamples the fixed-rate canonical mix onto this device's
+// independent clock.
 //
-// Opened in exclusive mode by default -- nothing else on the machine uses the
-// capture card's endpoint, so we get the shortest path to the hardware with no
-// engine mixing in between. Falls back to shared mode rather than failing,
+// Opened in exclusive mode when requested and safe, so a dedicated capture
+// endpoint gets the shortest path to hardware with no engine mixing in between.
+// Falls back to shared mode rather than failing,
 // because "no audio to the stream PC" is a much worse outcome than "a few more
 // milliseconds of latency".
 //
@@ -53,6 +53,10 @@ public:
     uint32_t     sampleRate() const noexcept { return sampleRate_.load(std::memory_order_acquire); }
     uint32_t     blockFrames() const noexcept { return blockFrames_.load(std::memory_order_acquire); }
     uint64_t     underruns() const noexcept { return underruns_.load(std::memory_order_relaxed); }
+    // Explicit session boundary. Automatic device restarts deliberately do
+    // not clear this counter, so status consumers always observe monotonic
+    // diagnostics while monitoring remains active.
+    void clearStatistics() noexcept { underruns_.store(0, std::memory_order_relaxed); }
 
     std::wstring resolvedName() const;
     std::wstring resolvedId() const;

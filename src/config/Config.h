@@ -18,7 +18,9 @@ namespace audiomon {
 class JsonValue;
 
 inline constexpr int kMaxSources = 16;
+inline constexpr int kMaxOutputs = 4;
 enum class SourceKind { Playback, Microphone, Application };
+enum class ColorTheme { Dark, Light, System };
 
 struct ChannelConfig {
     std::string  label;
@@ -37,9 +39,30 @@ inline float effectiveGain(const ChannelConfig& channel) noexcept {
     return channel.gain * channel.volume;
 }
 
+// True when two persisted endpoint selections identify the same physical
+// destination. IDs are authoritative when both exist; otherwise the friendly
+// name fallback uses the same case-insensitive substring semantics as device
+// resolution so a migrated name-only output cannot be added again by ID.
+bool sameEndpointSelection(const ChannelConfig& a, const ChannelConfig& b) noexcept;
+
 struct Config {
     std::vector<ChannelConfig> sources;
+    // `output` remains the first destination so older configuration files and
+    // code keep their meaning. Extra destinations mirror the same mix and
+    // retain their own device, trim, mute, label, and icon settings.
     ChannelConfig output;
+    std::vector<ChannelConfig> additionalOutputs;
+
+    size_t outputCount() const noexcept {
+        const size_t count = 1 + additionalOutputs.size();
+        return count < size_t(kMaxOutputs) ? count : size_t(kMaxOutputs);
+    }
+    ChannelConfig& outputAt(size_t index) {
+        return index == 0 ? output : additionalOutputs.at(index - 1);
+    }
+    const ChannelConfig& outputAt(size_t index) const {
+        return index == 0 ? output : additionalOutputs.at(index - 1);
+    }
 
     bool     mono             = false;
     bool     closeToTray      = false;
@@ -50,8 +73,9 @@ struct Config {
     // boot launch goes to the notification area regardless -- defaulting this
     // to true as well would make a first double-click look like it did
     // nothing at all.
-    bool     startMinimized   = false;
-    uint32_t bufferMillis     = 50;   // per-channel drift setpoint
+    bool       startMinimized = false;
+    ColorTheme colorTheme     = ColorTheme::Dark;
+    uint32_t   bufferMillis   = 50;   // per-channel drift setpoint
 
     static Config defaults();
     static Config fromJson(const JsonValue& root);
