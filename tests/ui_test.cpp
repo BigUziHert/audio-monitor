@@ -5,6 +5,7 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,7 @@ struct AudioEngineTestAccess {
     static void prepareMeterSession(AudioEngine &engine, const Config &config) {
         engine.config_ = config;
         engine.sourceCount_ = config.sources.size();
+        engine.outputCount_ = config.outputCount();
         engine.running_.store(true);
         engine.monitoringState_.store(2u);
     }
@@ -79,6 +81,22 @@ struct MixerWindowTestAccess {
         return mixer.meters_.at(source).levelDb();
     }
     static void resetSourceMeters(MixerWindow &mixer) { mixer.meters_ = {}; }
+    static uint64_t statusEvaluationCount(const MixerWindow &mixer) {
+        return mixer.statusEvaluationCount_;
+    }
+    static uint64_t spectrumEvaluationCount(const MixerWindow &mixer) {
+        return mixer.spectrumEvaluationCount_;
+    }
+    static void forceExpensiveRefresh(MixerWindow &mixer) {
+        mixer.statusRefreshForced_ = true;
+        mixer.spectrumWasActive_ = false;
+    }
+    static void resetPerformanceCadence(MixerWindow &mixer) {
+        mixer.statusRefreshTimer_ = 0;
+        mixer.spectrumRefreshTimer_ = 0;
+        mixer.statusRefreshForced_ = true;
+        mixer.spectrumWasActive_ = false;
+    }
 };
 } // namespace audiomon::ui
 
@@ -88,6 +106,11 @@ int main() {
     {
         AudioEngine engine;
         Config config = Config::defaults();
+        // Most interaction fixtures exercise an existing primary output.
+        // First-run production defaults intentionally contain no outputs.
+        ChannelConfig initialOutput;
+        initialOutput.deviceNameMatch = L"Elgato 4K";
+        config.addOutput(initialOutput);
         ui::MixerWindow mixer;
         ImGui::CreateContext();
         auto &io = ImGui::GetIO();
@@ -116,16 +139,59 @@ int main() {
             expect(dialog && (dialog->Flags & ImGuiWindowFlags_NoTitleBar),
                    "Custom dialog has a native title bar");
         };
+        int changedFrames = 0;
         auto frame = [&](int w, int h) {
             io.DisplaySize = {float(w), float(h)};
             io.DeltaTime = 1.f / 60;
             ImGui::NewFrame();
-            mixer.draw(io.DeltaTime, w, h);
+            if (mixer.draw(io.DeltaTime, w, h)) ++changedFrames;
             ImGui::Render();
             if (!ImGui::GetDrawData() || ImGui::GetDrawData()->TotalVtxCount == 0) {
                 std::printf("No draw data at %dx%d frame %d\n",w,h,ImGui::GetFrameCount()); ++failed;
             }
         };
+
+        if (GetEnvironmentVariableA("AUDIOMON_UI_BENCHMARK", nullptr, 0) != 0) {
+            config.sources.resize(kMaxSources);
+            for (size_t i = 0; i < config.sources.size(); ++i) {
+                config.sources[i].label = "Synthetic source " + std::to_string(i + 1);
+                config.sources[i].deviceNameMatch = L"Synthetic playback endpoint";
+            }
+            config.additionalOutputs.resize(kMaxOutputs - 1);
+            for (size_t i = 0; i < config.additionalOutputs.size(); ++i) {
+                config.additionalOutputs[i].label = "Synthetic output " + std::to_string(i + 2);
+                config.additionalOutputs[i].deviceId = L"synthetic-output-" + std::to_wstring(i + 2);
+            }
+            AudioEngineTestAccess::prepareMeterSession(engine, config);
+            AudioEngineTestAccess::setMonitoringState(engine, true);
+            mixer.setVisible(true);
+            auto benchmark = [&](const char *label, bool forceEveryFrame) {
+                ui::MixerWindowTestAccess::resetPerformanceCadence(mixer);
+                const auto started = std::chrono::steady_clock::now();
+                for (int rendered = 0; rendered < 600; ++rendered) {
+                    if (forceEveryFrame)
+                        ui::MixerWindowTestAccess::forceExpensiveRefresh(mixer);
+                    for (int source = 0; source < kMaxSources; ++source)
+                        engine.channelPeak(source).l.publish(.35f);
+                    auto &visual = engine.visualSamples();
+                    const uint32_t samples = std::min<uint32_t>(480, visual.beginWrite());
+                    for (uint32_t sample = 0; sample < samples; ++sample)
+                        visual.writeFrame(sample, .25f, -.25f);
+                    visual.endWrite(samples);
+                    frame(1600, 986);
+                }
+                const auto elapsed = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                std::printf("Synthetic dashboard (%s): 600 frames, %.3f ms, %.3f ms/frame\n",
+                            label, elapsed, elapsed / 600.0);
+            };
+            benchmark("per-frame status + FFT", true);
+            benchmark("bounded status + FFT", false);
+            ImGui::DestroyContext();
+            engine.stop();
+            CoUninitialize();
+            return 0;
+        }
 
         // Paused and forwarding source cards must consume the same engine
         // peaks with identical attack/release. No hardware is opened here.
@@ -146,9 +212,45 @@ int main() {
             }
         }
 
+        // Expensive health/routing reconstruction and FFT work must be tied to
+        // human-visible update rates, not a 144/240 Hz desktop refresh rate.
+        const uint64_t statusBefore =
+            ui::MixerWindowTestAccess::statusEvaluationCount(mixer);
+        const uint64_t spectrumBefore =
+            ui::MixerWindowTestAccess::spectrumEvaluationCount(mixer);
+        for (int rendered = 0; rendered < 120; ++rendered) {
+            auto &visual = engine.visualSamples();
+            const uint32_t samples = std::min<uint32_t>(480, visual.beginWrite());
+            for (uint32_t sample = 0; sample < samples; ++sample)
+                visual.writeFrame(sample, .2f, -.2f);
+            visual.endWrite(samples);
+            frame(1600, 986);
+        }
+        const uint64_t statusUpdates =
+            ui::MixerWindowTestAccess::statusEvaluationCount(mixer) - statusBefore;
+        const uint64_t spectrumUpdates =
+            ui::MixerWindowTestAccess::spectrumEvaluationCount(mixer) - spectrumBefore;
+        expect(statusUpdates >= 9 && statusUpdates <= 11,
+               "Status work was not capped near 5 Hz");
+        expect(spectrumUpdates >= 58 && spectrumUpdates <= 61,
+               "Spectrum work was not capped near 30 Hz");
+
         // Exercise the actual Start/Stop Monitoring button, including its
         // release frame: a reset there visibly freezes or blanks the meter.
         AudioEngineTestAccess::setMonitoringState(engine, false);
+        {
+            auto &visual = engine.visualSamples();
+            const uint32_t silentFrames = visual.beginWrite();
+            for (uint32_t sample = 0; sample < silentFrames; ++sample)
+                visual.writeFrame(sample, 0.f, 0.f);
+            visual.endWrite(silentFrames);
+            const uint64_t beforePausedFrame =
+                ui::MixerWindowTestAccess::spectrumEvaluationCount(mixer);
+            frame(1600, 986);
+            expect(visual.depth() == 0 &&
+                       ui::MixerWindowTestAccess::spectrumEvaluationCount(mixer) == beforePausedFrame,
+                   "Paused dashboard copied silent samples through the FFT");
+        }
         ui::MixerWindowTestAccess::resetSourceMeters(mixer);
         MeterBallistics continuousMeter;
         auto meterFrame = [&](float peak) {
@@ -459,6 +561,8 @@ int main() {
             }
         };
         dragAndResizePopup(false); // Settings
+        const Config routesBeforeRestore = config;
+        const float volumeBeforeRestore = config.output.volume;
         if (auto *dialog = popup())
             click(dialog->DC.CursorStartPos.x + 83, dialog->DC.CursorStartPos.y + 716); // Restore defaults
         expect(popup() && std::strcmp(popup()->Name, "Restore defaults?") == 0,
@@ -471,7 +575,13 @@ int main() {
         expect(config.output.volume < .9f, "Restore defaults applied before Save");
         if (auto *dialog = popup())
             click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save Settings
-        expect(!popup() && config.output.volume == 1.f, "Restore defaults was not committed by Save");
+        expect(!popup() && config.sources.empty() && config.outputCount() == 0 && !engine.running(),
+               "Saving Restore Defaults did not clear both Devices and Outputs and stop audio");
+        // Restore only test fixtures for the independent editor coverage below.
+        config.sources = routesBeforeRestore.sources;
+        for (size_t output = 0; output < routesBeforeRestore.outputCount(); ++output)
+            config.addOutput(routesBeforeRestore.outputAt(output));
+        frame(1600, 986);
 
         const size_t sourceCountBeforeOutputEdit = config.sources.size();
         click(1514, 702); // Configure output device.
@@ -506,7 +616,7 @@ int main() {
             click(dialog->DC.CursorStartPos.x + 634, dialog->DC.CursorStartPos.y + 634); // Save
         }
         expect(!popup() && config.output.icon == "chat" && config.output.label == "Stream Output" &&
-                   config.output.gain == 4.f && config.output.volume == 1.f,
+                   config.output.gain == 4.f && config.output.volume == volumeBeforeRestore,
                "Typed output gain was not committed");
         expect(config.sources.size() == sourceCountBeforeOutputEdit,
                "Editing output accidentally changed the source list");
@@ -539,9 +649,14 @@ int main() {
             expect(picker && picker != dialog, "Output device combo did not open");
             if (!picker || picker == dialog)
                 return;
-            const float rowStep = ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y;
+            // The dashboard's scaled font has already been popped here.
+            // Measure the actual combo rows instead of using the harness's
+            // smaller default font (which clicks the wrong third row).
+            const float spacing = ImGui::GetStyle().ItemSpacing.y;
+            const float rowStep = (picker->DC.CursorMaxPos.y - picker->DC.CursorStartPos.y + spacing) /
+                                  static_cast<float>(outputFixtures.size());
             click(picker->DC.CursorStartPos.x + 30,
-                  picker->DC.CursorStartPos.y + ImGui::GetTextLineHeight() * .5f +
+                  picker->DC.CursorStartPos.y + (rowStep - spacing) * .5f +
                       rowStep * float(fixtureIndex));
         };
         auto pressEscape = [&] {
@@ -886,30 +1001,133 @@ int main() {
 
         const ImU32 darkBackground = ui::themePalette().background;
         click(670, 900); // Settings, General.
+        const int changedBeforeTheme = changedFrames;
+        const bool closeToTrayBeforeTheme = config.closeToTray;
         if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 230,
+                  dialog->DC.CursorStartPos.y + 290); // Stage another preference.
             click(dialog->DC.CursorStartPos.x + 316,
                   dialog->DC.CursorStartPos.y + 633); // Light theme.
-            expect(config.colorTheme == ColorTheme::Dark,
-                   "Theme draft applied before Save");
+            expect(config.colorTheme == ColorTheme::Light &&
+                       ui::themePalette().background != darkBackground &&
+                       changedFrames > changedBeforeTheme,
+                   "Theme selection did not immediately apply and request persistence");
             dialog = popup();
-            click(dialog->DC.CursorStartPos.x + 633,
-                  dialog->DC.CursorStartPos.y + 716); // Save.
+            click(dialog->DC.CursorStartPos.x + 453,
+                  dialog->DC.CursorStartPos.y + 716); // Cancel remaining settings.
         }
         frame(1600, 986);
         expect(config.colorTheme == ColorTheme::Light &&
-                   ui::themePalette().background != darkBackground,
-               "Light theme was not committed and applied");
+                   ui::themePalette().background != darkBackground &&
+                   config.closeToTray == closeToTrayBeforeTheme,
+               "Cancel reverted the already-committed light theme");
 
         click(670, 900); // Reopen General settings.
         if (auto *dialog = popup()) {
             click(dialog->DC.CursorStartPos.x + 426,
                   dialog->DC.CursorStartPos.y + 633); // System theme.
+            expect(config.colorTheme == ColorTheme::System,
+                   "System theme did not become live before saving");
             dialog = popup();
-            click(dialog->DC.CursorStartPos.x + 633,
-                  dialog->DC.CursorStartPos.y + 716); // Save.
+            click(dialog->DC.CursorStartPos.x + 700,
+                  dialog->DC.CursorStartPos.y + 21); // Close without saving.
         }
         expect(config.colorTheme == ColorTheme::System,
-               "System theme choice was not committed");
+               "Closing settings reverted the System theme choice");
+
+        auto restorePreferences = [&](bool save = true) {
+            click(670, 900);
+            auto *settings = popup();
+            expect(settings && std::strcmp(settings->Name, "Settings") == 0,
+                   "Could not open settings for restore");
+            if (!settings) return;
+            click(settings->DC.CursorStartPos.x + 83,
+                  settings->DC.CursorStartPos.y + 716);
+            auto *confirm = popup();
+            expect(confirm && std::strcmp(confirm->Name, "Restore defaults?") == 0,
+                   "Restore did not ask for confirmation");
+            if (!confirm || confirm == settings) return;
+            click(confirm->DC.CursorStartPos.x + 25,
+                  confirm->DC.CursorMaxPos.y - ImGui::GetFrameHeight() * .5f);
+            settings = popup();
+            expect(settings && std::strcmp(settings->Name, "Settings") == 0,
+                   "Reset did not return to the settings draft");
+            if (settings)
+                click(settings->DC.CursorStartPos.x + (save ? 633 : 453),
+                      settings->DC.CursorStartPos.y + 716);
+            expect(!popup(), "Restored settings could not be saved or canceled");
+        };
+        const auto sourceRoutesBeforeRestore = config.sources;
+        const auto outputBeforeRestore = config.output;
+        config.bufferMillis = 150;
+        AudioEngineTestAccess::prepareMeterSession(engine, config);
+        AudioEngineTestAccess::setMonitoringState(engine, true);
+        restorePreferences(false);
+        expect(config.outputCount() == 1 && sameChannel(config.output, outputBeforeRestore) &&
+                   config.sources.size() == sourceRoutesBeforeRestore.size() &&
+                   std::equal(config.sources.begin(), config.sources.end(),
+                              sourceRoutesBeforeRestore.begin(), sameChannel) &&
+                   config.bufferMillis == 150 && engine.monitoring(),
+               "Cancel committed a staged Restore Defaults");
+        restorePreferences();
+        expect(config.sources.empty() && config.outputCount() == 0 && !engine.running() &&
+                   config.bufferMillis == Config::defaults().bufferMillis,
+               "Confirmed and saved Restore Defaults did not leave an empty setup");
+        // Subsequent ordinary Save must not retain the reset request.
+        config.sources = sourceRoutesBeforeRestore;
+        config.addOutput(outputBeforeRestore);
+        click(670, 900);
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716);
+        expect(config.outputCount() == 1 && config.sources.size() == sourceRoutesBeforeRestore.size(),
+               "A normal Save repeated an old device reset");
+
+        click(1514, 702); // Configure the last remaining output.
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 82,
+                  dialog->DC.CursorStartPos.y + 634); // Remove last output.
+        expect(!popup() && config.outputCount() == 0 && config.additionalOutputs.empty() &&
+                   ui::MixerWindowTestAccess::selectedOutput(mixer) == 0,
+               "Last output could not be removed without an invalid selection");
+        frame(1600, 986);
+        click(1000, 900); // Start Monitoring is unavailable with no destination.
+        expect(!engine.monitoring() &&
+                   ui::MixerWindowTestAccess::statusDetail(mixer).find("Add an output") != std::string::npos,
+               "Empty outputs started forwarding or reported a healthy live route");
+        restorePreferences();
+        expect(config.sources.empty() && config.outputCount() == 0,
+               "Restore defaults failed to clear sources or recreated a removed output");
+
+        // Even with no outputs the visible source meters remain useful.
+        config.sources = sourceRoutesBeforeRestore;
+        AudioEngineTestAccess::prepareMeterSession(engine, config);
+        mixer.setVisible(true);
+        engine.channelPeak(0).l.publish(.8f);
+        frame(1600, 986);
+        expect(ui::MixerWindowTestAccess::sourceMeterLevelDb(mixer, 0) > -3.f &&
+                   !engine.monitoring(), "Empty outputs prevented visible source metering");
+        mixer.setVisible(false);
+
+        click(1480, 618); // Add the first output back into the empty list.
+        injectOutputFixtures();
+        chooseOutputFixture(2);
+        expect(ui::MixerWindowTestAccess::outputDraft(mixer).deviceId == L"third-endpoint",
+               "Empty-list picker did not select the requested endpoint");
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 634,
+                  dialog->DC.CursorStartPos.y + 634);
+        expect(!popup() && config.outputCount() == 1 && config.additionalOutputs.empty() &&
+                   config.output.deviceId == L"third-endpoint" &&
+                   ui::MixerWindowTestAccess::selectedOutput(mixer) == 0,
+               "Adding an output to an empty list did not create the primary destination");
+
+        click(670, 900); // Runtime can resolve a replacement ID while Settings is open.
+        config.output.deviceId = L"freshly-resolved-output-id";
+        if (auto *dialog = popup())
+            click(dialog->DC.CursorStartPos.x + 633,
+                  dialog->DC.CursorStartPos.y + 716);
+        expect(!popup() && config.output.deviceId == L"freshly-resolved-output-id",
+               "Saving preferences restored an obsolete output ID from the settings draft");
 
         ImGui::DestroyContext();
     }

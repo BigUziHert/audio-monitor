@@ -50,6 +50,9 @@ arrives over HDMI as a single feed.
   can be typed directly from 0 to 100%, just like source percentages. Each output has
   its own buffered clock-drift correction, so one stalled device cannot block
   the others. Stop/Start Monitoring preserves the complete route.
+  Every output can be removed, including the last. New configurations start
+  with no selected outputs; an empty list stays empty after saving/restarting.
+  Source meters remain available, but forwarding requires adding an output.
 - **Tray support.** Minimize keeps audio running and releases the renderer.
   Close exits by default; Settings can make Close hide to the tray instead.
   Optional Windows startup and hidden manual launch remain available.
@@ -68,6 +71,11 @@ Volume, mute, stereo/mono, and buffer changes apply live. Sample Rate displays
 the fixed 48,000 Hz internal mix rate; its Settings link opens the classic Windows
 Sound control panel for device-format changes. A Keybinds settings category is
 reserved for future shortcut controls.
+Dark, Light, and System theme choices apply immediately and save automatically,
+even if the settings dialog is canceled or closed. Other preferences still use
+Save/Cancel. Restore Defaults resets preferences and clears both Devices and
+Outputs when saved; Cancel keeps the current setup. It never selects preset
+hardware, and the empty setup stays empty after restarting.
 
 ## Why loopback instead of a virtual audio driver
 
@@ -222,16 +230,13 @@ whenever you change something in the UI.
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "sources": [
     { "label": "Headphones", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "volume": 1, "muted": false },
     { "label": "Chat Audio", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "volume": 1, "muted": false },
     { "label": "Microphone", "kind": "microphone", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "USB Advanced Audio Device", "gain": 1, "volume": 1, "muted": false }
   ],
-  "output": { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "volume": 1, "muted": false },
-  "outputs": [
-    { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "volume": 1, "muted": false }
-  ],
+  "outputs": [],
   "mono": false,
   "closeToTray": false,
   "exclusiveOutput": true,
@@ -246,8 +251,10 @@ whenever you change something in the UI.
 independent 0-100% dashboard fader; the effective level is their product.
 `colorTheme` accepts `dark`, `light`, or `system`; `system` follows the Windows
 app-theme preference. `outputs` is the ordered list of simultaneous destinations,
-up to four. `output` mirrors its first item so older builds can still load the
-primary destination.
+from zero to four. A nonempty list also writes `output` as a legacy mirror of
+its first item. An explicit `outputs: []` always means no destinations, even
+if an old `output` field remains in the file. Legacy single-output files are
+migrated without changing the user's selected device.
 
 On the first save of a version 1 configuration, the original is preserved as
 `config.json.v1.bak` beside `config.json`. To return to an older build, exit the
@@ -310,19 +317,25 @@ measurement is low-passed at 0.5 s because instantaneous depth jumps by a whole
 packet every period.
 
 This part is covered by tests that run without any audio hardware
-(`scripts/run_tests.sh`): 20 simulated minutes at ±100 ppm and +400 ppm settle
-to exactly the true clock error with zero underruns, and a two-second capture
-stall recovers in about 20 seconds.
+(`scripts/run_tests.sh`), plus the Windows `source-drift` and `output-bus`
+CTest cases. These exercise the actual source mixer and output resamplers
+with packetized, independently scheduled clocks, including 44.1/48/96 kHz
+devices, positive/negative drift, and capture/render stalls. A delayed capture
+batch is trimmed when a silent source re-primes; an excessive output backlog
+is faded and trimmed to the newest target-sized tail. Scheduling stalls must
+not become persistent extra latency while the slow clock controller catches up.
 
 ### Loopback silence
 
 WASAPI loopback delivers **no packets at all** when nothing is playing to that
 endpoint — not silence, nothing. Two consequences:
 
-- **It cannot be event-driven.** With `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, a
-  silent endpoint never signals the event, so the wait blocks forever the
-  moment the game goes quiet. Loopback is polled here, on a high-resolution
-  waitable timer at half the device period.
+- **Silence does not signal an event.** On Windows 10 1703 and newer, loopback
+  uses packet events with a separate stop event and a 100 ms idle timeout.
+  There is no need to poll a silent endpoint every 5 ms. Microphone capture
+  also uses events; older loopback systems or drivers that reject event setup
+  fall back to a waitable timer at half the device period. See Microsoft's
+  [loopback recording documentation](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording).
 - **The render side still needs data every period.** Silence is synthesised on
   the consumer: when a ring cannot supply a full block the mixer fills the
   remainder with zeros and fades that channel out over ~5 ms, fading back in
@@ -351,6 +364,34 @@ Meters are polled by the UI from atomics. The audio thread only ever folds a
 new maximum into an atomic; all decay, hold and dB conversion happen on the UI
 timer, where wall-clock time actually exists. Reading is destructive
 (max-since-last-read), so no peak is missed between frames.
+
+### Gaming overhead and latency
+
+The dashboard is capped at 60 frames/s while focused and 30 frames/s when
+another application is foreground. Health/routing checks run at 5 Hz and the
+spectrum analysis at up to 30 Hz; source meter ballistics still update every
+displayed frame. Offscreen source cards skip layout/drawing. A fully occluded
+window only checks visibility four times/s. In the tray, the UI blocks on
+messages and releases its D3D resources; active audio forwarding continues.
+When both hidden and paused, the audio engine also stops.
+
+The mix pump stays at a 10 ms cadence instead of increasing wakeups to chase
+an unsafe zero-size buffer. The **Buffer** setting is the source queue target,
+not total end-to-end latency, and retains a 20 ms minimum. Output queues use
+the device's normal period instead of treating a shared client's maximum
+buffer size as its callback period. Normal outputs retain a 20 ms base plus
+5 ms of packet-phase reserve; longer-period devices retain additional headroom.
+Event-driven capture removes the old half-period polling wait without asking
+the Windows audio engine or hardware to run at a higher interrupt rate.
+Windows, drivers, wireless transport and hardware can add further
+delay: true zero-latency software monitoring is not possible. See Microsoft's
+[audio latency overview](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio).
+
+For a repeatable CPU-only dashboard comparison, set `AUDIOMON_UI_BENCHMARK=1`
+and run the Release `ui-test.exe`. It compares per-frame status/FFT work with
+the bounded cadence using 16 synthetic sources and four outputs. This does
+not measure GPU cost or game FPS; real performance also depends on the driver,
+selected devices, display refresh rate and game workload.
 
 ### Device resilience
 

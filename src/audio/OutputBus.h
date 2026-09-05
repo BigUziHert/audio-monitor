@@ -26,6 +26,8 @@ namespace audiomon {
 class OutputBus final : public IMixSource {
 public:
     static constexpr uint32_t kSourceSampleRate       = 48000;
+    // Base queue; the consumer adds 25% phase reserve (normally 5 ms). This
+    // headroom prevents drift from starving a callback at a pump packet edge.
     static constexpr uint32_t kTargetBufferMillis     = 20;
     static constexpr uint32_t kDefaultTargetFrames    =
         kSourceSampleRate * kTargetBufferMillis / 1000;
@@ -57,10 +59,11 @@ public:
     // IMixSource -- called only by this bus's RenderStream consumer.
     void renderMix(float* dst, uint32_t frames) noexcept override;
     void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept override;
+    void onRenderPeriod(uint32_t nominalFrames) noexcept override;
 
-    // Lock-free diagnostics.  droppedFrames counts only input frames rejected
-    // by publish(); starvedFrames counts missing output frames after playback
-    // had already left its initial priming state.
+    // Lock-free diagnostics. droppedFrames includes overflow rejection and
+    // stale frames trimmed after a scheduling hitch; starvedFrames counts
+    // missing output frames after playback left its initial priming state.
     uint32_t depthFrames() const noexcept { return ring_.depth(); }
     uint32_t capacityFrames() const noexcept { return ring_.capacity(); }
     uint32_t targetFrames() const noexcept { return targetFrames_; }
@@ -78,7 +81,11 @@ public:
         return published_.load(std::memory_order_relaxed);
     }
     uint64_t droppedFrames() const noexcept {
-        return dropped_.load(std::memory_order_relaxed);
+        return dropped_.load(std::memory_order_relaxed) +
+            latencyTrimmed_.load(std::memory_order_relaxed);
+    }
+    uint64_t latencyCorrections() const noexcept {
+        return latencyCorrections_.load(std::memory_order_relaxed);
     }
     uint64_t starvedFrames() const noexcept {
         return starved_.load(std::memory_order_relaxed);
@@ -89,8 +96,10 @@ public:
     void clearStatistics() noexcept;
 
 private:
-    void resetConsumer() noexcept;
+    void resetConsumer(uint32_t keepNewestFrames = 0) noexcept;
     void applyPresence(float* samples, uint32_t frames) noexcept;
+    void finishTimelineBreak() noexcept;
+    void setCallbackTarget(uint32_t frames) noexcept;
 
     StereoRing     ring_;
     DriftResampler resampler_;
@@ -110,6 +119,7 @@ private:
     double   baseRatio_ = 1.0;
     bool     priming_ = true;
     bool     timelineBreakPending_ = false;
+    bool     latencyTrimPending_ = false;
 
     // Cross-thread diagnostics/status.
     std::atomic<uint32_t> renderRateOut_{0};
@@ -118,6 +128,8 @@ private:
     std::atomic<bool>     primingOut_{true};
     std::atomic<uint64_t> published_{0};
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> latencyTrimmed_{0};
+    std::atomic<uint64_t> latencyCorrections_{0};
     std::atomic<uint64_t> starved_{0};
     std::atomic<uint64_t> starvationEvents_{0};
 };

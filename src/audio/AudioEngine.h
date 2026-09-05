@@ -142,6 +142,7 @@ private:
         OutputGate(AudioEngine& engine, size_t output) : engine_(engine), output_(output) {}
         void renderMix(float* dst, uint32_t frames) noexcept override;
         void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept override;
+        void onRenderPeriod(uint32_t periodFrames) noexcept override;
     private:
         AudioEngine& engine_;
         size_t output_;
@@ -158,6 +159,7 @@ private:
         std::atomic<bool>     muted{false};
         std::atomic<uint32_t> depthOut{0};
         std::atomic<double>   ratioOut{1.0};
+        std::atomic<uint64_t> latencyTrimmed{0};
 
         // Audio-thread-only state.
         float    smoothedGain = 1.0f;

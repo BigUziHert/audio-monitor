@@ -111,11 +111,11 @@ struct AudioEngineTestAccess {
         engine.setBufferMillis(bufferMs);
         engine.onRenderFormat(48000, 480);
     }
-    static void feed(AudioEngine& engine, uint32_t frames) {
+    static void feed(AudioEngine& engine, uint32_t frames, float left = 0.5f, float right = 0.25f) {
         auto& ring = engine.channels_[0]->stream.ring();
         const auto available = ring.beginWrite();
         frames = std::min(frames, available);
-        for (uint32_t i = 0; i < frames; ++i) ring.writeFrame(i, 0.5f, 0.25f);
+        for (uint32_t i = 0; i < frames; ++i) ring.writeFrame(i, left, right);
         ring.endWrite(frames);
     }
     static void idle(AudioEngine& engine) { engine.channels_[0]->stream.flowing_.store(false); }
@@ -189,6 +189,18 @@ struct AudioEngineTestAccess {
         std::lock_guard<std::mutex> config(engine.configMutex_);
         for (int i = 0; i < 1000; ++i) engine.setMonitoring((i & 1) != 0);
     }
+    static void clearConfiguredOutputs(AudioEngine& engine) {
+        engine.config_.clearOutputs();
+        engine.outputCount_ = 0;
+    }
+    static bool allOutputWorkersStopped(const AudioEngine& engine) {
+        return std::all_of(engine.renders_.begin(), engine.renders_.end(),
+            [](const auto& render) { return render->state() == StreamState::Stopped; });
+    }
+    static bool pumpIsCurrent(const AudioEngine& engine) {
+        return engine.pumpObservedState_.load(std::memory_order_acquire) ==
+            engine.monitoringState_.load(std::memory_order_acquire);
+    }
 };
 } // namespace audiomon
 
@@ -202,6 +214,87 @@ int main() {
         return std::any_of(samples.begin(), samples.end(), [](float v) { return std::fabs(v) > 0.1f; });
     };
     std::vector<float> block(480 * 2);
+    {
+        AudioEngine engine;
+        AudioEngineTestAccess::prepare(engine, 20);
+        AudioEngineTestAccess::clearConfiguredOutputs(engine);
+        AudioEngineTestAccess::activateMeterSession(engine);
+        engine.setMonitoring(true);
+        AudioEngineTestAccess::feed(engine, 960);
+        AudioEngineTestAccess::pumpBlock(engine);
+        check(engine.running() && !engine.monitoring() && engine.outputCount() == 0 &&
+                  engine.channelPeak(0).l.take() > 0.45f &&
+                  AudioEngineTestAccess::allOutputWorkersStopped(engine),
+              "zero outputs retain live source metering without reporting or opening forwarding");
+    }
+    {
+        const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        check(SUCCEEDED(coHr) || coHr == RPC_E_CHANGED_MODE,
+              "COM initialized for hardware-free zero-output engine sessions");
+        if (SUCCEEDED(coHr) || coHr == RPC_E_CHANGED_MODE) {
+            Config noOutputs = Config::defaults();
+            noOutputs.sources.clear(); // enumerator only; no audio endpoint is opened
+            AudioEngine engine;
+            for (bool forwardingRequested : {false, true}) {
+                const bool started = engine.start(noOutputs, forwardingRequested);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                while (started && !AudioEngineTestAccess::pumpIsCurrent(engine) &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                check(started && engine.running() && !engine.monitoring() &&
+                          engine.outputCount() == 0 && AudioEngineTestAccess::pumpIsCurrent(engine),
+                      "both paused and forwarding startup with no outputs run the metering pump safely");
+                for (int i = 0; i < 20; ++i) engine.setMonitoring((i & 1) == 0);
+                engine.setOutputDevice(0, {L"must-not-open", L"must-not-open"});
+                engine.setOutputGain(0, 0.5f);
+                engine.setOutputMuted(0, true);
+                check(!engine.monitoring() && engine.outputStatus(0).state == StreamState::Stopped &&
+                          AudioEngineTestAccess::allOutputWorkersStopped(engine) &&
+                          !engine.updateConfigFromRuntime(noOutputs) && noOutputs.outputCount() == 0,
+                      "zero-output controls and runtime synchronization cannot resurrect a destination");
+                engine.stop();
+                check(!engine.running() && !engine.monitoring() &&
+                          AudioEngineTestAccess::allOutputWorkersStopped(engine),
+                      "zero-output engine shuts down cleanly after rapid forwarding requests");
+            }
+            if (SUCCEEDED(coHr)) CoUninitialize();
+        }
+    }
+    {
+        AudioEngine engine;
+        AudioEngineTestAccess::prepare(engine, 20);
+        AudioEngineTestAccess::feed(engine, 960);
+        engine.renderMix(block.data(), 480);
+        for (int i = 0; i < 5; ++i) engine.renderMix(block.data(), 480);
+        check(!audible(block), "capture-stall fixture has faded to silence");
+        AudioEngineTestAccess::feed(engine, 8640, 0.75f, 0.75f);
+        AudioEngineTestAccess::feed(engine, 960, 0.25f, 0.25f);
+        engine.renderMix(block.data(), 480);
+        check(AudioEngineTestAccess::depth(engine) <= 960 &&
+                  engine.channelStatus(0).dropped == 8640 &&
+                  std::fabs(block[478 * 2] - 0.25f) < 0.0001f,
+              "late capture batch resumes at current audio instead of retaining stale latency");
+    }
+    {
+        AudioEngine engine;
+        AudioEngineTestAccess::prepare(engine, 20);
+        AudioEngineTestAccess::idle(engine);
+        engine.setGain(0, 0.25f);
+        bool silent = true;
+        for (int i = 0; i < 100; ++i) {
+            engine.renderMix(block.data(), 480);
+            silent = silent && std::all_of(block.begin(), block.end(),
+                                           [](float value) { return value == 0.0f; });
+        }
+        check(silent && engine.channelPeak(0).l.take() == 0.0f,
+              "idle-source fast path emits exact silence and no meter peak");
+        AudioEngineTestAccess::setFlowing(engine, true);
+        AudioEngineTestAccess::feed(engine, 960);
+        engine.renderMix(block.data(), 480);
+        check(block.front() > 0.0f && block.front() < 0.001f &&
+                  std::fabs(block[478 * 2] - 0.125f) < 0.0001f,
+              "source resumes from idle at its edited gain with the normal click-free fade");
+    }
     {
         AudioEngine engine;
         AudioEngineTestAccess::prepare(engine, 20);
@@ -250,9 +343,11 @@ int main() {
         AudioEngineTestAccess::activateMeterSession(engine);
         engine.setMonitoring(true);
         AudioEngineTestAccess::reopenOutputGate(engine);
-        std::vector<float> oldMix(4800 * 2, 0.75f);
+        // Stay inside the normal queue region: this test covers generation
+        // gates, while output-bus-test separately covers oversized backlogs.
+        std::vector<float> oldMix(1440 * 2, 0.75f);
         auto& bus = AudioEngineTestAccess::outputBus(engine);
-        bus.publish(oldMix.data(), 4800, 1.0f, false);
+        bus.publish(oldMix.data(), 1440, 1.0f, false);
         AudioEngineTestAccess::renderOutputGate(engine, block.data(), 480);
         check(audible(block), "active forwarding gate consumes audible mix samples");
         engine.setMonitoring(false);
@@ -266,8 +361,8 @@ int main() {
               "rapid resume cannot consume the preceding forwarding generation");
         AudioEngineTestAccess::reopenOutputGate(engine);
         check(bus.depthFrames() == 0, "resumed render consumer discards every queued old frame");
-        std::vector<float> newMix(2400 * 2, -0.25f);
-        bus.publish(newMix.data(), 2400, 1.0f, false);
+        std::vector<float> newMix(1440 * 2, -0.25f);
+        bus.publish(newMix.data(), 1440, 1.0f, false);
         AudioEngineTestAccess::renderOutputGate(engine, block.data(), 480);
         check(audible(block) && std::all_of(block.begin(), block.end(),
                   [](float v) { return v <= 0.0f; }),

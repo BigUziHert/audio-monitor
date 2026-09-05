@@ -40,8 +40,8 @@ public:
     static constexpr double kMaxRatio = 1.005;
 
     // Hard guarantee of gentleness, independent of controller state: the ratio
-    // can never move faster than this per update. Traversing the entire legal
-    // range takes ~25 seconds at a 10ms block.
+    // can never move faster than this per 10 ms of audio. Scale by the actual
+    // callback duration so 5/10/20 ms devices share the same slew per second.
     static constexpr double kMaxRatioStep = 2.0e-6;
 
     // How much of the correction the integrator alone is allowed to supply.
@@ -61,7 +61,6 @@ public:
                    double updatePeriodSeconds = 0.01) noexcept {
         fs_     = sampleRate > 0.0 ? sampleRate : 48000.0;
         target_ = targetDepthFrames;
-        dt_     = updatePeriodSeconds > 0.0 ? updatePeriodSeconds : 0.01;
 
         kp_ = 1.0 / (fs_ * kProportionalSeconds);
         ki_ = 1.0 / (4.0 * fs_ * kProportionalSeconds * kProportionalSeconds);
@@ -69,7 +68,7 @@ public:
         // One-pole smoothing on the depth measurement. Instantaneous depth
         // steps by a whole capture packet every period; feeding that straight
         // in would make the ratio jitter.
-        smoothA_ = std::exp(-dt_ / kMeasureSeconds);
+        setUpdatePeriod(updatePeriodSeconds);
 
         reset();
     }
@@ -84,6 +83,13 @@ public:
     // slew limit, which for the full 20..250ms range takes tens of seconds and
     // is inaudible.
     void setTarget(double targetDepthFrames) noexcept { target_ = targetDepthFrames; }
+
+    // Shared-mode callbacks can vary in length with endpoint padding. Keep
+    // filter/integrator time correct without throwing away clock convergence.
+    void setUpdatePeriod(double seconds) noexcept {
+        dt_ = seconds > 0.0 ? seconds : 0.01;
+        smoothA_ = std::exp(-dt_ / kMeasureSeconds);
+    }
 
     // Call after any discontinuity: device reconnect, DATA_DISCONTINUITY, a
     // genuine starve, or an overflow drop. A loop this slow would otherwise
@@ -133,7 +139,7 @@ public:
         // Let it unwind faster so a large downward setpoint move cannot drain
         // the ring before the controller gets back from its upper rail.
         const bool towardUnity = std::fabs(clamped - 1.0) < std::fabs(ratio_ - 1.0);
-        const double limit = kMaxRatioStep * (towardUnity ? 4.0 : 1.0);
+        const double limit = kMaxRatioStep * (dt_ / 0.01) * (towardUnity ? 4.0 : 1.0);
         const double step = std::clamp(clamped - ratio_, -limit, limit);
         ratio_ = std::clamp(ratio_ + step, kMinRatio, kMaxRatio);
         return ratio_;

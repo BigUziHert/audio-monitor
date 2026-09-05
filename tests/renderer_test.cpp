@@ -27,6 +27,28 @@ int main() {
         if (!ok) { std::printf("FAIL: %s\n", label); ++failed; }
         return ok;
     };
+    {
+        VisibleFramePacer pacer;
+        const auto start = VisibleFramePacer::TimePoint{};
+        pacer.reset(start);
+        check(pacer.waitMilliseconds(start) == 0, "new frame pacer allows an immediate frame");
+        pacer.frameStarted(start);
+        check(pacer.waitMilliseconds(start) == 17 &&
+                  pacer.waitMilliseconds(start + std::chrono::milliseconds(10)) == 7 &&
+                  pacer.waitMilliseconds(start + std::chrono::microseconds(16667)) == 0,
+              "foreground frame pacing caps rendering at 60 Hz");
+        pacer.setFramesPerSecond(30, start + std::chrono::milliseconds(20));
+        check(pacer.framesPerSecond() == 30 &&
+                  pacer.waitMilliseconds(start + std::chrono::milliseconds(20)) == 0,
+              "changing foreground state schedules a frame immediately");
+        pacer.frameStarted(start + std::chrono::milliseconds(20));
+        check(pacer.waitMilliseconds(start + std::chrono::milliseconds(20)) == 34,
+              "background frame pacing caps rendering at 30 Hz");
+        const auto afterStall = start + std::chrono::seconds(2);
+        pacer.frameStarted(afterStall);
+        check(pacer.waitMilliseconds(afterStall) == 34,
+              "frame pacing never bursts to catch up after a stall");
+    }
     const auto instance = GetModuleHandleW(nullptr);
     WNDCLASSW wc{};
     wc.hInstance = instance;

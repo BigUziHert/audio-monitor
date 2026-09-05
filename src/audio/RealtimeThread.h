@@ -39,9 +39,10 @@ public:
         handle_    = AvSetMmThreadCharacteristicsW(taskName, &taskIndex_);
         if (!handle_) {
             lastError_ = GetLastError();
-            // Fall back to a plain priority bump so a machine with the MMCSS
-            // service disabled still gets something.
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            // Keep a modest boost if MMCSS is disabled. TIME_CRITICAL lacks
+            // MMCSS's scheduling budget and can starve the game/UI threads
+            // when a driver stalls or several streams become ready at once.
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             return false;
         }
         AvSetMmThreadPriority(handle_, priority);

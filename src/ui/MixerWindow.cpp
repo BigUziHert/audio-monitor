@@ -50,6 +50,20 @@ const ImU32 &sliderTrack = themePalette().sliderTrack,
             &graphBarBottom = themePalette().graphBarBottom,
             &onAccent = themePalette().onAccent;
 constexpr float kStartupSettleSeconds = 1.5f;
+
+// Ordinary settings edits never own routing or faders. Copying the entire draft on Save
+// would overwrite device IDs re-resolved while the modal was open, and made
+// Restore Defaults replace the user's destinations with preset hardware.
+void copyPreferences(Config &destination, const Config &source) {
+    destination.mono = source.mono;
+    destination.closeToTray = source.closeToTray;
+    destination.exclusiveOutput = source.exclusiveOutput;
+    destination.startWithWindows = source.startWithWindows;
+    destination.startMinimized = source.startMinimized;
+    destination.bufferMillis = source.bufferMillis;
+    destination.colorTheme = source.colorTheme;
+}
+
 enum Icon {
     Wave,
     Headphones,
@@ -390,7 +404,8 @@ struct Canvas {
             constexpr float inputWidth = 61.f;
             const float horizontalPadding =
                 std::max(4.f * s, (inputWidth * s - ImGui::CalcTextSize(preview).x) / 2.f);
-            const std::string inputId = std::string(id) + "-percent";
+            char inputId[64];
+            std::snprintf(inputId, sizeof(inputId), "%s-percent", id);
             ImGui::SetCursorScreenPos(p(x + width + 7, y));
             ImGui::SetNextItemWidth(inputWidth * s);
             ImGui::PushStyleColor(ImGuiCol_FrameBg,
@@ -405,7 +420,7 @@ struct Canvas {
                                 {horizontalPadding, ImGui::GetStyle().FramePadding.y});
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, std::max(1.f, s));
             const bool inputChanged = ImGui::InputFloat(
-                inputId.c_str(), &percent, 0.f, 0.f, "%.0f%%",
+                inputId, &percent, 0.f, 0.f, "%.0f%%",
                 ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_AutoSelectAll);
             ImGui::PopStyleVar(2);
             ImGui::PopStyleColor(4);
@@ -674,6 +689,11 @@ void MixerWindow::setVisible(bool visible) {
     meters_ = {};
     outputMeter_ = {};
     spectrum_ = Spectrum{};
+    statusRefreshTimer_ = 0;
+    spectrumRefreshTimer_ = 0;
+    lastStatusMonitoring_ = false;
+    statusRefreshForced_ = true;
+    spectrumWasActive_ = false;
     if (visible_ && engine_) {
         for (int i = 0; i < kMaxSources; ++i) {
             engine_->channelPeak(i).l.take();
@@ -698,7 +718,8 @@ void MixerWindow::shutdown() {
 void MixerWindow::syncMeteringVisibility() {
     // A null HWND is used by the headless UI harness; it injects meter samples
     // and must never open the user's audio devices.
-    if (!window_ || !visible_ || engine_->running() || meteringStartAttempted_)
+    if (!window_ || !visible_ || engine_->running() || meteringStartAttempted_ ||
+        (config_->sources.empty() && config_->outputCount() == 0))
         return;
     meteringStartAttempted_ = true;
     engine_->start(*config_, false);
@@ -728,10 +749,14 @@ void MixerWindow::restart() {
     meters_ = {};
     outputMeter_ = {};
     spectrum_ = Spectrum{};
+    statusRefreshTimer_ = 0;
+    spectrumRefreshTimer_ = 0;
+    lastStatusMonitoring_ = false;
+    statusRefreshForced_ = true;
+    spectrumWasActive_ = false;
     lastUnderruns_ = lastDropped_ = 0;
     refreshDevices();
     meteringStartAttempted_ = false;
-    refreshTimer_ = 2;
 }
 void MixerWindow::addStatusWarning(const std::string &label, const std::string &detail,
                                    int severity) {
@@ -745,7 +770,7 @@ void MixerWindow::addStatusWarning(const std::string &label, const std::string &
 }
 void MixerWindow::refreshStatus(float dt) {
     refreshTimer_ += dt;
-    if (refreshTimer_ >= 2) {
+    if (refreshTimer_ >= kApplicationRefreshSeconds) {
         const bool hasApplicationSource =
             std::any_of(config_->sources.begin(), config_->sources.end(), [](const ChannelConfig &source) {
                 return source.kind == SourceKind::Application;
@@ -756,11 +781,27 @@ void MixerWindow::refreshStatus(float dt) {
             apps_.clear();
         refreshTimer_ = 0;
     }
+    const bool running = engine_->monitoring();
+    statusRefreshTimer_ += dt;
+    if (!statusRefreshForced_ && running == lastStatusMonitoring_ &&
+        statusRefreshTimer_ < kStatusRefreshSeconds)
+        return;
+    const float statusDt = statusRefreshTimer_;
+    statusRefreshTimer_ = 0;
+    lastStatusMonitoring_ = running;
+    statusRefreshForced_ = false;
+    ++statusEvaluationCount_;
     severity_ = 0;
     statusDetail_.clear();
-    const bool running = engine_->monitoring();
+    if (config_->outputCount() == 0) {
+        updateStartupSettling(false, false, statusDt);
+        status_ = "No outputs";
+        statusDetail_ = "Add an output device to send the mix to a playback device. Source meters remain active.";
+        severity_ = 1;
+        return;
+    }
     if (!running) {
-        updateStartupSettling(false, false, dt);
+        updateStartupSettling(false, false, statusDt);
         status_ = "Stopped";
         statusDetail_ = "Audio forwarding is stopped. Source meters remain active.";
         return;
@@ -791,7 +832,7 @@ void MixerWindow::refreshStatus(float dt) {
         if (config_->sources[i].enabled && sourceStates.back().state != StreamState::Running)
             allStreamsReady = false;
     }
-    const bool settling = updateStartupSettling(true, allStreamsReady, dt);
+    const bool settling = updateStartupSettling(true, allStreamsReady, statusDt);
     if (settling) {
         status_ = "Stopped";
         severity_ = 2;
@@ -877,7 +918,7 @@ void MixerWindow::refreshStatus(float dt) {
                 status_ = "Duplicate audio";
         }
     refreshDropoutStatus(anyOutputRunning ? StreamState::Running : StreamState::Failed,
-                         totalUnderruns, dropped, dt);
+                         totalUnderruns, dropped, statusDt);
     if (clippingTimer_ > 0)
         warn("Clipping", "The mix reached 0 dBFS. Lower a source or master volume to prevent distortion.", 2);
     if (!severity_)
@@ -920,7 +961,7 @@ void MixerWindow::refreshDropoutStatus(StreamState outputState, uint64_t underru
         addStatusWarning("Audio dropouts",
                          "Audio dropouts were detected recently. Try increasing Buffer in Settings.");
 }
-bool MixerWindow::drawSource(size_t index, float width, float dt) {
+bool MixerWindow::drawSource(size_t index, float width) {
     auto &source = config_->sources[index];
     const auto state = engine_->running() ? engine_->channelStatus(static_cast<int>(index)) : ChannelStatus{};
     const auto position = ImGui::GetCursorScreenPos();
@@ -962,11 +1003,6 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
         openSource_ = true;
         refreshDevices();
     }
-    const float peak = engine_->running()
-                           ? std::max(engine_->channelPeak(static_cast<int>(index)).l.take(),
-                                      engine_->channelPeak(static_cast<int>(index)).r.take())
-                           : 0.f;
-    meters_[index].update(peak, dt);
     meter(c, 90, 112, width - 108, meters_[index].levelDb());
     c.icon(source.muted ? Muted : Speaker, 39, 174, source.muted ? red : white, 27);
     if (c.hit("Mute source", 18, 152, 42, 42, source.muted ? "Unmute source" : "Mute source")) {
@@ -991,6 +1027,7 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
 bool MixerWindow::draw(float dt, int width, int height) {
     if (width <= 0 || height <= 0)
         return false;
+    const ColorTheme themeAtFrameStart = config_->colorTheme;
     syncMeteringVisibility();
     dt = std::clamp(dt, .001f, .1f);
     scale_ = std::min(float(width) / 1600.f, float(height) / 986.f);
@@ -1038,13 +1075,28 @@ bool MixerWindow::draw(float dt, int width, int height) {
         refreshDevices();
         meteringStartAttempted_ = false;
     }
+    // Keep every meter's ballistics continuous even when its card is clipped;
+    // only the substantially heavier card layout and geometry are skipped.
+    for (size_t i = 0; i < config_->sources.size(); ++i) {
+        const float sourcePeak = engine_->running()
+                                     ? std::max(engine_->channelPeak(static_cast<int>(i)).l.take(),
+                                                engine_->channelPeak(static_cast<int>(i)).r.take())
+                                     : 0.f;
+        meters_[i].update(sourcePeak, dt);
+    }
     ImGui::SetCursorScreenPos(c.p(44, 191));
     ImGui::BeginChild("Source list", {434 * scale_, (h - 307) * scale_}, ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoBackground);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 18 * scale_));
     const float sourceWidth = ImGui::GetContentRegionAvail().x / scale_;
-    for (size_t i = 0; i < config_->sources.size(); ++i)
-        changed |= drawSource(i, sourceWidth, dt);
+    // Only build geometry and copy status strings for cards intersecting the
+    // scroll viewport. At the 16-source limit this reduces a typical frame
+    // from all 16 cards to the three or four the user can actually see.
+    ImGuiListClipper sourceClipper;
+    sourceClipper.Begin(static_cast<int>(config_->sources.size()));
+    while (sourceClipper.Step())
+        for (int i = sourceClipper.DisplayStart; i < sourceClipper.DisplayEnd; ++i)
+            changed |= drawSource(static_cast<size_t>(i), sourceWidth);
     if (config_->sources.empty())
         ImGui::TextWrapped("Add a playback device, microphone, or app to begin your mix.");
     ImGui::PopStyleVar();
@@ -1064,7 +1116,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
         ImGui::TextUnformatted("Up to 16 sources can be mixed at once.");
         ImGui::EndPopup();
     }
-    selectedOutput_ = std::min(selectedOutput_, config_->outputCount() - 1);
+    selectedOutput_ = config_->outputCount() == 0
+                          ? 0 : std::min(selectedOutput_, config_->outputCount() - 1);
     float peak = 0.f;
     if (engine_->monitoring())
         for (size_t i = 0; i < config_->outputCount(); ++i)
@@ -1072,8 +1125,30 @@ bool MixerWindow::draw(float dt, int width, int height) {
                                           engine_->outputPeak(i).r.take()));
     outputMeter_.update(peak, dt);
     clippingTimer_ = peak >= 1.f ? 2.f : std::max(0.f, clippingTimer_ - dt);
-    spectrum_.update(engine_->visualSamples(), OutputBus::kSourceSampleRate, dt,
-                     engine_->monitoring());
+    const bool spectrumActive = engine_->monitoring() && config_->outputCount() > 0;
+    if (!spectrumActive) {
+        // The pump deliberately publishes timed silence while forwarding is
+        // paused. There is no reason to copy those samples through the FFT's
+        // history one by one; advance the SPSC consumer in O(1).
+        engine_->visualSamples().dropAllFromConsumer();
+        if (spectrumWasActive_)
+            spectrum_ = Spectrum{};
+        spectrumWasActive_ = false;
+        spectrumRefreshTimer_ = 0;
+    } else {
+        spectrumRefreshTimer_ += dt;
+        if (!spectrumWasActive_ || spectrumRefreshTimer_ >= kSpectrumRefreshSeconds) {
+            const float spectrumDt = spectrumRefreshTimer_;
+            // This accumulator is elapsed time since the previous analysis.
+            // Reset it completely so a fractional cadence remainder is not
+            // counted again in the next decay step.
+            spectrumRefreshTimer_ = 0;
+            spectrum_.update(engine_->visualSamples(), OutputBus::kSourceSampleRate,
+                             spectrumDt, true);
+            ++spectrumEvaluationCount_;
+        }
+        spectrumWasActive_ = true;
+    }
     refreshStatus(dt);
     const ImU32 statusColor = !engine_->monitoring() || severity_ >= 2 ? red : severity_ ? amber : green;
     c.rect(rightX, 105, rightW, liveH, panel, 19);
@@ -1190,64 +1265,71 @@ bool MixerWindow::draw(float dt, int width, int height) {
         }
     }
 
-    auto &selectedOutput = config_->outputAt(selectedOutput_);
-    const auto out = engine_->outputStatus(selectedOutput_);
-    c.rect(rightX + 18, outputY + 79, rightW - 38, 164, card, 16);
-    const auto outputIcon = iconFromKey(selectedOutput.icon, Screen);
-    // Screen is the output card's default icon and remains purple whether the
-    // implicit default or the explicit icon choice is stored.
-    const auto outputColor = selectedOutput.icon.empty() || selectedOutput.icon == "screen"
-                                 ? purple
-                                 : sourceColor(selectedOutput, selectedOutput_);
-    c.badge(outputIcon, rightX + 59, outputY + 127, outputColor);
-    auto outputDeviceName = !engine_->monitoring() || out.deviceName.empty()
-                                ? toUtf8(selectedOutput.deviceNameMatch)
-                                : toUtf8(out.deviceName);
-    if (outputDeviceName.empty())
-        outputDeviceName = "Choose output device";
-    const auto outputDisplayName = selectedOutput.label.empty() ? outputDeviceName : selectedOutput.label;
-    c.scrollingText(rightX + 107, outputY + 97, outputDisplayName, 24, white, true, rightW - 318);
-    std::string outputSubtitle = engine_->monitoring() && out.state == StreamState::Running
-                                     ? (out.exclusive ? "Exclusive audio output" : "Shared audio output")
-                                     : "Combined audio destination";
-    if (!selectedOutput.label.empty())
-        outputSubtitle = outputDeviceName + " - " + outputSubtitle;
-    if (selectedOutput_ == 0 && config_->outputCount() > 1)
-        outputSubtitle = "Primary - " + outputSubtitle;
-    c.scrollingText(rightX + 107, outputY + 132, outputSubtitle, 19, gray, false, rightW - 318);
-    bool active = engine_->monitoring() && out.state == StreamState::Running;
-    c.rect(rightX + rightW - 197, outputY + 102, 97, 46,
-           active ? activeStatusBackground : idleStatusBackground, 24, false);
-    c.centeredText(rightX + rightW - 148.5f, outputY + 125, active ? "Active" : "Idle", 20,
-                   active ? green : amber);
-    c.rect(rightX + rightW - 83, outputY + 101, 46, 46, controlFill, 11, false);
-    c.icon(Down, rightX + rightW - 60, outputY + 124, white, 28);
-    if (c.hit("Configure output device", rightX + rightW - 86, outputY + 98, 52, 52,
-              "Configure the output device, name, icon, and mix gain")) {
-        refreshDevices();
-        editOutput_ = static_cast<int>(selectedOutput_);
-        outputDraft_ = selectedOutput;
-        outputDraft_.kind = SourceKind::Playback;
-        outputDraft_.processPath.clear();
-        outputDraft_.enabled = true;
-        std::snprintf(outputName_, sizeof(outputName_), "%s", selectedOutput.label.c_str());
-        openOutput_ = true;
+    if (config_->outputCount() == 0) {
+        c.rect(rightX + 18, outputY + 79, rightW - 38, 164, card, 16);
+        c.centeredText(rightX + rightW / 2, outputY + 137, "No output devices", 24, white);
+        c.centeredText(rightX + rightW / 2, outputY + 178,
+                       "Choose Add Output to send your mix to a playback device.", 18, gray);
+    } else {
+        auto &selectedOutput = config_->outputAt(selectedOutput_);
+        const auto out = engine_->outputStatus(selectedOutput_);
+        c.rect(rightX + 18, outputY + 79, rightW - 38, 164, card, 16);
+        const auto outputIcon = iconFromKey(selectedOutput.icon, Screen);
+        // Screen is the output card's default icon and remains purple whether the
+        // implicit default or the explicit icon choice is stored.
+        const auto outputColor = selectedOutput.icon.empty() || selectedOutput.icon == "screen"
+                                     ? purple
+                                     : sourceColor(selectedOutput, selectedOutput_);
+        c.badge(outputIcon, rightX + 59, outputY + 127, outputColor);
+        auto outputDeviceName = !engine_->monitoring() || out.deviceName.empty()
+                                    ? toUtf8(selectedOutput.deviceNameMatch)
+                                    : toUtf8(out.deviceName);
+        if (outputDeviceName.empty())
+            outputDeviceName = "Choose output device";
+        const auto outputDisplayName = selectedOutput.label.empty() ? outputDeviceName : selectedOutput.label;
+        c.scrollingText(rightX + 107, outputY + 97, outputDisplayName, 24, white, true, rightW - 318);
+        std::string outputSubtitle = engine_->monitoring() && out.state == StreamState::Running
+                                         ? (out.exclusive ? "Exclusive audio output" : "Shared audio output")
+                                         : "Combined audio destination";
+        if (!selectedOutput.label.empty())
+            outputSubtitle = outputDeviceName + " - " + outputSubtitle;
+        if (selectedOutput_ == 0 && config_->outputCount() > 1)
+            outputSubtitle = "Primary - " + outputSubtitle;
+        c.scrollingText(rightX + 107, outputY + 132, outputSubtitle, 19, gray, false, rightW - 318);
+        bool active = engine_->monitoring() && out.state == StreamState::Running;
+        c.rect(rightX + rightW - 197, outputY + 102, 97, 46,
+               active ? activeStatusBackground : idleStatusBackground, 24, false);
+        c.centeredText(rightX + rightW - 148.5f, outputY + 125, active ? "Active" : "Idle", 20,
+                       active ? green : amber);
+        c.rect(rightX + rightW - 83, outputY + 101, 46, 46, controlFill, 11, false);
+        c.icon(Down, rightX + rightW - 60, outputY + 124, white, 28);
+        if (c.hit("Configure output device", rightX + rightW - 86, outputY + 98, 52, 52,
+                  "Configure the output device, name, icon, and mix gain")) {
+            refreshDevices();
+            editOutput_ = static_cast<int>(selectedOutput_);
+            outputDraft_ = selectedOutput;
+            outputDraft_.kind = SourceKind::Playback;
+            outputDraft_.processPath.clear();
+            outputDraft_.enabled = true;
+            std::snprintf(outputName_, sizeof(outputName_), "%s", selectedOutput.label.c_str());
+            openOutput_ = true;
+        }
+        c.icon(selectedOutput.muted ? Muted : Speaker, rightX + 54, outputY + 203,
+               selectedOutput.muted ? red : white, 28);
+        if (c.hit("Mute output", rightX + 32, outputY + 182, 44, 44,
+                  selectedOutput.muted ? "Unmute this output" : "Mute this output")) {
+            selectedOutput.muted = !selectedOutput.muted;
+            engine_->setOutputMuted(selectedOutput_, selectedOutput.muted);
+            changed = true;
+        }
+        ImGui::PushID(static_cast<int>(selectedOutput_));
+        if (c.volume("##master-volume", rightX + 96, outputY + 185, rightW - 221,
+                     selectedOutput.volume, true)) {
+            engine_->setOutputGain(selectedOutput_, effectiveGain(selectedOutput));
+            changed = true;
+        }
+        ImGui::PopID();
     }
-    c.icon(selectedOutput.muted ? Muted : Speaker, rightX + 54, outputY + 203,
-           selectedOutput.muted ? red : white, 28);
-    if (c.hit("Mute output", rightX + 32, outputY + 182, 44, 44,
-              selectedOutput.muted ? "Unmute this output" : "Mute this output")) {
-        selectedOutput.muted = !selectedOutput.muted;
-        engine_->setOutputMuted(selectedOutput_, selectedOutput.muted);
-        changed = true;
-    }
-    ImGui::PushID(static_cast<int>(selectedOutput_));
-    if (c.volume("##master-volume", rightX + 96, outputY + 185, rightW - 221,
-                 selectedOutput.volume, true)) {
-        engine_->setOutputGain(selectedOutput_, effectiveGain(selectedOutput));
-        changed = true;
-    }
-    ImGui::PopID();
     const float settingsW = rightW * .238f, stopW = rightW * .35f, stateW = rightW * .325f,
                 stopX = rightX + settingsW + (rightW - settingsW - stopW - stateW) * .5f;
     c.rect(rightX, footerY, settingsW, 73, card, 18);
@@ -1257,12 +1339,15 @@ bool MixerWindow::draw(float dt, int width, int height) {
         openSettings_ = true;
     }
     bool running = engine_->monitoring();
-    c.rect(stopX, footerY - 1, stopW, 76, running ? red : accentButton, 17, false);
+    const bool canMonitor = config_->outputCount() > 0;
+    c.rect(stopX, footerY - 1, stopW, 76,
+           !canMonitor ? disabledControl : running ? red : accentButton, 17, false);
     c.centeredIconLabel(running ? Stop : Play, stopX + stopW / 2, footerY + 37,
-                        running ? "Stop Monitoring" : "Start Monitoring", 28, 34, onAccent,
-                        onAccent);
+                        running ? "Stop Monitoring" : "Start Monitoring", 28, 34,
+                        canMonitor ? onAccent : gray, canMonitor ? onAccent : gray);
     if (c.hit("Toggle monitoring", stopX, footerY, stopW, 74,
-              running ? "Stop sending audio; keep source meters active" : "Resume saved mix")) {
+              !canMonitor ? "Add an output device before starting monitoring" :
+              running ? "Stop sending audio; keep source meters active" : "Resume saved mix") && canMonitor) {
         if (engine_->running())
             engine_->setMonitoring(!running);
         else
@@ -1272,6 +1357,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
         // request. Only the forwarded mix display starts a new session.
         outputMeter_ = {};
         spectrum_ = Spectrum{};
+        spectrumRefreshTimer_ = 0;
+        spectrumWasActive_ = false;
         lastUnderruns_ = lastDropped_ = 0;
         changed = true;
     }
@@ -1282,6 +1369,10 @@ bool MixerWindow::draw(float dt, int width, int height) {
     changed |= drawDialogs();
     ImGui::End();
     ImGui::PopFont();
+    // Apply after drawing and unwinding temporary styles. The next frame is
+    // entirely in the new palette, and System notifications see the live
+    // config immediately. No audio restart or Settings Save is required.
+    if (config_->colorTheme != themeAtFrameStart) applyTheme(config_->colorTheme);
     return changed;
 }
 
@@ -1791,17 +1882,13 @@ bool MixerWindow::drawDialogs() {
                            (editOutput_ >= 0 || config_->outputCount() < kMaxOutputs);
         if (duplicateOutput)
             c.text(18, 585, "That playback device is already an output.", 15, amber);
-        if (editOutput_ >= 0 && config_->outputCount() > 1 &&
+        if (editOutput_ >= 0 && static_cast<size_t>(editOutput_) < config_->outputCount() &&
             drawButton("Remove output", 0, 610, 164, 48, "Remove", Close, dangerSurface)) {
             const size_t removed = static_cast<size_t>(editOutput_);
-            if (removed == 0) {
-                config_->output = std::move(config_->additionalOutputs.front());
-                config_->additionalOutputs.erase(config_->additionalOutputs.begin());
-            } else {
-                config_->additionalOutputs.erase(config_->additionalOutputs.begin() +
-                                                  static_cast<ptrdiff_t>(removed - 1));
-            }
-            selectedOutput_ = std::min(removed, config_->outputCount() - 1);
+            config_->removeOutput(removed);
+            selectedOutput_ = config_->outputCount() == 0
+                                  ? 0 : std::min(removed, config_->outputCount() - 1);
+            if (config_->outputCount() == 0) engine_->setMonitoring(false);
             restart();
             changed = true;
             ImGui::CloseCurrentPopup();
@@ -1816,7 +1903,7 @@ bool MixerWindow::drawDialogs() {
             outputDraft_.processPath.clear();
             outputDraft_.enabled = true;
             if (editOutput_ < 0) {
-                config_->additionalOutputs.push_back(outputDraft_);
+                config_->addOutput(outputDraft_);
                 selectedOutput_ = config_->outputCount() - 1;
             } else {
                 selectedOutput_ = static_cast<size_t>(editOutput_);
@@ -1832,7 +1919,7 @@ bool MixerWindow::drawDialogs() {
     }
     if (openSettings_) {
         settingsDraft_ = *config_;
-        settingsRestoreAll_ = false;
+        resetDevicesOnSave_ = false;
         ImGui::OpenPopup("Settings");
         openSettings_ = false;
     }
@@ -1957,8 +2044,11 @@ bool MixerWindow::drawDialogs() {
             if (bufferFocused)
                 c.dl->AddRect(c.p(contentX, 309), c.p(contentX + 504, 345), purple, 8 * scale_, 0,
                               2 * scale_);
-            c.text(contentX, 350, "Lower values reduce delay; higher values better tolerate scheduling jitter.",
-                   14, gray, false, 504);
+            c.text(contentX, 350,
+                   "Source buffer only; total delay also includes Windows and device buffers.",
+                   13, gray, false, 504);
+            c.text(contentX, 369, "The 20 ms minimum helps prevent audio glitches.",
+                   13, gray, false, 504);
 
             c.line(contentX, 389, contentX + 504, 389, border, 1);
             c.text(contentX, 410, "Channels", 17, white);
@@ -2011,6 +2101,10 @@ bool MixerWindow::drawDialogs() {
             if (drawRadio("System theme", contentX + 230, 633, "System",
                           settingsDraft_.colorTheme == ColorTheme::System))
                 settingsDraft_.colorTheme = ColorTheme::System;
+            if (config_->colorTheme != settingsDraft_.colorTheme) {
+                config_->colorTheme = settingsDraft_.colorTheme;
+                changed = true;
+            }
         } else if (settingsPage_ == 2) {
             c.badge(Puzzle, 448, 263, purple);
             c.centeredText(448, 327, "Work In Progress", 28, white);
@@ -2040,9 +2134,20 @@ bool MixerWindow::drawDialogs() {
                 ImGui::OpenPopup("Startup setting failed");
             } else {
                 const bool exclusiveChanged = settingsDraft_.exclusiveOutput != config_->exclusiveOutput;
-                *config_ = settingsDraft_;
-                applyTheme(config_->colorTheme);
-                if (settingsRestoreAll_ || (exclusiveChanged && engine_->running())) {
+                // Theme is already committed independently by its radio
+                // buttons; Save only commits the remaining pending choices.
+                settingsDraft_.colorTheme = config_->colorTheme;
+                copyPreferences(*config_, settingsDraft_);
+                if (resetDevicesOnSave_) {
+                    // Stop workers before discarding the live routing. Runtime
+                    // endpoint synchronization must not resurrect cleared IDs.
+                    engine_->stop();
+                    config_->sources.clear();
+                    config_->clearOutputs();
+                    selectedOutput_ = 0;
+                    resetDevicesOnSave_ = false;
+                    restart(); // clear display history; an empty setup stays stopped
+                } else if (exclusiveChanged && engine_->running()) {
                     restart();
                 } else {
                     engine_->setBufferMillis(config_->bufferMillis);
@@ -2057,10 +2162,18 @@ bool MixerWindow::drawDialogs() {
             ImGui::EndPopup();
         }
         if (beginBoundedModal("Restore defaults?", 560, scale_)) {
-            ImGui::TextWrapped("Reset all sources, devices, gains, and application preferences?");
+            ImGui::TextWrapped("Restore default preferences and remove all devices and outputs? Save settings to apply, or Cancel to keep your current setup.");
             if (ImGui::Button("Reset")) {
-                settingsDraft_ = Config::defaults();
-                settingsRestoreAll_ = true;
+                // Reset to an empty setup, never the example source presets.
+                // Clearing routes follows Save/Cancel; theme remains immediate.
+                copyPreferences(settingsDraft_, Config::defaults());
+                settingsDraft_.sources.clear();
+                settingsDraft_.clearOutputs();
+                resetDevicesOnSave_ = true;
+                if (config_->colorTheme != settingsDraft_.colorTheme) {
+                    config_->colorTheme = settingsDraft_.colorTheme;
+                    changed = true;
+                }
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();

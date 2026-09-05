@@ -19,6 +19,9 @@ class MixerWindow {
 
   private:
     friend struct MixerWindowTestAccess;
+    static constexpr float kApplicationRefreshSeconds = 5.f;
+    static constexpr float kStatusRefreshSeconds = .2f;
+    static constexpr float kSpectrumRefreshSeconds = 1.f / 30.f;
     void refreshDevices();
     void syncMeteringVisibility();
     void refreshStatus(float dt);
@@ -29,7 +32,7 @@ class MixerWindow {
     void refreshDropoutStatus(StreamState outputState, uint64_t underruns, uint64_t dropped,
                               float dt);
     void restart();
-    bool drawSource(size_t index, float width, float dt);
+    bool drawSource(size_t index, float width);
     bool drawDialogs();
     AudioEngine *engine_ = nullptr;
     Config *config_ = nullptr;
@@ -46,13 +49,20 @@ class MixerWindow {
     std::string status_ = "Stopped", statusDetail_;
     int severity_ = 0;
     float scale_ = 1, refreshTimer_ = 0, clippingTimer_ = 0, dropoutTimer_ = 0;
+    float statusRefreshTimer_ = 0;
+    float spectrumRefreshTimer_ = 0;
     float startupSettleTimer_ = 0;
     uint64_t lastUnderruns_ = 0, lastDropped_ = 0;
     bool monitoringWasRunning_ = false;
+    bool lastStatusMonitoring_ = false;
+    bool statusRefreshForced_ = true;
+    bool spectrumWasActive_ = false;
+    uint64_t statusEvaluationCount_ = 0;
+    uint64_t spectrumEvaluationCount_ = 0;
     bool exitRequested_ = false, openSettings_ = false, openSource_ = false;
     bool openChannels_ = false, openStatus_ = false, openOutput_ = false;
     int settingsPage_ = 1;
-    bool settingsRestoreAll_ = false;
+    bool resetDevicesOnSave_ = false;
     Config settingsDraft_;
     int editSource_ = -1;
     size_t selectedOutput_ = 0;

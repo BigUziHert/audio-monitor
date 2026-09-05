@@ -14,7 +14,7 @@
 namespace audiomon {
 namespace {
 
-constexpr int kConfigVersion = 5;
+constexpr int kConfigVersion = 6;
 
 const char* colorThemeName(ColorTheme theme) noexcept {
     switch (theme) {
@@ -167,23 +167,49 @@ bool sameEndpointSelection(const ChannelConfig& a, const ChannelConfig& b) noexc
            containsInsensitive(b.deviceNameMatch, a.deviceNameMatch);
 }
 
+bool Config::addOutput(ChannelConfig channel) {
+    if (channel.deviceId.empty() && channel.deviceNameMatch.empty()) return false;
+    if (outputCount() >= size_t(kMaxOutputs)) return false;
+    for (size_t i = 0; i < outputCount(); ++i)
+        if (sameEndpointSelection(channel, outputAt(i))) return false;
+    channel.kind = SourceKind::Playback;
+    channel.processPath.clear();
+    channel.enabled = true;
+    if (!hasOutput) {
+        output = std::move(channel);
+        additionalOutputs.clear();
+        hasOutput = true;
+    } else {
+        additionalOutputs.push_back(std::move(channel));
+    }
+    return true;
+}
+
+bool Config::removeOutput(size_t index) {
+    if (index >= outputCount()) return false;
+    if (index == 0) {
+        if (additionalOutputs.empty()) {
+            clearOutputs();
+        } else {
+            output = std::move(additionalOutputs.front());
+            additionalOutputs.erase(additionalOutputs.begin());
+        }
+    } else {
+        additionalOutputs.erase(additionalOutputs.begin() + (index - 1));
+    }
+    return true;
+}
+
+void Config::clearOutputs() {
+    output = ChannelConfig{};
+    additionalOutputs.clear();
+    hasOutput = false;
+}
+
 Config Config::defaults() {
     Config c;
-    // First-run autodetection, chosen to be UNAMBIGUOUS on a real machine
-    // rather than merely plausible.
-    //
-    // "Elgato" alone is actively dangerous: with Wave Link installed it also
-    // matches "System (Elgato Virtual Audio)" and the mic mirror, and routing
-    // the mix into the virtual driver is exactly what this application exists
-    // to avoid. "Elgato 4K" matches only the capture card.
-    //
-    // The mic is matched on the USB Audio Class name it actually enumerates
-    // with; "Yeti" matched nothing, because the device reports itself
-    // generically rather than by product name.
-    //
-    // Anything ambiguous is refused outright at resolve time and reported, so
-    // a wrong guess here shows up as an error rather than as audio quietly
-    // going somewhere else.
+    // Preserve the original source presets; output hardware must be selected
+    // explicitly so first launch never guesses a capture card or old endpoint.
     ChannelConfig game, chat, mic;
     game.label = "Headphones";
     chat.label = "Chat Audio";
@@ -193,7 +219,7 @@ Config Config::defaults() {
     chat.deviceNameMatch = L"Arctis Pro Wireless Chat";
     mic.deviceNameMatch = L"USB Advanced Audio Device";
     c.sources = {game, chat, mic};
-    c.output.deviceNameMatch = L"Elgato 4K";
+    c.clearOutputs();
     return c;
 }
 
@@ -255,39 +281,33 @@ Config Config::fromJson(const JsonValue& root) {
         c.sources[1] = channelFromJson(root.find("chat"), def.sources[1]);
         c.sources[2] = channelFromJson(root.find("mic"), def.sources[2]);
     }
-    // Version 5 stores every simultaneous destination in `outputs`. Fall back
-    // to the original singular field so every older configuration migrates
-    // without changing its selected endpoint or fader.
+    // The array is authoritative even when empty. Falling back to the legacy
+    // mirror for [] would resurrect the user's deleted last destination.
     const JsonValue* outputs = root.find("outputs");
-    if (outputs && outputs->isArray() && !outputs->items().empty()) {
-        std::vector<ChannelConfig> parsed;
-        parsed.reserve(std::min(outputs->items().size(), size_t(kMaxOutputs)));
+    c.clearOutputs();
+    if (outputs && outputs->isArray()) {
         for (const auto& value : outputs->items()) {
             if (!value.isObject()) continue;
-            const ChannelConfig fallback = parsed.empty() ? def.output : ChannelConfig{};
-            ChannelConfig candidate = channelFromJson(&value, fallback);
+            ChannelConfig candidate = channelFromJson(&value, ChannelConfig{});
             candidate.kind = SourceKind::Playback;
             candidate.processPath.clear();
             candidate.enabled = true;
-            if (!parsed.empty() && candidate.deviceId.empty() &&
-                candidate.deviceNameMatch.empty())
-                continue;
-            const bool duplicate = std::any_of(
-                parsed.begin(), parsed.end(), [&](const ChannelConfig& existing) {
-                    return sameEndpointSelection(candidate, existing);
-                });
-            if (!duplicate) parsed.push_back(std::move(candidate));
-            if (parsed.size() == kMaxOutputs) break;
+            if (!c.hasOutput) {
+                // Retain a legacy unresolved primary's label/fader metadata,
+                // but never give it a machine-specific fallback endpoint.
+                c.output = std::move(candidate);
+                c.hasOutput = true;
+            } else {
+                c.addOutput(std::move(candidate));
+            }
+            if (c.outputCount() == kMaxOutputs) break;
         }
-        if (!parsed.empty()) {
-            c.output = std::move(parsed.front());
-            c.additionalOutputs.assign(std::make_move_iterator(parsed.begin() + 1),
-                                       std::make_move_iterator(parsed.end()));
-        } else {
-            c.output = channelFromJson(root.find("output"), def.output);
-        }
-    } else {
-        c.output = channelFromJson(root.find("output"), def.output);
+    } else if (const auto* legacy = root.find("output"); legacy && legacy->isObject()) {
+        c.output = channelFromJson(legacy, ChannelConfig{});
+        c.output.kind = SourceKind::Playback;
+        c.output.processPath.clear();
+        c.output.enabled = true;
+        c.hasOutput = true;
     }
     if (auto v = root.find("mono")) c.mono = v->asBool(false);
     if (auto v = root.find("closeToTray")) c.closeToTray = v->asBool(false);
@@ -312,11 +332,10 @@ JsonValue Config::toJson() const {
     root.set("sources", sourcesJson);
     root.set("mono", JsonValue(mono));
     root.set("closeToTray", JsonValue(closeToTray));
-    root.set("output",           channelToJson(output));
     JsonValue outputsJson = JsonValue::array();
-    outputsJson.push(channelToJson(output));
-    for (size_t i = 0; i < additionalOutputs.size() && i + 1 < kMaxOutputs; ++i)
-        outputsJson.push(channelToJson(additionalOutputs[i]));
+    if (outputCount() > 0) root.set("output", channelToJson(output));
+    for (size_t i = 0; i < outputCount(); ++i)
+        outputsJson.push(channelToJson(outputAt(i)));
     root.set("outputs", outputsJson);
     root.set("exclusiveOutput",  JsonValue(exclusiveOutput));
     root.set("startWithWindows", JsonValue(startWithWindows));

@@ -6,12 +6,14 @@
 // Devices are stored as BOTH an endpoint ID and a friendly-name substring. The
 // ID is exact but a driver reinstall reissues it; the name substring is what
 // lets the config survive that. On first run there is no config at all, so the
-// defaults autodetect by name.
+// source defaults autodetect by name; playback destinations are selected by
+// the user rather than guessed from machine-specific hardware names.
 //
 #include "util/Text.h"
 
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace audiomon {
@@ -52,17 +54,29 @@ struct Config {
     // retain their own device, trim, mute, label, and icon settings.
     ChannelConfig output;
     std::vector<ChannelConfig> additionalOutputs;
+    // Bare Config{} retains the legacy primary slot for existing code that
+    // assigns output directly. defaults()/clearOutputs() explicitly remove it.
+    bool hasOutput = true;
 
     size_t outputCount() const noexcept {
+        if (!hasOutput) return 0;
         const size_t count = 1 + additionalOutputs.size();
         return count < size_t(kMaxOutputs) ? count : size_t(kMaxOutputs);
     }
     ChannelConfig& outputAt(size_t index) {
+        if (index >= outputCount()) throw std::out_of_range("output index");
         return index == 0 ? output : additionalOutputs.at(index - 1);
     }
     const ChannelConfig& outputAt(size_t index) const {
+        if (index >= outputCount()) throw std::out_of_range("output index");
         return index == 0 ? output : additionalOutputs.at(index - 1);
     }
+    // Returns false for an empty selection, duplicate, or the four-output cap.
+    bool addOutput(ChannelConfig channel);
+    // Deleting the primary promotes the next output; deleting the last keeps
+    // an explicitly empty list, including after saving and restarting.
+    bool removeOutput(size_t index);
+    void clearOutputs();
 
     bool     mono             = false;
     bool     closeToTray      = false;

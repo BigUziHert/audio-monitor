@@ -430,7 +430,7 @@ void RenderStream::threadMain(DeviceRef ref) {
     MmcssRegistration mmcss;
     if (!mmcss.acquire(L"Pro Audio", AVRT_PRIORITY_CRITICAL)) {
         LOG_WARN("render: MMCSS 'Pro Audio' unavailable (%lu); fell back to "
-                 "THREAD_PRIORITY_TIME_CRITICAL", mmcss.lastError());
+                 "THREAD_PRIORITY_ABOVE_NORMAL", mmcss.lastError());
     }
 
     if (!openDevice(ref)) {
@@ -457,6 +457,12 @@ void RenderStream::threadMain(DeviceRef ref) {
         if (SUCCEEDED(hr)) {
             LOG_INFO("render: notifying mixer of format");
             mixer_->onRenderFormat(format_.sampleRate, bufferFrames_);
+            const uint32_t nominalFrames = exclusive_.load(std::memory_order_relaxed)
+                ? bufferFrames_
+                : static_cast<uint32_t>(std::min<uint64_t>(bufferFrames_,
+                    std::max<uint64_t>(1, (uint64_t(devicePeriodHns_) * format_.sampleRate +
+                                          9999999ULL) / 10000000ULL)));
+            mixer_->onRenderPeriod(nominalFrames);
             LOG_INFO("render: mixer configured; pre-rolling silence");
 
             // Pre-roll one silent buffer: exclusive mode starts the DMA

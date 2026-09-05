@@ -10,6 +10,7 @@ constexpr uint32_t kResamplerHistoryFrames = 4;
 constexpr uint32_t kMinimumRingFrames = 8;
 constexpr uint32_t kLargestRingFrames = uint32_t{1} << 31;
 constexpr double kTransitionSeconds = 0.005;
+constexpr uint32_t kProducerBlockFrames = OutputBus::kSourceSampleRate / 100; // 10 ms pump
 
 uint32_t normalizedCapacity(uint32_t requested) noexcept {
     // RingBuffer's generic rounding loop assumes the requested power of two
@@ -77,15 +78,47 @@ void OutputBus::requestReset() noexcept {
     timelineEpoch_.fetch_add(1, std::memory_order_release);
 }
 
-void OutputBus::resetConsumer() noexcept {
-    ring_.dropAllFromConsumer();
+void OutputBus::resetConsumer(uint32_t keepNewestFrames) noexcept {
+    if (keepNewestFrames > 0) {
+        const uint32_t available = ring_.beginRead();
+        const uint32_t trimmed = available - std::min(available, keepNewestFrames);
+        ring_.endRead(trimmed);
+        latencyTrimmed_.fetch_add(trimmed, std::memory_order_relaxed);
+        latencyCorrections_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ring_.dropAllFromConsumer();
+    }
     resampler_.reset();
     rate_.reset();
     priming_ = true;
     timelineBreakPending_ = false;
+    latencyTrimPending_ = false;
     presence_.reset(0.0f);
     primingOut_.store(true, std::memory_order_relaxed);
     ratioOut_.store(baseRatio_, std::memory_order_relaxed);
+}
+
+void OutputBus::finishTimelineBreak() noexcept {
+    const uint32_t epoch = timelineEpoch_.load(std::memory_order_acquire);
+    // A real discontinuity that arrives during a latency fade invalidates the
+    // whole timeline. Only an intact stream may retain its newest short tail.
+    const uint32_t keep = latencyTrimPending_ && epoch == seenEpoch_
+        ? effectiveTargetFrames_ : 0;
+    seenEpoch_ = epoch;
+    resetConsumer(keep);
+}
+
+void OutputBus::setCallbackTarget(uint32_t frames) noexcept {
+    const double maximumNeed = requiredInputFrames(frames, baseRatio_ * RateController::kMaxRatio);
+    const uint32_t reserve = std::max<uint32_t>(1, targetFrames_ / 4);
+    // Half a producer packet of phase headroom is needed even when nominal
+    // consumption fits in the base target. Independent clocks slowly shift
+    // a render callback across a 10 ms pump boundary; a bare 20 ms setpoint
+    // can otherwise lose one frame during that packet-phase transition.
+    const double desiredTarget = std::max(maximumNeed, double(targetFrames_)) + double(reserve);
+    effectiveTargetFrames_ = static_cast<uint32_t>(std::min(desiredTarget, double(ring_.capacity())));
+    effectiveTargetOut_.store(effectiveTargetFrames_, std::memory_order_relaxed);
+    rate_.setTarget(double(effectiveTargetFrames_));
 }
 
 void OutputBus::applyPresence(float* samples, uint32_t frames) noexcept {
@@ -101,18 +134,10 @@ void OutputBus::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexce
     baseRatio_ = double(kSourceSampleRate) / double(renderRate_);
 
     // blockFrames is the largest buffer RenderStream can ask us to fill.  For
-    // ordinary 5-10 ms periods, the nominal 20 ms setpoint already includes
-    // ample scheduling reserve.  A longer endpoint period needs a larger
+    // ordinary 5-10 ms periods, a 20 ms base plus 5 ms phase reserve is enough
+    // for independently clocked packets. A longer endpoint period needs a larger
     // effective setpoint or every callback would drain the ring to zero.
-    const double maximumNeed = requiredInputFrames(
-        blockFrames, baseRatio_ * RateController::kMaxRatio);
-    const uint32_t reserve = std::max<uint32_t>(1, targetFrames_ / 4); // ~5 ms by default
-    const double desiredTarget = maximumNeed > double(targetFrames_)
-        ? maximumNeed + double(reserve)
-        : double(targetFrames_);
-    effectiveTargetFrames_ = static_cast<uint32_t>(std::min(
-        desiredTarget, double(ring_.capacity())));
-    effectiveTargetOut_.store(effectiveTargetFrames_, std::memory_order_relaxed);
+    setCallbackTarget(blockFrames);
 
     const double period = blockFrames
         ? double(blockFrames) / double(renderRate_)
@@ -125,6 +150,10 @@ void OutputBus::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexce
     renderRateOut_.store(renderRate_, std::memory_order_release);
     seenEpoch_ = timelineEpoch_.load(std::memory_order_acquire);
     resetConsumer();
+}
+
+void OutputBus::onRenderPeriod(uint32_t nominalFrames) noexcept {
+    if (nominalFrames > 0) setCallbackTarget(nominalFrames);
 }
 
 void OutputBus::renderMix(float* dst, uint32_t frames) noexcept {
@@ -147,12 +176,24 @@ void OutputBus::renderMix(float* dst, uint32_t frames) noexcept {
         }
     }
 
+    // A render thread can miss several periods while the capture/pump stays
+    // healthy. The resulting extra depth is a scheduling step, not crystal
+    // drift; allowing the minute-scale PI loop to drain it would leave audio
+    // noticeably late long after the game hitch. Keep normal packet jitter
+    // (two 10 ms producer blocks) untouched, and fade/trim larger backlogs.
+    const uint32_t allowance = std::max(effectiveTargetFrames_, 2 * kProducerBlockFrames);
+    const uint32_t highWater = static_cast<uint32_t>(std::min(
+        uint64_t(ring_.capacity()), uint64_t(effectiveTargetFrames_) + allowance));
+    if (!timelineBreakPending_ && ring_.depth() > highWater) {
+        latencyTrimPending_ = true;
+        timelineBreakPending_ = true;
+    }
+
     if (timelineBreakPending_) {
         const uint32_t requested =
             std::min(frames, presence_.framesUntilSilent());
         if (requested == 0) {
-            seenEpoch_ = timelineEpoch_.load(std::memory_order_acquire);
-            resetConsumer();
+            finishTimelineBreak();
             return;
         }
 
@@ -165,22 +206,17 @@ void OutputBus::renderMix(float* dst, uint32_t frames) noexcept {
         applyPresence(dst, frames);
 
         if (made < requested || presence_.value() <= 0.0f) {
-            seenEpoch_ = timelineEpoch_.load(std::memory_order_acquire);
-            resetConsumer();
+            finishTimelineBreak();
         }
         return;
     }
 
 
-    // Shared-mode bufferFrames can be two periods while renderMix normally
-    // receives only one period (buffer minus padding).  Calibrate controller
-    // time constants from the first real callback without changing the target
-    // derived from the maximum block size above.  We are still priming here,
-    // so the configure/reset cannot interrupt audio.
-    if (configuredCallbackFrames_ == 0) {
-        const double period = double(frames) / double(renderRate_);
-        rate_.configure(double(kSourceSampleRate),
-                        double(effectiveTargetFrames_), period);
+    // Padding can vary individual shared-mode callback sizes; change only
+    // controller elapsed time here, never infer a smaller safety target from
+    // one short callback. onRenderPeriod supplies the endpoint's normal clock.
+    if (configuredCallbackFrames_ != frames) {
+        rate_.setUpdatePeriod(double(frames) / double(renderRate_));
         configuredCallbackFrames_ = frames;
     }
 
@@ -228,6 +264,8 @@ void OutputBus::renderMix(float* dst, uint32_t frames) noexcept {
 void OutputBus::clearStatistics() noexcept {
     published_.store(0, std::memory_order_relaxed);
     dropped_.store(0, std::memory_order_relaxed);
+    latencyTrimmed_.store(0, std::memory_order_relaxed);
+    latencyCorrections_.store(0, std::memory_order_relaxed);
     starved_.store(0, std::memory_order_relaxed);
     starvationEvents_.store(0, std::memory_order_relaxed);
 }

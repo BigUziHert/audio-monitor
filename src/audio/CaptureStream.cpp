@@ -20,6 +20,17 @@ constexpr double kIdleAfterSeconds = 0.10;
 // Ring capacity is derived from this, in frames per millisecond.
 constexpr uint32_t kMaxSupportedRateKHz = 192;
 
+bool supportsLoopbackEvents() {
+    // Microsoft documents event-driven loopback beginning with Win10 1703.
+    // RtlGetVersion avoids the application-manifest version compatibility lie.
+    using VersionFn = LONG(WINAPI *)(OSVERSIONINFOW*);
+    const auto versionFn = reinterpret_cast<VersionFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
+    OSVERSIONINFOW version{};
+    version.dwOSVersionInfoSize = sizeof(version);
+    return versionFn && versionFn(&version) == 0 && version.dwBuildNumber >= 15063;
+}
+
 } // namespace
 
 CaptureStream::~CaptureStream() { stop(); }
@@ -168,16 +179,33 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
     REFERENCE_TIME hnsDefault = 0, hnsMin = 0;
     client_->GetDevicePeriod(&hnsDefault, &hnsMin);
 
-    // No EVENTCALLBACK here, deliberately. With LOOPBACK, a silent endpoint
-    // produces no packets and therefore never signals the event -- an
-    // event-driven wait would block forever the moment the game goes quiet.
-    // We poll instead. A generous capture buffer costs only memory, not
-    // latency, and absorbs a scheduling hiccup without losing packets.
+    // Modern loopback and microphone streams wake only when packets arrive.
+    // Silent loopback sends no event, so threadMain also has a finite idle
+    // timeout and a separate stop event. This eliminates constant 5 ms polling
+    // during silence and removes its half-period delivery delay while active.
     DWORD flags = AUDCLNT_STREAMFLAGS_NOPERSIST;
     if (mode_ == CaptureMode::Loopback) flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
     const REFERENCE_TIME hnsBuffer = 5000000;   // 500 ms
-    hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, hnsBuffer, 0, mix, nullptr);
+    eventDriven_ = mode_ == CaptureMode::Microphone || supportsLoopbackEvents();
+    if (eventDriven_) {
+        timer_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        eventDriven_ = timer_ != nullptr;
+    }
+    hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+        flags | (eventDriven_ ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0), hnsBuffer, 0, mix, nullptr);
+    if (SUCCEEDED(hr) && eventDriven_) hr = client_->SetEventHandle(timer_);
+    if (FAILED(hr) && eventDriven_) {
+        // Some legacy endpoint drivers reject event capture. Initialize left
+        // the previous client unusable, so retry polling on a fresh interface.
+        LOG_WARN("%s: event capture unavailable; retrying periodic capture", label_.c_str());
+        CloseHandle(timer_);
+        timer_ = nullptr;
+        eventDriven_ = false;
+        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, client_.putVoid());
+        if (SUCCEEDED(hr))
+            hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, hnsBuffer, 0, mix, nullptr);
+    }
     CoTaskMemFree(mix);
     if (FAILED(hr)) { setError("IAudioClient::Initialize", hr); return false; }
 
@@ -200,23 +228,30 @@ bool CaptureStream::openDevice(const DeviceRef& ref) {
     if (FAILED(hr)) { setError("IAudioClient::Start", hr); return false; }
     LOG_INFO("%s: started", label_.c_str());
 
-    // Poll at roughly half the device period so we never sit on a full packet.
+    // Compatibility fallback: poll at half the device period.
     LONG period100ns = static_cast<LONG>(hnsDefault ? hnsDefault / 2 : 50000);
     period100ns = std::clamp<LONG>(period100ns, 10000, 100000);   // 1ms .. 10ms
 
-    timer_ = CreateWaitableTimerExW(nullptr, nullptr,
+    if (!eventDriven_) {
+        timer_ = CreateWaitableTimerExW(nullptr, nullptr,
                                     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (!timer_) timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
-    if (timer_) {
+        if (!timer_) timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        if (!timer_) {
+            setError("capture polling timer", HRESULT_FROM_WIN32(GetLastError()));
+            return false;
+        }
         LARGE_INTEGER due;
         due.QuadPart = -static_cast<LONGLONG>(period100ns);
-        SetWaitableTimer(timer_, &due, period100ns / 10000 ? period100ns / 10000 : 1,
-                         nullptr, nullptr, FALSE);
+        if (!SetWaitableTimer(timer_, &due, period100ns / 10000 ? period100ns / 10000 : 1,
+                             nullptr, nullptr, FALSE)) {
+            setError("arm capture polling timer", HRESULT_FROM_WIN32(GetLastError()));
+            return false;
+        }
     }
 
-    LOG_INFO("%s: open on '%s' (%s, %s)", label_.c_str(), toUtf8(resolvedName()).c_str(),
+    LOG_INFO("%s: open on '%s' (%s, %s, %s)", label_.c_str(), toUtf8(resolvedName()).c_str(),
              mode_ == CaptureMode::Loopback ? "loopback" : "microphone",
-             format_.describe().c_str());
+             format_.describe().c_str(), eventDriven_ ? "event-driven" : "polling");
     return true;
 }
 
@@ -247,6 +282,7 @@ bool CaptureStream::openProcess(const std::wstring& path) {
     hr = client_->GetService(__uuidof(IAudioCaptureClient), capture_.putVoid());
     if (FAILED(hr)) { setError("App capture service", hr); return false; }
     timer_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    eventDriven_ = true;
     if (!timer_) { setError("App capture event", E_OUTOFMEMORY); return false; }
     hr = client_->SetEventHandle(timer_);
     if (SUCCEEDED(hr)) hr = client_->Start();
@@ -264,9 +300,10 @@ void CaptureStream::closeDevice() {
     capture_.reset();
     client_.reset();
     if (timer_) {
-        if (mode_ != CaptureMode::Application) CancelWaitableTimer(timer_);
+        if (!eventDriven_) CancelWaitableTimer(timer_);
         CloseHandle(timer_); timer_ = nullptr;
     }
+    eventDriven_ = false;
     if (process_) { CloseHandle(process_); process_ = nullptr; }
     processId_.store(0, std::memory_order_relaxed);
 }
@@ -365,7 +402,7 @@ void CaptureStream::threadMain(DeviceRef ref) {
     // class for the render thread.
     MmcssRegistration mmcss;
     if (!mmcss.acquire(L"Audio")) {
-        LOG_WARN("%s: MMCSS unavailable (%lu); fell back to a plain priority bump",
+        LOG_WARN("%s: MMCSS unavailable (%lu); fell back to THREAD_PRIORITY_ABOVE_NORMAL",
                  label_.c_str(), mmcss.lastError());
     }
 
@@ -394,6 +431,12 @@ void CaptureStream::threadMain(DeviceRef ref) {
             const DWORD wr = WaitForMultipleObjects(waitCount, waits, FALSE, 100);
             if (wr == WAIT_OBJECT_0) break;                 // stop requested
             if (quit_.load(std::memory_order_relaxed)) break;
+            if (wr != WAIT_TIMEOUT && wr != WAIT_OBJECT_0 + 1) {
+                const DWORD error = wr == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+                setError("capture event wait failed", HRESULT_FROM_WIN32(error));
+                state_.store(StreamState::Failed, std::memory_order_release);
+                break;
+            }
 
             if (process_ && WaitForSingleObject(process_, 0) == WAIT_OBJECT_0) {
                 setError("App closed; waiting for it to reopen", E_FAIL);

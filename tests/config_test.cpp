@@ -113,10 +113,28 @@ int main() {
               ColorTheme::Light,
           "light theme string loads");
     const auto defaultJson = Config::defaults().toJson();
-    check(defaultJson.find("version") && defaultJson.find("version")->asNumber(0) == 5 &&
+    check(defaultJson.find("version") && defaultJson.find("version")->asNumber(0) == 6 &&
               defaultJson.find("colorTheme") &&
               defaultJson.find("colorTheme")->asString("") == "dark",
-          "version 5 writes the default dark theme string");
+          "version 6 writes the default dark theme string");
+    check(Config{}.outputCount() == 1, "bare Config preserves the legacy directly assigned output slot");
+    check(Config::defaults().outputCount() == 0 &&
+              Config::defaults().output.deviceId.empty() &&
+              Config::defaults().output.deviceNameMatch.empty() &&
+              defaultJson.find("outputs") && defaultJson.find("outputs")->items().empty() &&
+              !defaultJson.find("output"),
+          "first-run defaults contain no guessed output or legacy hardware mirror");
+    const Config emptyOutputs = Config::fromJson(JsonValue::parse(
+        R"({"outputs":[],"output":{"deviceId":"obsolete-output","deviceName":"Old capture card"}})"));
+    check(emptyOutputs.outputCount() == 0 && !emptyOutputs.hasOutput &&
+              emptyOutputs.output.deviceId.empty() && emptyOutputs.additionalOutputs.empty() &&
+              Config::fromJson(emptyOutputs.toJson()).outputCount() == 0 &&
+              !emptyOutputs.toJson().find("output"),
+          "an explicit empty outputs array overrides the legacy mirror and stays empty on round-trip");
+    bool rejectedEmptyLookup = false;
+    try { (void)emptyOutputs.outputAt(0); }
+    catch (const std::out_of_range&) { rejectedEmptyLookup = true; }
+    check(rejectedEmptyLookup, "empty output lookup cannot expose a hidden stale primary");
 
     const auto legacySingleOutput = Config::fromJson(JsonValue::parse(
         R"({"version":4,"output":{"label":"Legacy HDMI","deviceId":"legacy-id","deviceName":"Legacy Device","icon":"screen","gain":1.75,"volume":0.42,"muted":true}})"));
@@ -130,11 +148,13 @@ int main() {
           "version 4 single output migrates losslessly");
 
     Config multipleOutputs = Config::defaults();
-    multipleOutputs.output.label = "Primary";
-    multipleOutputs.output.deviceId = L"primary-id";
-    multipleOutputs.output.deviceNameMatch = L"Primary Device";
-    multipleOutputs.output.gain = 1.25f;
-    multipleOutputs.output.volume = 0.8f;
+    ChannelConfig primaryOutput;
+    primaryOutput.label = "Primary";
+    primaryOutput.deviceId = L"primary-id";
+    primaryOutput.deviceNameMatch = L"Primary Device";
+    primaryOutput.gain = 1.25f;
+    primaryOutput.volume = 0.8f;
+    check(multipleOutputs.addOutput(primaryOutput), "adding the first output installs the primary");
     ChannelConfig secondaryOutput;
     secondaryOutput.label = "Headphones";
     secondaryOutput.deviceId = L"secondary-id";
@@ -148,7 +168,8 @@ int main() {
     tertiaryOutput.deviceId = L"tertiary-id";
     tertiaryOutput.deviceNameMatch = L"Tertiary Device";
     tertiaryOutput.icon = "wave";
-    multipleOutputs.additionalOutputs = {secondaryOutput, tertiaryOutput};
+    check(multipleOutputs.addOutput(secondaryOutput) && multipleOutputs.addOutput(tertiaryOutput),
+          "adding extra outputs preserves ordering");
 
     const JsonValue multipleJson = multipleOutputs.toJson();
     const Config multipleCopy = Config::fromJson(JsonValue::parse(multipleJson.dump()));
@@ -181,10 +202,43 @@ int main() {
 
     const auto malformedOutputsFallback = Config::fromJson(JsonValue::parse(
         R"({"output":{"label":"Legacy fallback","deviceId":"legacy-fallback"},"outputs":[false,null,"bad"]})"));
-    check(malformedOutputsFallback.outputCount() == 1 &&
-              malformedOutputsFallback.output.label == "Legacy fallback" &&
-              malformedOutputsFallback.output.deviceId == L"legacy-fallback",
-          "an unusable outputs array falls back to the legacy output");
+    check(malformedOutputsFallback.outputCount() == 0,
+          "an authoritative array containing only invalid entries cannot restore a legacy endpoint");
+    const auto invalidArrayLegacy = Config::fromJson(JsonValue::parse(
+        R"({"output":{"deviceId":"legacy-fallback"},"outputs":false})"));
+    check(invalidArrayLegacy.outputCount() == 1 && invalidArrayLegacy.output.deviceId == L"legacy-fallback",
+          "a malformed non-array outputs field still permits singular legacy migration");
+    {
+        Config editable = multipleOutputs;
+        check(!editable.addOutput(primaryOutput) && !editable.addOutput(ChannelConfig{}),
+              "output helpers reject duplicates and empty selections");
+        check(editable.removeOutput(0) && editable.outputCount() == 2 &&
+                  editable.outputAt(0).deviceId == secondaryOutput.deviceId &&
+                  editable.outputAt(0).muted && editable.outputAt(0).volume == 0.55f,
+              "deleting the primary promotes the next output without losing its controls");
+        check(editable.removeOutput(1) && editable.outputCount() == 1 &&
+                  editable.removeOutput(0) && editable.outputCount() == 0 &&
+                  !editable.hasOutput && editable.output.deviceId.empty() &&
+                  editable.output.deviceNameMatch.empty() && editable.additionalOutputs.empty(),
+              "deleting the final output clears all stored destination state");
+        check(!editable.removeOutput(0) && !editable.removeOutput(900),
+              "deleting from an empty output list is a safe no-op");
+        check(editable.addOutput(primaryOutput) && editable.outputCount() == 1 &&
+                  editable.outputAt(0).deviceId == primaryOutput.deviceId,
+              "adding after deleting all outputs creates one fresh primary");
+        editable.clearOutputs();
+        editable.output.deviceId = L"stale-cached-field";
+        check(editable.outputCount() == 0 && !editable.toJson().find("output") &&
+                  Config::fromJson(editable.toJson()).outputCount() == 0,
+              "cached legacy fields cannot resurrect an explicitly cleared list");
+        for (int i = 0; i < kMaxOutputs; ++i) {
+            ChannelConfig output;
+            output.deviceId = L"target-" + std::to_wstring(i);
+            check(editable.addOutput(output), "add helper accepts each distinct available output slot");
+        }
+        check(!editable.addOutput(primaryOutput) && editable.outputCount() == kMaxOutputs,
+              "add helper enforces the output limit");
+    }
     ChannelConfig app;
     app.kind = SourceKind::Application;
     app.label = "Discord";
@@ -237,7 +291,10 @@ int main() {
         saved.bufferMillis = 90;
         saved.mono = true;
         saved.colorTheme = ColorTheme::Light;
-        saved.output.label = "Temporary output";
+        ChannelConfig savedOutput;
+        savedOutput.label = "Temporary output";
+        savedOutput.deviceId = L"temporary-output";
+        check(saved.addOutput(savedOutput), "create explicit output for save fixture");
         check(saved.save(path), "save to explicit path");
         bool usedDefaults = true;
         const Config loaded = Config::load(path, &usedDefaults);
@@ -247,6 +304,18 @@ int main() {
               "load from explicit path");
         check(GetFileAttributesW(tmp.c_str()) == INVALID_FILE_ATTRIBUTES,
               "successful save leaves no temp file");
+        Config cleared = saved;
+        cleared.clearOutputs();
+        check(cleared.save(path), "save an explicitly empty output list");
+        const Config reopenedEmpty = Config::load(path, &usedDefaults);
+        check(!usedDefaults && reopenedEmpty.outputCount() == 0 &&
+                  reopenedEmpty.output.deviceId.empty() && reopenedEmpty.bufferMillis == 90,
+              "reopening a saved empty output list preserves zero outputs and other preferences");
+        cleared.sources.clear();
+        check(cleared.save(path), "save a reset setup with no devices or outputs");
+        const Config reopenedReset = Config::load(path, &usedDefaults);
+        check(!usedDefaults && reopenedReset.sources.empty() && reopenedReset.outputCount() == 0,
+              "reopening a reset setup does not recreate preset devices or outputs");
 
         const std::string legacyText =
             R"({"game":{"gain":0.8},"chat":{},"mic":{},"bufferMillis":90})";

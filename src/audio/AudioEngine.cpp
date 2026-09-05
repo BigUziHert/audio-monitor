@@ -57,6 +57,7 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
     try {
         sourceCount_ = std::min(config.sources.size(), size_t(kMaxSources));
         outputCount_ = std::min(config.outputCount(), size_t(kMaxOutputs));
+        monitoring = monitoring && outputCount_ > 0;
         LOG_INFO("engine: start");
         {
             std::lock_guard<std::mutex> lock(configMutex_);
@@ -73,6 +74,7 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
             channel.gain.store(effectiveGain(source));
             channel.muted.store(source.muted || !source.enabled);
             channel.peak.l.take(); channel.peak.r.take();
+            channel.latencyTrimmed.store(0, std::memory_order_relaxed);
         }
         for (size_t i = 0; i < kMaxOutputs; ++i) {
             const bool configured = i < outputCount_;
@@ -91,7 +93,7 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
         mono_.store(config.mono);
         mixMode_.reset(config.mono);
         visualSamples_.dropAllFromConsumer();
-        bufferMillis_.store(config.bufferMillis);
+        setBufferMillis(config.bufferMillis);
 
         // The mixer has one fixed clock, independent of every output endpoint.
         // This is what allows several RenderStreams to consume the same mix
@@ -175,6 +177,7 @@ void AudioEngine::stopLocked() {
 
 void AudioEngine::setMonitoring(bool enabled) {
     if (!running()) return;
+    enabled = enabled && outputCount_ > 0;
     uint64_t state = monitoringState_.load(std::memory_order_acquire);
     for (;;) {
         if (((state & 1u) != 0) == enabled) return;
@@ -203,6 +206,10 @@ void AudioEngine::OutputGate::renderMix(float* dst, uint32_t frames) noexcept {
 
 void AudioEngine::OutputGate::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept {
     engine_.outputBuses_[output_]->onRenderFormat(sampleRate, blockFrames);
+}
+
+void AudioEngine::OutputGate::onRenderPeriod(uint32_t periodFrames) noexcept {
+    engine_.outputBuses_[output_]->onRenderPeriod(periodFrames);
 }
 
 void AudioEngine::setGain(int channel, float g) noexcept {
@@ -346,7 +353,7 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                            (flowing || observedDepth > 0));
 
         if (live) {
-            const uint32_t depth = observedDepth;
+            uint32_t depth = observedDepth;
             ch.depthOut.store(depth, std::memory_order_relaxed);
 
             const uint32_t srcRate = ch.stream.sampleRate();
@@ -377,6 +384,30 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                 ch.rate.setTarget(ch.targetDepth);
             }
             if (!stoppingFade && ch.targetDepth <= 0.0) { ch.priming = true; }
+
+            // A descheduled capture worker can return a batch of old WASAPI
+            // packets after this channel has already starved. Re-priming from
+            // the oldest packet would retain that whole stall as extra delay
+            // until the very slow drift controller catches up. Keep only the
+            // newest target-sized tail; silence has already ended the old
+            // envelope, so the normal fade-in makes this transition safe.
+            // Steady playback and live buffer-slider migrations are untouched.
+            if (!stoppingFade && ch.priming && ch.presence.value() <= 0.0f &&
+                ch.targetDepth > 0.0) {
+                const auto keep = static_cast<uint32_t>(std::ceil(ch.targetDepth));
+                const auto reserve = static_cast<uint32_t>(std::ceil(
+                    double(frames) * ch.baseRatio * RateController::kMaxRatio)) + 4;
+                if (depth > keep && depth - keep > reserve) {
+                    const uint32_t available = ring.beginRead();
+                    const uint32_t trim = available > keep ? available - keep : 0;
+                    ring.endRead(trim);
+                    ch.latencyTrimmed.fetch_add(trim, std::memory_order_relaxed);
+                    ch.rate.reset();
+                    ch.resampler.reset();
+                    depth = available - trim;
+                    ch.depthOut.store(depth, std::memory_order_relaxed);
+                }
+            }
 
             // Priming: wait for the ring to reach the setpoint before drawing
             // from it, so we do not immediately starve. This is also the path
@@ -440,6 +471,20 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
         const float gainTarget = ch.muted.load(std::memory_order_relaxed)
                                      ? 0.0f
                                      : ch.gain.load(std::memory_order_relaxed);
+
+        // Disabled/disconnected and idle loopback sources need no per-sample
+        // gain, envelope, sum or peak work. beginBlock(0, ...) has already
+        // landed the presence envelope at zero, so snapping the gain while
+        // silent cannot click; returning audio still fades in normally. The
+        // stream/ring/controller bookkeeping above must run even when silent.
+        if (made == 0 && ch.presence.value() <= 0.0f) {
+            if (ch.timelineBreakPending || state != StreamState::Running)
+                resetTimeline();
+            ch.smoothedGain = gainTarget;
+            ch.peak.l.publish(0.0f);
+            ch.peak.r.publish(0.0f);
+            continue;
+        }
 
         float g = ch.smoothedGain;
         float peakL = 0.0f, peakR = 0.0f;
@@ -652,6 +697,7 @@ void AudioEngine::requestRebuild() {
 
 bool AudioEngine::synchronizeOutputs(uint64_t state) {
     for (auto& ready : outputReadyState_) ready.store(0, std::memory_order_release);
+    if (outputCount_ == 0) return true;
     // A previous pump block may have read the old forwarding generation just
     // before the click. Let that block finish before a restarted consumer
     // clears its ring; otherwise its late publish could replay old audio.
@@ -835,7 +881,7 @@ ChannelStatus AudioEngine::channelStatus(int channel) const {
     s.depth      = ch.depthOut.load(std::memory_order_relaxed);
     s.sampleRate = ch.stream.sampleRate();
     s.ratio      = ch.ratioOut.load(std::memory_order_relaxed);
-    s.dropped    = ch.stream.droppedFrames();
+    s.dropped    = ch.stream.droppedFrames() + ch.latencyTrimmed.load(std::memory_order_relaxed);
     s.deviceId   = ch.stream.resolvedId();
     s.processId  = ch.stream.processId();
     s.deviceName = ch.stream.resolvedName();

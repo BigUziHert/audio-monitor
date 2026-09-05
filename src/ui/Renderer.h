@@ -9,9 +9,35 @@
 // nothing and costs VRAM. Re-creating on show takes a few milliseconds.
 //
 #include <d3d11.h>
+#include <chrono>
 #include <cstdint>
 
 namespace audiomon::ui {
+
+// Caps the immediate-mode dashboard independently of the monitor's refresh
+// rate. Present(1) follows a 144/240 Hz desktop, which needlessly multiplies
+// all layout, status and draw work for a meter that is already smooth at 60 Hz.
+// The clock is supplied by the caller so the policy stays deterministic in
+// tests and message handling can remain outside the renderer.
+class VisibleFramePacer {
+public:
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    void reset(TimePoint now) noexcept;
+    void setFramesPerSecond(uint32_t framesPerSecond, TimePoint now) noexcept;
+    uint32_t waitMilliseconds(TimePoint now) const noexcept;
+    void frameStarted(TimePoint now) noexcept;
+    uint32_t framesPerSecond() const noexcept { return framesPerSecond_; }
+
+private:
+    static std::chrono::microseconds periodFor(uint32_t framesPerSecond) noexcept;
+
+    uint32_t framesPerSecond_ = 60;
+    std::chrono::microseconds period_{16667};
+    TimePoint nextFrame_{};
+    bool initialized_ = false;
+};
 
 class Renderer {
 public:

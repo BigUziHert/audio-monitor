@@ -10,20 +10,63 @@
 
 namespace audiomon::ui {
 
+std::chrono::microseconds VisibleFramePacer::periodFor(uint32_t framesPerSecond) noexcept {
+    framesPerSecond = framesPerSecond ? framesPerSecond : 1;
+    return std::chrono::microseconds((1000000u + framesPerSecond - 1u) / framesPerSecond);
+}
+
+void VisibleFramePacer::reset(TimePoint now) noexcept {
+    nextFrame_ = now;
+    initialized_ = true;
+}
+
+void VisibleFramePacer::setFramesPerSecond(uint32_t framesPerSecond, TimePoint now) noexcept {
+    framesPerSecond = framesPerSecond ? framesPerSecond : 1;
+    if (initialized_ && framesPerSecond_ == framesPerSecond)
+        return;
+    framesPerSecond_ = framesPerSecond;
+    period_ = periodFor(framesPerSecond);
+    reset(now);
+}
+
+uint32_t VisibleFramePacer::waitMilliseconds(TimePoint now) const noexcept {
+    if (!initialized_ || now >= nextFrame_)
+        return 0;
+    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(nextFrame_ - now);
+    return static_cast<uint32_t>((remaining.count() + 999) / 1000);
+}
+
+void VisibleFramePacer::frameStarted(TimePoint now) noexcept {
+    if (!initialized_) {
+        reset(now);
+    }
+    // Keep the fractional part of a steady cadence after small scheduling
+    // jitter, but never issue catch-up frames after a stall or occlusion.
+    if (now >= nextFrame_ + period_)
+        nextFrame_ = now + period_;
+    else
+        nextFrame_ += period_;
+}
+
 bool Renderer::createDeviceObjects(void* hwnd) {
     DXGI_SWAP_CHAIN_DESC sd{};
     sd.BufferCount                        = 2;
     sd.BufferDesc.Width                   = 0;      // track the window
     sd.BufferDesc.Height                  = 0;
     sd.BufferDesc.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferDesc.RefreshRate.Numerator   = 60;
-    sd.BufferDesc.RefreshRate.Denominator = 1;
+    // Windowed presentation is paced explicitly by VisibleFramePacer. A zero
+    // refresh rate lets DWM select the current display mode when this window is
+    // moved between monitors.
+    sd.BufferDesc.RefreshRate.Numerator   = 0;
+    sd.BufferDesc.RefreshRate.Denominator = 0;
     sd.Flags                              = 0;   // see MakeWindowAssociation below
     sd.BufferUsage                        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.OutputWindow                       = static_cast<HWND>(hwnd);
     sd.SampleDesc.Count                   = 1;
     sd.Windowed                           = TRUE;
-    sd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
+    // Flip presentation avoids the extra DWM copy required by the legacy
+    // blit-model swapchain. Windows 10 is this application's minimum target.
+    sd.SwapEffect                         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     UINT flags = 0;
     const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };

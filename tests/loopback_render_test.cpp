@@ -103,7 +103,35 @@ int main() {
                     std::printf("Shared render failed: %s\n", render.lastError().c_str());
                     ++failures;
                 } else {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    // RenderStream submits real zero-valued packets with
+                    // ReleaseBuffer flags 0, so the endpoint stays active
+                    // without playing a tone. Keep loopback open concurrently
+                    // to verify packet delivery, not just successful opens.
+                    capture.start(devices, ref);
+                    const bool captureRunning = waitForRunning(capture, std::chrono::seconds(8));
+                    uint64_t capturedFrames = 0;
+                    const auto captureUntil = std::chrono::steady_clock::now() +
+                                              std::chrono::seconds(1);
+                    while (captureRunning && std::chrono::steady_clock::now() < captureUntil) {
+                        const uint32_t frames = capture.ring().beginRead();
+                        capturedFrames += frames;
+                        capture.ring().endRead(frames);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    }
+                    if (!captureRunning || capturedFrames == 0 ||
+                        capture.state() != StreamState::Running) {
+                        std::printf("Active silent render delivered no healthy loopback packets: %s\n",
+                                    capture.lastError().c_str());
+                        ++failures;
+                    } else {
+                        std::printf("Concurrent silent render delivered %llu loopback frames\n",
+                                    static_cast<unsigned long long>(capturedFrames));
+                    }
+                    capture.stop();
+                    if (capture.state() != StreamState::Stopped) {
+                        std::printf("Concurrent loopback capture did not stop cleanly\n");
+                        ++failures;
+                    }
                     if (render.state() != StreamState::Running) {
                         std::printf("Shared render stopped during the one-second run: %s\n",
                                     render.lastError().c_str());
@@ -125,12 +153,14 @@ int main() {
                     Config multi = Config::defaults();
                     multi.sources.clear();
                     multi.exclusiveOutput = false;
-                    multi.output.deviceId = endpoints[0].id;
-                    multi.output.deviceNameMatch = endpoints[0].name;
+                    ChannelConfig primary;
+                    primary.deviceId = endpoints[0].id;
+                    primary.deviceNameMatch = endpoints[0].name;
+                    multi.addOutput(primary);
                     ChannelConfig second;
                     second.deviceId = endpoints[1].id;
                     second.deviceNameMatch = endpoints[1].name;
-                    multi.additionalOutputs.push_back(second);
+                    multi.addOutput(second);
 
                     AudioEngine engine;
                     if (!engine.start(multi, false)) {

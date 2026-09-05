@@ -7,7 +7,8 @@
 // altering it; shared-mode capture leaves the mic available to Discord at the
 // same time. Neither path touches volume, mute or default-device state.
 //
-// Threading: one poll thread per source, owning its own COM apartment and its
+// Threading: one event-driven worker per source (polling fallback on older
+// loopback implementations), owning its own COM apartment and its
 // own WASAPI objects. It is the only writer to the ring. The mixer thread is
 // the only reader. Nothing is shared but the ring and a few atomics.
 //
@@ -41,7 +42,7 @@ public:
     // readout and to drop stale audio), so reallocating under it would race.
     void configure(const char* label, CaptureMode mode, uint32_t ringMillis = 250);
 
-    // Starts (or restarts) the poll thread against the given endpoint.
+    // Starts (or restarts) the capture worker against the given endpoint.
     // Non-blocking: resolution and device setup happen on the worker.
     void start(DeviceManager& devices, const DeviceRef& ref);
     void stop();
@@ -99,6 +100,7 @@ private:
     std::thread  thread_;
     HANDLE       stopEvent_  = nullptr;
     HANDLE       timer_      = nullptr;
+    bool         eventDriven_ = false; // worker-owned: timer_ is an audio event
     HANDLE       process_    = nullptr;
     std::atomic<uint32_t> processId_{0};
 

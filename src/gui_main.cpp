@@ -34,6 +34,9 @@ constexpr wchar_t kWindowTitle[] = L"Audio Monitor";
 constexpr wchar_t kMutexName[]   = L"Local\\AudioMonitorSingleInstance";
 constexpr int     kWindowWidth   = 1440;
 constexpr int     kWindowHeight  = 890;
+constexpr uint32_t kForegroundFramesPerSecond = 60;
+constexpr uint32_t kBackgroundFramesPerSecond = 30;
+constexpr DWORD    kOccludedPollMilliseconds = 250;
 
 // Sent by a second instance to bring the running one to the front.
 UINT g_showMessage = 0;
@@ -43,6 +46,7 @@ struct App {
     Config           config;
     ui::MixerWindow  mixer;
     ui::Renderer     renderer;
+    ui::VisibleFramePacer framePacer;
     ui::TrayIcon     tray;
     HWND             hwnd    = nullptr;
     bool             visible = false;
@@ -56,9 +60,18 @@ struct App {
     std::chrono::steady_clock::time_point lastSave{};
     std::chrono::steady_clock::time_point lastSaveAttempt{};
     std::chrono::steady_clock::time_point lastRuntimeSync{};
+    std::chrono::steady_clock::time_point nextOcclusionPoll{};
 };
 
 App* g_app = nullptr;
+
+DWORD waitMillisecondsUntil(std::chrono::steady_clock::time_point deadline,
+                            std::chrono::steady_clock::time_point now) {
+    if (now >= deadline)
+        return 0;
+    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+    return static_cast<DWORD>((remaining.count() + 999) / 1000);
+}
 
 void showRendererError(HWND owner) {
     MessageBoxW(owner, L"Could not create a Direct3D 11 device for the mixer window.\n"
@@ -75,10 +88,13 @@ void showWindow(App& app) {
         return;
     }
     app.visible = true;
+    app.occluded = false;
     app.mixer.setVisible(true);
     if (!wasIconic) ShowWindow(app.hwnd, SW_SHOW);
     SetForegroundWindow(app.hwnd);
     app.lastFrame = std::chrono::steady_clock::now();
+    app.framePacer.reset(app.lastFrame);
+    app.nextOcclusionPoll = app.lastFrame;
     app.consecutiveBeginFailures = 0;
 }
 
@@ -90,6 +106,7 @@ void hideWindow(App& app) {
     saveConfigIfDirty(app, true);
     app.mixer.setVisible(false);
     app.visible = false;
+    app.occluded = false;
     ShowWindow(app.hwnd, SW_HIDE);
     // Give the GPU memory back: the machine is probably running a game.
     app.renderer.destroy();
@@ -337,14 +354,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     app.tray.add(app.hwnd, icon, kWindowTitle);
     app.mixer.init(&app.engine, &app.config, app.hwnd);
 
-    app.engineRunning = app.engine.start(app.config);
-    if (!app.engineRunning) {
-        MessageBoxW(app.hwnd, L"Could not start the audio engine. See audio-monitor.log in "
-                              L"%APPDATA%\\audio-monitor for details.",
-                    kWindowTitle, MB_OK | MB_ICONERROR);
+    const bool startHidden = app.config.startMinimized || commandLineHas(L"--tray");
+    // An explicitly empty output list has nothing to forward. A tray launch
+    // must not keep meter-only capture workers alive with no visible meters;
+    // showing the window later starts them through syncMeteringVisibility().
+    if (app.config.outputCount() > 0 || (!startHidden && !app.config.sources.empty())) {
+        app.engineRunning = app.engine.start(app.config);
+        if (!app.engineRunning) {
+            MessageBoxW(app.hwnd, L"Could not start the audio engine. See audio-monitor.log in "
+                                  L"%APPDATA%\\audio-monitor for details.",
+                        kWindowTitle, MB_OK | MB_ICONERROR);
+        }
     }
 
-    const bool startHidden = app.config.startMinimized || commandLineHas(L"--tray");
     if (!startHidden) showWindow(app);
 
     app.lastFrame = std::chrono::steady_clock::now();
@@ -365,15 +387,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             if (!app.visible) continue;
 
             // Present does not wait for vsync while the window is occluded --
-            // covered by a fullscreen game, or the workstation locked -- so
-            // without this the loop would spin a core flat out on a machine
-            // that is busy doing something the user actually cares about.
+            // covered by a fullscreen game, or the workstation locked. Poll
+            // four times per second and wake immediately for window messages;
+            // a 16 ms Sleep used to burn ~62 DXGI test presents per second.
             if (app.occluded) {
-                if (app.renderer.stillOccluded()) { Sleep(16); continue; }
+                const auto pollNow = std::chrono::steady_clock::now();
+                if (const DWORD wait = waitMillisecondsUntil(app.nextOcclusionPoll, pollNow)) {
+                    MsgWaitForMultipleObjectsEx(0, nullptr, wait, QS_ALLINPUT,
+                                                MWMO_INPUTAVAILABLE);
+                    continue;
+                }
+                if (app.renderer.stillOccluded()) {
+                    app.nextOcclusionPoll = pollNow +
+                        std::chrono::milliseconds(kOccludedPollMilliseconds);
+                    continue;
+                }
                 app.occluded = false;
+                app.lastFrame = std::chrono::steady_clock::now();
+                app.framePacer.reset(app.lastFrame);
             }
 
             const auto now = std::chrono::steady_clock::now();
+            // A visible panel remains responsive at 60 Hz while focused. When
+            // a game or another app owns the foreground, 30 Hz is ample for
+            // readable meters and halves the panel's background draw traffic.
+            app.framePacer.setFramesPerSecond(
+                GetForegroundWindow() == app.hwnd ? kForegroundFramesPerSecond
+                                                  : kBackgroundFramesPerSecond,
+                now);
+            if (const DWORD wait = app.framePacer.waitMilliseconds(now)) {
+                MsgWaitForMultipleObjectsEx(0, nullptr, wait, QS_ALLINPUT,
+                                            MWMO_INPUTAVAILABLE);
+                continue;
+            }
+            app.framePacer.frameStarted(now);
             const float dt = std::chrono::duration<float>(now - app.lastFrame).count();
             app.lastFrame = now;
 
@@ -393,7 +440,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
             }
             app.consecutiveBeginFailures = 0;
             if (app.mixer.draw(dt, rc.right - rc.left, rc.bottom - rc.top)) app.configDirty = true;
-            app.occluded = app.renderer.endFrame(true);   // vsync paces the loop
+            app.occluded = app.renderer.endFrame(true);
+            if (app.occluded)
+                app.nextOcclusionPoll = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(kOccludedPollMilliseconds);
 
             saveConfigIfDirty(app, false);
 

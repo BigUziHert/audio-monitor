@@ -35,6 +35,10 @@ public:
     // Called on the render thread when the stream (re)starts, so the mixer can
     // reconfigure its rate controllers to the new clock.
     virtual void onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept = 0;
+    // The endpoint's ordinary period can be shorter than its maximum buffer.
+    // Optional metadata lets downstream queues reserve for the real clock
+    // without mistaking a one-off partial callback for that normal period.
+    virtual void onRenderPeriod(uint32_t nominalFrames) noexcept { (void)nominalFrames; }
 };
 
 class RenderStream {
