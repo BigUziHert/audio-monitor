@@ -59,13 +59,13 @@ bool AudioEngine::start(const Config& config) {
         auto mode = source.kind == SourceKind::Application ? CaptureMode::Application :
                     source.kind == SourceKind::Microphone ? CaptureMode::Microphone : CaptureMode::Loopback;
         channel.stream.configure(source.label.c_str(), mode);
-        channel.gain.store(source.gain);
+        channel.gain.store(effectiveGain(source));
         channel.muted.store(source.muted || !source.enabled);
         channel.peak.l.take(); channel.peak.r.take();
         if (source.enabled) channel.stream.start(devices_, source.kind == SourceKind::Application
             ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
     }
-    outputGain_.store(config.output.gain);
+    outputGain_.store(effectiveGain(config.output));
     outputMuted_.store(config.output.muted);
     mono_.store(config.mono);
     mixMode_.reset(config.mono);

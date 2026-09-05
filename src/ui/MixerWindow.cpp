@@ -18,6 +18,7 @@ constexpr ImU32 purple = IM_COL32(139, 96, 255, 255), green = IM_COL32(48, 213, 
                 amber = IM_COL32(255, 174, 51, 255);
 constexpr ImU32 red = IM_COL32(255, 58, 96, 255), cyan = IM_COL32(14, 193, 226, 255),
                 pink = IM_COL32(230, 63, 148, 255);
+constexpr float kStartupSettleSeconds = 1.5f;
 enum Icon {
     Wave,
     Headphones,
@@ -309,27 +310,17 @@ struct Canvas {
         const auto measured = textSize("i", fontSize, true);
         text(x - measured.x / 2, y - measured.y / 2 - .5f, "i", fontSize, color, true);
     }
-    bool volume(const char *id, float x, float y, float width, float &gain) const {
+    bool volume(const char *id, float x, float y, float width, float &volume) const {
         // Keep the native slider's keyboard navigation; replace its appearance.
         ImGui::SetCursorScreenPos(p(x, y));
         ImGui::SetNextItemWidth(width * s);
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
-        // The compact dashboard uses the familiar 0-100% range until a boosted
-        // value is configured in the editor. Keep boosted values adjustable
-        // instead of collapsing them to 100% on the next interaction.
-        const ImGuiID sliderId = ImGui::GetID(id);
-        auto *storage = ImGui::GetStateStorage();
-        if (ImGui::GetActiveID() != sliderId)
-            storage->SetFloat(sliderId, gain > 1.0001f ? 4.0f : 1.0f);
-        // Latch the starting range for mouse and keyboard interactions. Merely
-        // being active must not turn an ordinary 50% adjustment into 200%.
-        const float maxGain = storage->GetFloat(sliderId, 1.0f);
-        float value = std::clamp(gain, 0.0f, maxGain);
-        bool changed = ImGui::SliderFloat(id, &value, 0, maxGain, "", ImGuiSliderFlags_NoInput);
+        float value = std::clamp(volume, 0.0f, 1.0f);
+        bool changed = ImGui::SliderFloat(id, &value, 0, 1, "", ImGuiSliderFlags_NoInput);
         ImGui::PopStyleVar();
         if (changed)
-            gain = value;
-        float center = y + 18, end = x + 8 + (width - 16) * std::clamp(gain / maxGain, 0.0f, 1.0f);
+            volume = value;
+        float center = y + 18, end = x + 8 + (width - 16) * std::clamp(volume, 0.0f, 1.0f);
         line(x + 8, center, x + width - 8, center, IM_COL32(46, 51, 58, 255), 9);
         line(x + 8, center, end, center, purple, 9);
         dl->AddCircleFilled(p(end, center + 2), 14 * s, IM_COL32(0, 0, 0, 80), 28);
@@ -337,10 +328,10 @@ struct Canvas {
         if (ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible)
             dl->AddCircle(p(end, center), 17 * s, purple, 28, 2 * s);
         char label[24];
-        std::snprintf(label, sizeof(label), "%.0f%%", gain * 100);
+        std::snprintf(label, sizeof(label), "%.0f%%", volume * 100);
         text(x + width + 14, y + 4, label, 20);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Mix volume: %.0f%% (Windows volume is unchanged)", gain * 100);
+            ImGui::SetTooltip("Volume: %.0f%% (Windows volume is unchanged)", volume * 100);
         return changed;
     }
 };
@@ -538,6 +529,7 @@ void MixerWindow::restart() {
     if (engine_->running()) {
         engine_->stop();
         engine_->start(*config_);
+        monitoringWasRunning_ = false;
     }
     meters_ = {};
     outputMeter_ = {};
@@ -570,12 +562,29 @@ void MixerWindow::refreshStatus(float dt) {
     }
     severity_ = 0;
     statusDetail_.clear();
-    if (!engine_->running()) {
+    const bool running = engine_->running();
+    if (!running) {
+        updateStartupSettling(false, false, dt);
         status_ = "Stopped";
         statusDetail_ = "Monitoring is stopped. Press Start Monitoring to resume your saved mix.";
         return;
     }
     const auto out = engine_->outputStatus();
+    std::vector<ChannelStatus> sourceStates;
+    sourceStates.reserve(config_->sources.size());
+    bool allStreamsReady = out.state == StreamState::Running;
+    for (size_t i = 0; i < config_->sources.size(); ++i) {
+        sourceStates.push_back(engine_->channelStatus(static_cast<int>(i)));
+        if (config_->sources[i].enabled && sourceStates.back().state != StreamState::Running)
+            allStreamsReady = false;
+    }
+    const bool settling = updateStartupSettling(true, allStreamsReady, dt);
+    if (settling) {
+        status_ = "Stopped";
+        severity_ = 2;
+        statusDetail_ = "Monitoring is starting. Availability warnings appear if startup takes too long.";
+        return;
+    }
     uint64_t dropped = 0;
     std::vector<SourceRoute> routes;
     auto warn = [&](const std::string &label, const std::string &detail, int severity = 1) {
@@ -587,15 +596,15 @@ void MixerWindow::refreshStatus(float dt) {
              2);
     for (size_t i = 0; i < config_->sources.size(); ++i) {
         const auto &source = config_->sources[i];
-        const auto state = engine_->channelStatus(static_cast<int>(i));
+        const auto &state = sourceStates[i];
         dropped += state.dropped;
         SourceRoute route;
         route.kind = source.kind;
         route.endpoint = state.deviceId;
         route.processId = state.processId;
-        route.audible = source.enabled && !source.muted && source.gain > 0.0001f &&
+        route.audible = source.enabled && !source.muted && effectiveGain(source) > 0.0001f &&
                         state.state == StreamState::Running && !config_->output.muted &&
-                        config_->output.gain > 0.0001f;
+                        effectiveGain(config_->output) > 0.0001f;
         if (source.enabled && state.state != StreamState::Running)
             warn("Source unavailable",
                  sourceName(source) + ": " + (state.error.empty() ? "Connecting..." : state.error));
@@ -636,6 +645,25 @@ void MixerWindow::refreshStatus(float dt) {
         warn("Clipping", "The mix reached 0 dBFS. Lower a source or master volume to prevent distortion.", 2);
     if (!severity_)
         statusDetail_ = "Audio devices are running. No source overlap or recent dropouts detected.";
+}
+bool MixerWindow::updateStartupSettling(bool running, bool allStreamsReady, float dt) {
+    if (!running) {
+        monitoringWasRunning_ = false;
+        startupSettleTimer_ = 0;
+        return false;
+    }
+    if (!monitoringWasRunning_) {
+        monitoringWasRunning_ = true;
+        startupSettleTimer_ = kStartupSettleSeconds;
+    }
+    if (allStreamsReady) {
+        startupSettleTimer_ = 0;
+        return false;
+    }
+    if (startupSettleTimer_ <= 0)
+        return false;
+    startupSettleTimer_ = std::max(0.f, startupSettleTimer_ - std::max(0.f, dt));
+    return startupSettleTimer_ > 0;
 }
 bool MixerWindow::updateDropoutTimer(StreamState outputState, uint64_t underruns,
                                      uint64_t dropped, float dt) {
@@ -707,9 +735,9 @@ bool MixerWindow::drawSource(size_t index, float width, float dt) {
             engine_->setMuted(static_cast<int>(index), source.muted);
         changed = true;
     }
-    if (c.volume("##source-volume", 80, 156, width - 161, source.gain)) {
+    if (c.volume("##source-volume", 80, 156, width - 161, source.volume)) {
         if (engine_->running())
-            engine_->setGain(static_cast<int>(index), source.gain);
+            engine_->setGain(static_cast<int>(index), effectiveGain(source));
         changed = true;
     }
     if (source.enabled && engine_->running() && state.state != StreamState::Running)
@@ -911,8 +939,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
         engine_->setOutputMuted(config_->output.muted);
         changed = true;
     }
-    if (c.volume("##master-volume", rightX + 96, outputY + 185, rightW - 221, config_->output.gain)) {
-        engine_->setOutputGain(config_->output.gain);
+    if (c.volume("##master-volume", rightX + 96, outputY + 185, rightW - 221, config_->output.volume)) {
+        engine_->setOutputGain(effectiveGain(config_->output));
         changed = true;
     }
     const float settingsW = rightW * .238f, stopW = rightW * .35f, stateW = rightW * .325f,
@@ -1271,7 +1299,7 @@ bool MixerWindow::drawDialogs() {
         const char *gainMarks[] = {"0%", "100%", "200%", "300%", "400%"};
         for (int i = 0; i < 5; ++i)
             c.centeredText(58 + 500 * float(i) / 4.f, 749, gainMarks[i], 15, gray);
-        c.text(18, 780, "Adjust how much of this source is mixed into the output. 100% is normal volume.",
+        c.text(18, 764, "Adjust how much of this source is mixed into the output. 100% is normal volume.",
                15, gray, false, dialogW - 36);
 
         const bool valid = isApp ? applicationCaptureAvailable && !draft_.processPath.empty()
@@ -1432,7 +1460,7 @@ bool MixerWindow::drawDialogs() {
             outputDraft_.processPath.clear();
             outputDraft_.enabled = true;
             config_->output = outputDraft_;
-            engine_->setOutputGain(config_->output.gain);
+            engine_->setOutputGain(effectiveGain(config_->output));
             engine_->setOutputMuted(config_->output.muted);
             if (deviceChanged)
                 engine_->setChannelDevice(

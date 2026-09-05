@@ -26,6 +26,10 @@ struct MixerWindowTestAccess {
         mixer.severity_ = 0;
         mixer.refreshDropoutStatus(outputState, underruns, dropped, 1.f / 60.f);
     }
+    static bool updateStartupSettling(MixerWindow &mixer, bool running,
+                                      bool allStreamsReady, float dt) {
+        return mixer.updateStartupSettling(running, allStreamsReady, dt);
+    }
     static const std::string &statusDetail(const MixerWindow &mixer) {
         return mixer.statusDetail_;
     }
@@ -95,6 +99,19 @@ int main() {
                "Running output did not report a newly dropped capture frame");
         ui::MixerWindowTestAccess::resetDropoutState(mixer);
 
+        expect(!ui::MixerWindowTestAccess::updateStartupSettling(mixer, false, false, .1f),
+               "Stopped monitoring entered the startup grace period");
+        expect(ui::MixerWindowTestAccess::updateStartupSettling(mixer, true, false, .1f),
+               "A newly started stream did not suppress transient availability warnings");
+        expect(!ui::MixerWindowTestAccess::updateStartupSettling(mixer, true, true, .1f),
+               "Ready streams did not end the startup grace period immediately");
+        ui::MixerWindowTestAccess::updateStartupSettling(mixer, false, false, .1f);
+        expect(ui::MixerWindowTestAccess::updateStartupSettling(mixer, true, false, .5f) &&
+                   ui::MixerWindowTestAccess::updateStartupSettling(mixer, true, false, .5f) &&
+                   !ui::MixerWindowTestAccess::updateStartupSettling(mixer, true, false, .51f),
+               "Startup grace did not expire for a persistently unavailable stream");
+        ui::MixerWindowTestAccess::updateStartupSettling(mixer, false, false, .1f);
+
         io.DisplaySize = {1600, 986};
         io.DeltaTime = 1.f / 60;
         ImGui::NewFrame();
@@ -151,25 +168,26 @@ int main() {
             }
         expect(foundPaddedTooltip, "Refresh tooltip did not appear");
 
-        auto holdGainSlider = [&](float x, float y, float &gain, float expectedGain) {
+        auto holdVolumeSlider = [&](float x, float y, float &volume, float expectedVolume) {
             io.AddMousePosEvent(x, y);
             frame(1600, 986);
             io.AddMouseButtonEvent(0, true);
             frame(1600, 986);
-            expect(std::abs(gain - expectedGain) < .06f, "Slider click set an unexpected gain");
-            const float gainOnPress = gain;
+            expect(std::abs(volume - expectedVolume) < .06f,
+                   "Slider click set an unexpected volume");
+            const float volumeOnPress = volume;
             for (int i = 0; i < 4; ++i) {
                 frame(1600, 986);
-                expect(std::abs(gain - gainOnPress) < .001f,
-                       "Holding a gain slider changed its range without moving the pointer");
+                expect(std::abs(volume - volumeOnPress) < .001f,
+                       "Holding a volume slider changed its value without moving the pointer");
             }
             io.AddMouseButtonEvent(0, false);
             frame(1600, 986);
             frame(1600, 986);
         };
-        holdGainSlider(1030, 785, config.output.gain, .5f);
-        holdGainSlider(260, 365, config.sources[0].gain, .5f);
-        config.output.gain = config.sources[0].gain = 1.f;
+        holdVolumeSlider(1030, 785, config.output.volume, .5f);
+        holdVolumeSlider(260, 365, config.sources[0].volume, .5f);
+        config.output.volume = config.sources[0].volume = 1.f;
         const auto originalBuffer = config.bufferMillis;
         click(650, 488); // Sample Rate opens the Audio settings page.
         expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
@@ -204,7 +222,7 @@ int main() {
         }
         expect(config.mono && !popup(), "Channels did not close cleanly");
         click(850, 785); // Master volume
-        expect(config.output.gain < .9f, "Volume blocked after choosing channels");
+        expect(config.output.volume < .9f, "Volume blocked after choosing channels");
         click(670, 900); // Settings
         expect(popup() != nullptr, "Settings blocked after adjusting volume");
         expect(!mixer.hitTitleBar(700, 50, 1600, 986), "Native dragging steals input from a modal");
@@ -308,10 +326,10 @@ int main() {
             click(dialog->DC.CursorStartPos.x + 20, dialog->DC.CursorPosPrevLine.y + 10); // Reset
         expect(popup() && std::strcmp(popup()->Name, "Settings") == 0,
                "Reset did not return to Settings");
-        expect(config.output.gain < .9f, "Restore defaults applied before Save");
+        expect(config.output.volume < .9f, "Restore defaults applied before Save");
         if (auto *dialog = popup())
             click(dialog->DC.CursorStartPos.x + 633, dialog->DC.CursorStartPos.y + 716); // Save Settings
-        expect(!popup() && config.output.gain == 1.f, "Restore defaults was not committed by Save");
+        expect(!popup() && config.output.volume == 1.f, "Restore defaults was not committed by Save");
 
         const size_t sourceCountBeforeOutputEdit = config.sources.size();
         click(1514, 702); // Configure output device.
@@ -341,24 +359,57 @@ int main() {
             frame(1600, 986);
             click(dialog->DC.CursorStartPos.x + 308, dialog->DC.CursorStartPos.y + 495); // 200% gain
             click(dialog->DC.CursorStartPos.x + 634, dialog->DC.CursorStartPos.y + 492); // Gain field
-            io.AddInputCharactersUTF8("275");
+            io.AddInputCharactersUTF8("400");
             frame(1600, 986);
             click(dialog->DC.CursorStartPos.x + 634, dialog->DC.CursorStartPos.y + 634); // Save
         }
         expect(!popup() && config.output.icon == "chat" && config.output.label == "Stream Output" &&
-                   config.output.gain > 2.7f && config.output.gain < 2.8f,
+                   config.output.gain == 4.f && config.output.volume == 1.f,
                "Typed output gain was not committed");
         expect(config.sources.size() == sourceCountBeforeOutputEdit,
                "Editing output accidentally changed the source list");
-        click(825, 785); // Lower boosted output to about 100% in one held interaction.
-        expect(config.output.gain > .75f && config.output.gain < 1.25f,
-               "Dashboard output slider changed scale before the boosted drag finished");
-        config.output.gain = 2.75f;
-        holdGainSlider(700, 785, config.output.gain, .4f); // Keep the boosted range below 100% while held.
-        holdGainSlider(1030, 785, config.output.gain, .5f); // A new interaction returns to the normal range.
+        holdVolumeSlider(1030, 785, config.output.volume, .5f);
+        expect(config.output.gain == 4.f,
+               "Master volume changed the configured output mix gain");
+
+        config.sources[0].volume = 1.f;
         click(440, 239); // Configure the first source.
         expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
         dragAndResizePopup(false);
+
+        if (auto *dialog = popup()) {
+            click(dialog->DC.CursorStartPos.x + 634,
+                  dialog->DC.CursorStartPos.y + 708); // Source gain field
+            io.AddInputCharactersUTF8("400");
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 634,
+                  dialog->DC.CursorStartPos.y + 830); // Save source
+        }
+        expect(!popup() && config.sources[0].gain == 4.f && config.sources[0].volume == 1.f,
+               "Saving a 400% source mix gain changed its card volume");
+        holdVolumeSlider(260, 365, config.sources[0].volume, .5f);
+        expect(config.sources[0].gain == 4.f,
+               "Source card volume changed the configured source mix gain");
+
+        click(440, 239); // Reopen the first source for dialog behavior tests.
+        expect(popup() && std::strcmp(popup()->Name, "Configure source") == 0, "Source popup missing");
+        dragAndResizePopup(false);
+
+        if (auto *dialog = popup()) {
+            const ImVec2 origin = dialog->DC.CursorStartPos;
+            bool foundGainHelper = false;
+            float helperMaxY = origin.y;
+            for (const ImDrawVert &vertex : dialog->DrawList->VtxBuffer) {
+                if (vertex.col != IM_COL32(173, 181, 190, 255) ||
+                    vertex.pos.x < origin.x + 15 || vertex.pos.x > origin.x + 707 ||
+                    vertex.pos.y < origin.y + 758 || vertex.pos.y > origin.y + 800)
+                    continue;
+                foundGainHelper = true;
+                helperMaxY = std::max(helperMaxY, vertex.pos.y);
+            }
+            expect(foundGainHelper && helperMaxY < origin.y + 784,
+                   "Source gain helper text overlaps its panel outline");
+        }
 
         const size_t sourceCountBeforeDialogTests = config.sources.size();
         if (auto *dialog = popup()) {
@@ -463,26 +514,30 @@ int main() {
                   dialog->DC.CursorStartPos.y + 21); // Close Settings
         expect(!popup(), "Keyboard-opened Settings did not close");
 
-        config.output.gain = .5f;
+        config.output.gain = 1.f;
+        config.output.volume = .5f;
         frame(1600, 986);
         focusDashboardItem("##master-volume");
         pressKey(ImGuiKey_Space);
-        const float normalGainBefore = config.output.gain;
+        const float normalVolumeBefore = config.output.volume;
         pressKey(ImGuiKey_RightArrow);
-        const float normalGainStep = config.output.gain - normalGainBefore;
-        expect(normalGainStep > 0.f && normalGainStep < .02f,
-               "Keyboard slider did not use its latched 0-100% range");
+        const float normalVolumeStep = config.output.volume - normalVolumeBefore;
+        expect(normalVolumeStep > 0.f && normalVolumeStep < .02f,
+               "Keyboard slider did not use its 0-100% volume range");
         ImGui::ClearActiveID();
 
-        config.output.gain = 2.f;
+        config.output.gain = 4.f;
+        config.output.volume = .5f;
         frame(1600, 986);
         focusDashboardItem("##master-volume");
         pressKey(ImGuiKey_Space);
-        const float boostedGainBefore = config.output.gain;
+        const float boostedVolumeBefore = config.output.volume;
         pressKey(ImGuiKey_RightArrow);
-        const float boostedGainStep = config.output.gain - boostedGainBefore;
-        expect(boostedGainStep > normalGainStep * 3.f && boostedGainStep < .06f,
-               "Keyboard slider did not use its latched 0-400% range");
+        const float boostedVolumeStep = config.output.volume - boostedVolumeBefore;
+        expect(boostedVolumeStep > 0.f &&
+                   std::abs(boostedVolumeStep - normalVolumeStep) < .002f &&
+                   config.output.gain == 4.f,
+               "Mix gain changed the keyboard volume range or value");
         ImGui::ClearActiveID();
 
         const auto savedSources = config.sources;

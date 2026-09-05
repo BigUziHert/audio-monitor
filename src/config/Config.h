@@ -28,9 +28,14 @@ struct ChannelConfig {
     std::wstring deviceId;         // exact endpoint id, if known
     std::wstring deviceNameMatch;  // case-insensitive substring fallback
     std::string  icon;             // optional UI icon key; empty keeps the automatic icon
-    float        gain  = 1.0f;     // linear, 0..4 (100% is 1.0)
+    float        gain   = 1.0f;    // mix gain, 0..4 (100% is 1.0)
+    float        volume = 1.0f;    // dashboard volume, 0..1
     bool         muted = false;
 };
+
+inline float effectiveGain(const ChannelConfig& channel) noexcept {
+    return channel.gain * channel.volume;
+}
 
 struct Config {
     std::vector<ChannelConfig> sources;

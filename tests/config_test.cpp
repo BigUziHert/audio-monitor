@@ -92,39 +92,52 @@ int main() {
         R"({"game":{"deviceId":"game-pin","gain":0.8,"muted":true},"chat":{"gain":0.7},"mic":{"gain":2.1},"output":{"muted":true},"bufferMillis":90})");
     auto c = Config::fromJson(legacy);
     check(c.sources.size() == 3, "legacy keeps three sources");
-    check(c.sources[0].deviceId == L"game-pin" && c.sources[0].muted && c.sources[0].gain == 0.8f,
-          "legacy preserves pin, gain, mute");
+    check(c.sources[0].deviceId == L"game-pin" && c.sources[0].muted && c.sources[0].gain == 0.8f &&
+              c.sources[0].volume == 1.0f,
+          "legacy preserves pin, gain, mute and defaults volume");
     check(c.sources[2].kind == SourceKind::Microphone && c.sources[2].gain == 2.1f,
           "legacy microphone retains boost");
     check(c.output.muted && c.bufferMillis == 90, "legacy master mute and buffer");
+    const auto previous = Config::fromJson(JsonValue::parse(
+        R"({"version":2,"sources":[{"gain":4}],"output":{"gain":2}})"));
+    check(previous.sources.size() == 1 && previous.sources[0].gain == 4.f &&
+              previous.sources[0].volume == 1.f && previous.output.gain == 2.f &&
+              previous.output.volume == 1.f,
+          "version 2 mix gains load with full dashboard volume");
     ChannelConfig app;
     app.kind = SourceKind::Application;
     app.label = "Discord";
     app.icon = "chat";
     app.processPath = L"C:\\Apps\\Discord.exe";
     app.enabled = false;
+    app.gain = 4.0f;
+    app.volume = 0.65f;
     c.sources.push_back(app);
     c.mono = true;
     c.closeToTray = true;
     c.output.label = "Stream Output";
     c.output.icon = "screen";
     c.output.gain = 1.75f;
+    c.output.volume = 0.35f;
     auto copy = Config::fromJson(JsonValue::parse(c.toJson().dump()));
     check(copy.sources.size() == 4 && copy.sources[3].processPath == app.processPath &&
               copy.sources[3].icon == "chat" &&
-              !copy.sources[3].enabled,
-          "app identity, icon, and enabled state persist");
+              !copy.sources[3].enabled && copy.sources[3].gain == 4.0f &&
+              copy.sources[3].volume == 0.65f,
+          "app identity, icon, enabled state, mix gain, and volume persist");
     check(copy.mono && copy.closeToTray && copy.output.muted, "mix and window preferences persist");
     check(copy.output.label == "Stream Output" && copy.output.icon == "screen" &&
-              copy.output.gain == 1.75f,
-          "output name, icon, and gain persist");
+              copy.output.gain == 1.75f && copy.output.volume == 0.35f,
+          "output name, icon, mix gain, and volume persist");
     c.sources.clear();
     copy = Config::fromJson(c.toJson());
     check(copy.sources.empty(), "empty source list remains empty");
     auto malformed =
-        Config::fromJson(JsonValue::parse(R"({"sources":[{},false,{"gain":999}],"bufferMillis":999})"));
-    check(malformed.sources.size() == 2 && malformed.sources[1].gain == 4 && malformed.bufferMillis == 250,
-          "invalid entries skipped and gains clamped");
+        Config::fromJson(JsonValue::parse(
+            R"({"sources":[{},false,{"gain":999,"volume":999}],"bufferMillis":999})"));
+    check(malformed.sources.size() == 2 && malformed.sources[1].gain == 4 &&
+              malformed.sources[1].volume == 1 && malformed.bufferMillis == 250,
+          "invalid entries skipped and gains and volumes clamped");
     auto many = JsonValue::object(), list = JsonValue::array();
     for (int i = 0; i < 50; ++i)
         list.push(JsonValue::object());

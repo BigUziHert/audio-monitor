@@ -21,6 +21,7 @@ class MixerWindow {
     void refreshStatus(float dt);
     bool updateDropoutTimer(StreamState outputState, uint64_t underruns, uint64_t dropped,
                             float dt);
+    bool updateStartupSettling(bool running, bool allStreamsReady, float dt);
     void addStatusWarning(const std::string &label, const std::string &detail, int severity = 1);
     void refreshDropoutStatus(StreamState outputState, uint64_t underruns, uint64_t dropped,
                               float dt);
@@ -38,7 +39,9 @@ class MixerWindow {
     std::string status_ = "Stopped", statusDetail_;
     int severity_ = 0;
     float scale_ = 1, refreshTimer_ = 0, clippingTimer_ = 0, dropoutTimer_ = 0;
+    float startupSettleTimer_ = 0;
     uint64_t lastUnderruns_ = 0, lastDropped_ = 0;
+    bool monitoringWasRunning_ = false;
     bool exitRequested_ = false, openSettings_ = false, openSource_ = false;
     bool openChannels_ = false, openStatus_ = false, openOutput_ = false;
     int settingsPage_ = 1;

@@ -11,7 +11,7 @@
 namespace audiomon {
 namespace {
 
-constexpr int kConfigVersion = 2;
+constexpr int kConfigVersion = 3;
 
 JsonValue channelToJson(const ChannelConfig& c) {
     JsonValue v = JsonValue::object();
@@ -24,6 +24,7 @@ JsonValue channelToJson(const ChannelConfig& c) {
     v.set("deviceName", JsonValue(toUtf8(c.deviceNameMatch)));
     if (!c.icon.empty()) v.set("icon", JsonValue(c.icon));
     v.set("gain",       JsonValue(static_cast<double>(c.gain)));
+    v.set("volume",     JsonValue(static_cast<double>(c.volume)));
     v.set("muted",      JsonValue(c.muted));
     return v;
 }
@@ -43,16 +44,20 @@ ChannelConfig channelFromJson(const JsonValue* v, const ChannelConfig& fallback)
     const JsonValue* id   = v->find("deviceId");
     const JsonValue* name = v->find("deviceName");
     const JsonValue* gain = v->find("gain");
+    const JsonValue* volume = v->find("volume");
     const JsonValue* mute = v->find("muted");
 
     c.deviceId        = id   ? toWide(id->asString("")) : fallback.deviceId;
     c.deviceNameMatch = name ? toWide(name->asString(toUtf8(fallback.deviceNameMatch)))
                              : fallback.deviceNameMatch;
-    c.gain  = gain ? static_cast<float>(gain->asNumber(fallback.gain)) : fallback.gain;
-    c.muted = mute ? mute->asBool(fallback.muted) : fallback.muted;
+    c.gain   = gain ? static_cast<float>(gain->asNumber(fallback.gain)) : fallback.gain;
+    c.volume = volume ? static_cast<float>(volume->asNumber(fallback.volume)) : fallback.volume;
+    c.muted  = mute ? mute->asBool(fallback.muted) : fallback.muted;
 
     if (!(c.gain >= 0.0f)) c.gain = 0.0f;      // also catches NaN
     if (c.gain > 4.0f)     c.gain = 4.0f;
+    if (!(c.volume >= 0.0f)) c.volume = 0.0f;
+    if (c.volume > 1.0f)     c.volume = 1.0f;
     return c;
 }
 

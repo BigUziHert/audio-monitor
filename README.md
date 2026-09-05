@@ -23,9 +23,9 @@ arrives over HDMI as a single feed.
   applications such as Discord. The original Game, Chat, and Microphone
   selections are migrated automatically.
 - **Independent source controls.** The checkmark includes/excludes a source;
-  the speaker mutes it while retaining its gain. The arrow opens source
-  selection, naming, gain boost, and removal. Sliders adjust the forwarded
-  mix without changing Windows or headset volumes.
+  the speaker mutes it while retaining its levels. The arrow opens source
+  selection, naming, mix gain boost, and removal. Card sliders provide a
+  separate 0-100% volume control without changing Windows or headset volumes.
 - **Stereo / Mono.** Click the Channels card to switch live. Mono averages
   left and right and sends the same signal to both sides, with a short ramp
   to avoid a click. The selection is saved.
@@ -36,8 +36,9 @@ arrives over HDMI as a single feed.
   Warnings update about every two seconds and clear when sources are muted,
   disabled, removed, or routed separately. Detection uses Windows session
   routing; it does not analyze acoustic microphone echo.
-- **Master output controls.** Pick the destination, adjust its mix gain, or
-  mute the combined output. Stop/Start Monitoring preserves your configuration.
+- **Master output controls.** Pick the destination, adjust its mix gain and
+  0-100% volume independently, or mute the combined output. Stop/Start
+  Monitoring preserves your configuration.
 - **Tray support.** Minimize keeps audio running and releases the renderer.
   Close exits by default; Settings can make Close hide to the tray instead.
   Optional Windows startup and hidden manual launch remain available.
@@ -207,13 +208,13 @@ whenever you change something in the UI.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "sources": [
-    { "label": "Headphones", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "muted": false },
-    { "label": "Chat Audio", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "muted": false },
-    { "label": "Microphone", "kind": "microphone", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "USB Advanced Audio Device", "gain": 1, "muted": false }
+    { "label": "Headphones", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "volume": 1, "muted": false },
+    { "label": "Chat Audio", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "volume": 1, "muted": false },
+    { "label": "Microphone", "kind": "microphone", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "USB Advanced Audio Device", "gain": 1, "volume": 1, "muted": false }
   ],
-  "output": { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "muted": false },
+  "output": { "label": "", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Elgato 4K", "gain": 1, "volume": 1, "muted": false },
   "mono": false,
   "closeToTray": false,
   "exclusiveOutput": true,
@@ -222,6 +223,9 @@ whenever you change something in the UI.
   "bufferMillis": 50
 }
 ```
+
+`gain` is the 0-400% mix gain configured in the editor. `volume` is the
+independent 0-100% dashboard fader; the effective level is their product.
 
 On the first save of a version 1 configuration, the original is preserved as
 `config.json.v1.bak` beside `config.json`. To return to an older build, exit the
