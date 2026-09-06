@@ -168,11 +168,15 @@ cannot replace an executable that is still running, and launching a second
 instance only shows the first one's window.
 
 ```powershell
-git switch main
-git pull --ff-only origin main
+git switch devchatgpt
+git pull --ff-only origin devchatgpt
 .\scripts\build.ps1 -Test
 .\build\Release\audio-monitor.exe
 ```
+
+Make changes on `devchatgpt`. `main` holds the published version; promote a
+tested `devchatgpt` commit when publishing. Windows CI uses the `windows-2022`
+image to match the Visual Studio 2022 build tools used locally.
 
 `-BuildDir` is optional and defaults to `build`. `-Test` runs the DSP and sample
 format checks, configuration persistence and migration tests, deterministic

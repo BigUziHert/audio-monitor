@@ -156,6 +156,8 @@ std::string formatDiagnosticReport(const DiagnosticSample& current,
         << "Source overflow/trim units: source-native frames; source shortfall: canonical 48 kHz frames.\n"
         << "Source shortfalls are counted only after priming while capture reports flowing; an endpoint\n"
         << "falling silent can still report flowing briefly, so these are not necessarily audible glitches.\n"
+        << "Shortfall counters exclude timeline-recovery fades, discarded queues, and priming silence.\n"
+        << "Zero output underruns do not rule out source gaps: the mixer can deliver silence on time.\n"
         << "Output overflow/trim: canonical 48 kHz frames; output shortfall: output-native frames.\n"
         << "Underruns and starvation counts are events, not frames. Pump misses are global, not per output.\n"
         << "A capture epoch is a timeline break, not a device restart count.\n"
