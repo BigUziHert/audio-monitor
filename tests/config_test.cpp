@@ -1,6 +1,7 @@
 #include "config/Config.h"
 #include "config/Json.h"
 #include <windows.h>
+#include <algorithm>
 #include <cstdio>
 #include <string>
 using namespace audiomon;
@@ -113,10 +114,42 @@ int main() {
               ColorTheme::Light,
           "light theme string loads");
     const auto defaultJson = Config::defaults().toJson();
-    check(defaultJson.find("version") && defaultJson.find("version")->asNumber(0) == 6 &&
+    check(defaultJson.find("version") && defaultJson.find("version")->asNumber(0) == 7 &&
               defaultJson.find("colorTheme") &&
               defaultJson.find("colorTheme")->asString("") == "dark",
-          "version 6 writes the default dark theme string");
+          "version 7 writes the default dark theme string");
+    const Config defaultKeybindConfig = Config::defaults();
+    check(Config{}.monitoringKeybind.empty() && ChannelConfig{}.muteKeybind.empty() &&
+              defaultKeybindConfig.monitoringKeybind == Keybind{} &&
+              std::all_of(defaultKeybindConfig.sources.begin(), defaultKeybindConfig.sources.end(),
+                          [](const ChannelConfig& source) { return source.muteKeybind == Keybind{}; }),
+          "new monitoring and channel keybinds are unassigned by default");
+    check(c.monitoringKeybind == Keybind{} && c.output.muteKeybind == Keybind{} &&
+              c.sources[0].muteKeybind == Keybind{},
+          "legacy settings never acquire default keybinds");
+    const auto blankKeybinds = Config::fromJson(defaultJson);
+    check(blankKeybinds.monitoringKeybind == Keybind{} &&
+              blankKeybinds.sources[0].muteKeybind == Keybind{},
+          "explicit blank keybinds remain blank after round-trip");
+    for (const char* chord : {
+             "null", "false", "5", "\"Ctrl+M\"", "[]", "{}",
+             R"({"modifiers":2})", R"({"key":77})",
+             R"({"modifiers":"2","key":77})", R"({"modifiers":2,"key":true})",
+             R"({"modifiers":-1,"key":77})", R"({"modifiers":16,"key":77})",
+             R"({"modifiers":16384,"key":77})", R"({"modifiers":1.5,"key":77})",
+             R"({"modifiers":2,"key":77.5})", R"({"modifiers":2,"key":0})",
+             R"({"modifiers":2,"key":-1})", R"({"modifiers":2,"key":9999999999})",
+             R"({"modifiers":2,"key":16})", R"({"modifiers":2,"key":1})",
+             R"({"modifiers":0,"key":123})"}) {
+        const std::string json = std::string("{\"monitoringKeybind\":") + chord +
+            ",\"sources\":[{\"muteKeybind\":" + chord +
+            "}],\"outputs\":[{\"deviceId\":\"output\",\"muteKeybind\":" + chord + "}]}";
+        const auto invalidKeybind = Config::fromJson(JsonValue::parse(json));
+        check(invalidKeybind.monitoringKeybind == Keybind{} &&
+                  invalidKeybind.sources[0].muteKeybind == Keybind{} &&
+                  invalidKeybind.output.muteKeybind == Keybind{},
+              "malformed keybind objects normalize to unassigned");
+    }
     check(Config{}.outputCount() == 1, "bare Config preserves the legacy directly assigned output slot");
     check(Config::defaults().outputCount() == 0 &&
               Config::defaults().output.deviceId.empty() &&
@@ -154,6 +187,7 @@ int main() {
     primaryOutput.deviceNameMatch = L"Primary Device";
     primaryOutput.gain = 1.25f;
     primaryOutput.volume = 0.8f;
+    primaryOutput.muteKeybind = {MOD_CONTROL | MOD_SHIFT, 'P'};
     check(multipleOutputs.addOutput(primaryOutput), "adding the first output installs the primary");
     ChannelConfig secondaryOutput;
     secondaryOutput.label = "Headphones";
@@ -163,6 +197,7 @@ int main() {
     secondaryOutput.gain = 0.75f;
     secondaryOutput.volume = 0.55f;
     secondaryOutput.muted = true;
+    secondaryOutput.muteKeybind = {MOD_ALT, VK_F9};
     ChannelConfig tertiaryOutput;
     tertiaryOutput.label = "Recorder";
     tertiaryOutput.deviceId = L"tertiary-id";
@@ -180,6 +215,8 @@ int main() {
               multipleCopy.outputAt(1).icon == "headphones" &&
               multipleCopy.outputAt(1).gain == 0.75f &&
               multipleCopy.outputAt(1).volume == 0.55f && multipleCopy.outputAt(1).muted &&
+              multipleCopy.outputAt(0).muteKeybind == primaryOutput.muteKeybind &&
+              multipleCopy.outputAt(1).muteKeybind == secondaryOutput.muteKeybind &&
               multipleCopy.outputAt(2).label == "Recorder" &&
               multipleCopy.outputAt(2).deviceId == L"tertiary-id",
           "multiple outputs round-trip in order with independent settings");
@@ -214,7 +251,8 @@ int main() {
               "output helpers reject duplicates and empty selections");
         check(editable.removeOutput(0) && editable.outputCount() == 2 &&
                   editable.outputAt(0).deviceId == secondaryOutput.deviceId &&
-                  editable.outputAt(0).muted && editable.outputAt(0).volume == 0.55f,
+                  editable.outputAt(0).muted && editable.outputAt(0).volume == 0.55f &&
+                  editable.outputAt(0).muteKeybind == secondaryOutput.muteKeybind,
               "deleting the primary promotes the next output without losing its controls");
         check(editable.removeOutput(1) && editable.outputCount() == 1 &&
                   editable.removeOutput(0) && editable.outputCount() == 0 &&
@@ -247,9 +285,11 @@ int main() {
     app.enabled = false;
     app.gain = 4.0f;
     app.volume = 0.65f;
+    app.muteKeybind = {MOD_ALT | MOD_CONTROL, 'D'};
     c.sources.push_back(app);
     c.mono = true;
     c.closeToTray = true;
+    c.monitoringKeybind = {MOD_CONTROL | MOD_SHIFT, VK_F8};
     c.colorTheme = ColorTheme::System;
     c.output.label = "Stream Output";
     c.output.icon = "screen";
@@ -259,14 +299,21 @@ int main() {
     check(copy.sources.size() == 4 && copy.sources[3].processPath == app.processPath &&
               copy.sources[3].icon == "chat" &&
               !copy.sources[3].enabled && copy.sources[3].gain == 4.0f &&
-              copy.sources[3].volume == 0.65f,
+              copy.sources[3].volume == 0.65f &&
+              copy.sources[3].muteKeybind == app.muteKeybind,
           "app identity, icon, enabled state, mix gain, and volume persist");
     check(copy.mono && copy.closeToTray && copy.output.muted &&
-              copy.colorTheme == ColorTheme::System,
+              copy.colorTheme == ColorTheme::System &&
+              copy.monitoringKeybind == c.monitoringKeybind,
           "mix, window, and theme preferences persist");
     check(copy.output.label == "Stream Output" && copy.output.icon == "screen" &&
               copy.output.gain == 1.75f && copy.output.volume == 0.35f,
           "output name, icon, mix gain, and volume persist");
+    copy.sources.erase(copy.sources.begin());
+    copy = Config::fromJson(copy.toJson());
+    check(copy.sources[2].processPath == app.processPath &&
+              copy.sources[2].muteKeybind == app.muteKeybind,
+          "source keybind stays with its device when an earlier source is removed");
     c.sources.clear();
     copy = Config::fromJson(c.toJson());
     check(copy.sources.empty(), "empty source list remains empty");
@@ -291,16 +338,20 @@ int main() {
         saved.bufferMillis = 90;
         saved.mono = true;
         saved.colorTheme = ColorTheme::Light;
+        saved.monitoringKeybind = {MOD_CONTROL, VK_F10};
         ChannelConfig savedOutput;
         savedOutput.label = "Temporary output";
         savedOutput.deviceId = L"temporary-output";
+        savedOutput.muteKeybind = {MOD_SHIFT, VK_F11};
         check(saved.addOutput(savedOutput), "create explicit output for save fixture");
         check(saved.save(path), "save to explicit path");
         bool usedDefaults = true;
         const Config loaded = Config::load(path, &usedDefaults);
         check(!usedDefaults && loaded.bufferMillis == 90 && loaded.mono &&
                   loaded.colorTheme == ColorTheme::Light &&
-                  loaded.output.label == "Temporary output",
+                  loaded.output.label == "Temporary output" &&
+                  loaded.monitoringKeybind == saved.monitoringKeybind &&
+                  loaded.output.muteKeybind == savedOutput.muteKeybind,
               "load from explicit path");
         check(GetFileAttributesW(tmp.c_str()) == INVALID_FILE_ATTRIBUTES,
               "successful save leaves no temp file");

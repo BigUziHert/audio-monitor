@@ -154,6 +154,16 @@ void copyPreferences(Config &destination, const Config &source) {
     destination.startMinimized = source.startMinimized;
     destination.bufferMillis = source.bufferMillis;
     destination.colorTheme = source.colorTheme;
+    destination.monitoringKeybind = source.monitoringKeybind;
+}
+
+// Settings owns shortcuts, but live mute/fader values and resolved endpoint
+// identities may change while the modal is open.
+void copyDeviceKeybinds(Config &destination, const Config &source) {
+    for (size_t i = 0; i < std::min(destination.sources.size(), source.sources.size()); ++i)
+        destination.sources[i].muteKeybind = source.sources[i].muteKeybind;
+    for (size_t i = 0; i < std::min(destination.outputCount(), source.outputCount()); ++i)
+        destination.outputAt(i).muteKeybind = source.outputAt(i).muteKeybind;
 }
 
 enum Icon {
@@ -789,6 +799,9 @@ void MixerWindow::init(AudioEngine *engine, Config *config, void *window) {
     engine_ = engine;
     config_ = config;
     window_ = window;
+    hotkeys_.init(window);
+    if (!hotkeys_.apply(*config_, keybindError_))
+        LOG_WARN("keybinds: %s", keybindError_.c_str());
     applyTheme(config_->colorTheme);
     refreshDevices();
 }
@@ -796,6 +809,11 @@ void MixerWindow::setVisible(bool visible) {
     if (visible_ == visible)
         return;
     visible_ = visible;
+    resetDropoutTracking();
+    if (!visible_) {
+        keybindTarget_ = -1;
+        captureCancelRequested_ = true;
+    }
     meteringStartAttempted_ = false;
     // A hidden dashboard has no frame clock. Discard its old display history
     // on re-entry, while ordinary Start/Stop clicks keep that history intact.
@@ -824,6 +842,7 @@ void MixerWindow::setVisible(bool visible) {
         engine_->stop();
 }
 void MixerWindow::shutdown() {
+    hotkeys_.clear();
     // Export owns an engine pointer, never ImGui or a window handle. Finish it
     // before application teardown destroys the engine or logging service.
     if (diagnosticExport_.valid()) diagnosticExport_.wait();
@@ -895,6 +914,12 @@ void MixerWindow::refreshDevices() {
     refreshTimer_ = 0;
 }
 void MixerWindow::restart() {
+    if (!hotkeys_.apply(*config_, keybindError_)) {
+        // A topology change must never leave an old index targeting another
+        // device if a persisted shortcut could not be registered.
+        hotkeys_.clear();
+        LOG_WARN("keybinds: %s", keybindError_.c_str());
+    }
     if (engine_->running()) {
         const bool wasMonitoring = engine_->monitoring();
         engine_->start(*config_, wasMonitoring);
@@ -908,9 +933,112 @@ void MixerWindow::restart() {
     lastStatusMonitoring_ = false;
     statusRefreshForced_ = true;
     spectrumWasActive_ = false;
-    lastUnderruns_ = lastDropped_ = 0;
+    resetDropoutTracking();
     refreshDevices();
     meteringStartAttempted_ = false;
+}
+bool MixerWindow::toggleMonitoring() {
+    if (!engine_ || !config_ || config_->outputCount() == 0) return false;
+    if (engine_->running())
+        engine_->setMonitoring(!engine_->monitoring());
+    else
+        engine_->start(*config_);
+    if (!visible_ && !engine_->monitoring()) engine_->stop();
+    // Preserve the source meters, just as the dashboard button does.
+    outputMeter_ = {};
+    spectrum_ = Spectrum{};
+    spectrumRefreshTimer_ = 0;
+    spectrumWasActive_ = false;
+    statusRefreshForced_ = true;
+    resetDropoutTracking();
+    return true;
+}
+
+Keybind *MixerWindow::draftKeybind(int target) {
+    if (target == 0) return &settingsDraft_.monitoringKeybind;
+    if (target > 0 && target <= kMaxSources &&
+        size_t(target - 1) < settingsDraft_.sources.size())
+        return &settingsDraft_.sources[target - 1].muteKeybind;
+    const int output = target - 1 - kMaxSources;
+    if (output >= 0 && size_t(output) < settingsDraft_.outputCount())
+        return &settingsDraft_.outputAt(output).muteKeybind;
+    return nullptr;
+}
+
+void MixerWindow::captureKeybind(uint32_t key, uint32_t modifiers, bool repeated) {
+    if (keybindTarget_ < 0 || repeated) return;
+    if (key == VK_ESCAPE) {
+        captureCancelRequested_ = true;
+        return;
+    }
+    if (key == VK_RETURN && modifiers == 0 && capturedKeybindChanged_ && captureError_.empty()) {
+        captureAcceptRequested_ = true;
+        return;
+    }
+    if (key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+        key == VK_LSHIFT || key == VK_RSHIFT || key == VK_LCONTROL || key == VK_RCONTROL ||
+        key == VK_LMENU || key == VK_RMENU || key == VK_LWIN || key == VK_RWIN)
+        return;
+    captureError_.clear();
+    if (key == VK_BACK || key == VK_DELETE) {
+        capturedKeybind_ = {};
+        capturedKeybindChanged_ = true;
+    } else if (validKeybind({modifiers, key})) {
+        capturedKeybind_ = {modifiers, key};
+        capturedKeybindChanged_ = true;
+    } else {
+        captureError_ = "That key is unavailable. Choose another shortcut.";
+    }
+}
+
+bool MixerWindow::handleKeybindMessage(uint32_t message, uintptr_t key, intptr_t data) {
+    if (keybindTarget_ < 0) return false;
+    if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+        uint32_t modifiers = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
+        if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
+        if (GetKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
+        if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) modifiers |= MOD_WIN;
+        captureKeybind(static_cast<uint32_t>(key), modifiers, (data & (intptr_t(1) << 30)) != 0);
+        return true;
+    }
+    return message == WM_CHAR || message == WM_SYSCHAR;
+}
+
+bool MixerWindow::handleHotkey(int id, intptr_t chord) {
+    Hotkeys::Action action;
+    if (!hotkeys_.actionFor(id, chord, action)) return false;
+    // Windows may deliver a registered chord as WM_HOTKEY while recording.
+    // Keep the capture popup open until the user explicitly accepts it.
+    if (keybindTarget_ >= 0) {
+        captureKeybind(HIWORD(chord), LOWORD(chord));
+        return false;
+    }
+    return executeHotkeyAction(action);
+}
+
+bool MixerWindow::executeHotkeyAction(const Hotkeys::Action &action) {
+    if (!engine_ || !config_) return false;
+    switch (action.kind) {
+    case Hotkeys::ActionKind::Monitoring:
+        return toggleMonitoring();
+    case Hotkeys::ActionKind::SourceMute:
+        if (action.index >= config_->sources.size()) return false;
+        config_->sources[action.index].muted = !config_->sources[action.index].muted;
+        engine_->setMuted(static_cast<int>(action.index), config_->sources[action.index].muted);
+        if (editSource_ == static_cast<int>(action.index))
+            draft_.muted = config_->sources[action.index].muted;
+        break;
+    case Hotkeys::ActionKind::OutputMute:
+        if (action.index >= config_->outputCount()) return false;
+        config_->outputAt(action.index).muted = !config_->outputAt(action.index).muted;
+        engine_->setOutputMuted(action.index, config_->outputAt(action.index).muted);
+        if (editOutput_ == static_cast<int>(action.index))
+            outputDraft_.muted = config_->outputAt(action.index).muted;
+        break;
+    }
+    statusRefreshForced_ = true;
+    return true;
 }
 void MixerWindow::addStatusWarning(const std::string &label, const std::string &detail,
                                    int severity) {
@@ -948,6 +1076,7 @@ void MixerWindow::refreshStatus(float dt) {
     severity_ = 0;
     statusDetail_.clear();
     if (config_->outputCount() == 0) {
+        resetDropoutTracking();
         updateStartupSettling(false, false, statusDt);
         status_ = "No outputs";
         statusDetail_ = "Add an output device to send the mix to a playback device. Source meters remain active.";
@@ -955,6 +1084,7 @@ void MixerWindow::refreshStatus(float dt) {
         return;
     }
     if (!running) {
+        resetDropoutTracking();
         updateStartupSettling(false, false, statusDt);
         status_ = "Stopped";
         statusDetail_ = "Audio forwarding is stopped. Source meters remain active.";
@@ -1099,13 +1229,24 @@ bool MixerWindow::updateStartupSettling(bool running, bool allStreamsReady, floa
     startupSettleTimer_ = std::max(0.f, startupSettleTimer_ - std::max(0.f, dt));
     return startupSettleTimer_ > 0;
 }
+void MixerWindow::resetDropoutTracking() {
+    dropoutBaselineValid_ = false;
+    lastUnderruns_ = lastDropped_ = 0;
+    dropoutTimer_ = 0;
+}
 bool MixerWindow::updateDropoutTimer(StreamState outputState, uint64_t underruns,
                                      uint64_t dropped, float dt) {
-    if (outputState == StreamState::Running &&
+    // Counts span the audio session, but the dashboard stops observing them
+    // in the tray and while forwarding is paused. The first sample after
+    // either gap establishes a baseline; it cannot date historical events.
+    // Keep those events in diagnostics instead of replaying a fresh warning.
+    if (dropoutBaselineValid_ && outputState == StreamState::Running &&
         (underruns > lastUnderruns_ || dropped > lastDropped_))
         dropoutTimer_ = 4;
+    if (outputState != StreamState::Running) dropoutTimer_ = 0;
     lastUnderruns_ = underruns;
     lastDropped_ = dropped;
+    dropoutBaselineValid_ = true;
     dropoutTimer_ = std::max(0.f, dropoutTimer_ - dt);
     return dropoutTimer_ > 0;
 }
@@ -1508,19 +1649,8 @@ bool MixerWindow::draw(float dt, int width, int height) {
               running ? "Stop sending audio; keep source meters active" : "Resume saved mix");
     ImGui::PopItemFlag();
     if (toggleMonitoring && canMonitor) {
-        if (engine_->running())
-            engine_->setMonitoring(!running);
-        else
-            engine_->start(*config_);
+        changed |= this->toggleMonitoring();
         running = engine_->monitoring();
-        // Source meters retain their samples and ballistics across this
-        // request. Only the forwarded mix display starts a new session.
-        outputMeter_ = {};
-        spectrum_ = Spectrum{};
-        spectrumRefreshTimer_ = 0;
-        spectrumWasActive_ = false;
-        lastUnderruns_ = lastDropped_ = 0;
-        changed = true;
     }
     float stateX = rightX + rightW - stateW;
     c.rect(stateX, footerY, stateW, 73, card, 18);
@@ -2090,6 +2220,8 @@ bool MixerWindow::drawDialogs() {
     if (openSettings_) {
         settingsDraft_ = *config_;
         resetDevicesOnSave_ = false;
+        keybindTarget_ = -1;
+        captureCancelRequested_ = false;
         ImGui::OpenPopup("Settings");
         openSettings_ = false;
     }
@@ -2279,10 +2411,70 @@ bool MixerWindow::drawDialogs() {
             c.centeredText(448, 327, "Work In Progress", 28, white);
             c.centeredText(448, 365, "Plugin support is currently being built.", 17, gray);
         } else if (settingsPage_ == 3) {
-            c.badge(Keyboard, 448, 263, purple);
-            c.centeredText(448, 327, "Keybinds", 28, white);
-            c.centeredText(448, 365, "Keyboard shortcut controls will be added here later.", 17,
-                           gray);
+            c.icon(Keyboard, contentX + 10, 124, white, 27);
+            c.text(contentX + 38, 107, "Keybinds", 21, white, true);
+            c.wrappedText(contentX, 148,
+                          "Shortcuts work in other apps and from the tray.\nAll bindings start unassigned.",
+                          20, gray, 504, 52);
+            bool openCapture = false;
+            ImGui::SetCursorScreenPos(c.p(contentX, 218));
+            ImGui::BeginChild("Keybind list", {504 * scale_, 352 * scale_},
+                              ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoBackground);
+            const float rowWidth = ImGui::GetContentRegionAvail().x / scale_;
+            auto drawKeybind = [&](int target, const std::string &label, Keybind &binding) {
+                const ImVec2 position = ImGui::GetCursorScreenPos();
+                Canvas row{ImGui::GetWindowDrawList(), position, scale_};
+                ImGui::PushID(target);
+                row.text(0, 0, label, 20, white, false, rowWidth);
+                if (ImGui::IsMouseHoveringRect(row.p(0, 0), row.p(rowWidth, 28)))
+                    ImGui::SetTooltip("%s", label.c_str());
+                const float fieldWidth = rowWidth - 88;
+                row.rect(0, 34, fieldWidth, 44, card, 8);
+                row.text(12, 45, keybindLabel(binding), 20, white, false, fieldWidth - 24);
+                if (row.hit("Set keybind", 0, 34, fieldWidth, 44,
+                            "Click to assign a shortcut; an empty field is unassigned")) {
+                    keybindTarget_ = target;
+                    capturedKeybind_ = binding;
+                    captureCancelRequested_ = false;
+                    captureAcceptRequested_ = false;
+                    capturedKeybindChanged_ = false;
+                    captureError_.clear();
+                    openCapture = true;
+                }
+                ImGui::BeginDisabled(binding.empty());
+                row.rect(fieldWidth + 12, 34, 76, 44, card, 8);
+                row.centeredText(fieldWidth + 50, 56, "Clear", 20, binding.empty() ? gray : white);
+                if (row.hit("Clear keybind", fieldWidth + 12, 34, 76, 44)) {
+                    binding = {};
+                    keybindError_.clear();
+                }
+                ImGui::EndDisabled();
+                ImGui::PopID();
+                ImGui::SetCursorScreenPos(position);
+                ImGui::Dummy({rowWidth * scale_, 96 * scale_});
+            };
+            drawKeybind(0, "Start / Stop Monitoring", settingsDraft_.monitoringKeybind);
+            for (size_t i = 0; i < settingsDraft_.sources.size(); ++i) {
+                auto &source = settingsDraft_.sources[i];
+                drawKeybind(1 + static_cast<int>(i), "Mute / Unmute source: " + sourceName(source),
+                            source.muteKeybind);
+            }
+            for (size_t i = 0; i < settingsDraft_.outputCount(); ++i) {
+                auto &output = settingsDraft_.outputAt(i);
+                const auto label = output.label.empty() ? toUtf8(output.deviceNameMatch) : output.label;
+                drawKeybind(1 + kMaxSources + static_cast<int>(i),
+                            "Mute / Unmute output: " + (label.empty() ? "Output " + std::to_string(i + 1) : label),
+                            output.muteKeybind);
+            }
+            ImGui::EndChild();
+            c.wrappedText(contentX, 588,
+                          keybindError_.empty() ? "Click a blank field to set a shortcut.\nMute controls affect your monitored mix."
+                                               : keybindError_,
+                          20, keybindError_.empty() ? gray : red, 504, 66);
+            if (!keybindError_.empty() &&
+                ImGui::IsMouseHoveringRect(c.p(contentX, 588), c.p(contentX + 504, 654)))
+                ImGui::SetTooltip("%s", keybindError_.c_str());
+            if (openCapture) ImGui::OpenPopup("Set keybind");
         } else if (settingsPage_ == 4) {
             c.badge(Info, 448, 163, purple);
             c.centeredText(448, 222, "Audio Monitor", 28, white);
@@ -2335,8 +2527,18 @@ bool MixerWindow::drawDialogs() {
         if (drawButton("Cancel settings", 378, 691, 150, 49, "Cancel", card))
             ImGui::CloseCurrentPopup();
         if (drawButton("Save settings", 544, 691, 178, 49, "Save", accentButton, onAccent)) {
-            if (settingsDraft_.startWithWindows != config_->startWithWindows &&
+            Config candidate = *config_;
+            copyPreferences(candidate, settingsDraft_);
+            copyDeviceKeybinds(candidate, settingsDraft_);
+            if (resetDevicesOnSave_) {
+                candidate.sources.clear();
+                candidate.clearOutputs();
+            }
+            if (!hotkeys_.apply(candidate, keybindError_)) {
+                settingsPage_ = 3;
+            } else if (settingsDraft_.startWithWindows != config_->startWithWindows &&
                 !startup::setEnabled(settingsDraft_.startWithWindows)) {
+                hotkeys_.apply(*config_, keybindError_);
                 ImGui::OpenPopup("Startup setting failed");
             } else {
                 const bool exclusiveChanged = settingsDraft_.exclusiveOutput != config_->exclusiveOutput;
@@ -2344,6 +2546,7 @@ bool MixerWindow::drawDialogs() {
                 // buttons; Save only commits the remaining pending choices.
                 settingsDraft_.colorTheme = config_->colorTheme;
                 copyPreferences(*config_, settingsDraft_);
+                copyDeviceKeybinds(*config_, settingsDraft_);
                 if (resetDevicesOnSave_) {
                     // Stop workers before discarding the live routing. Runtime
                     // endpoint synchronization must not resurrect cleared IDs.
@@ -2362,6 +2565,33 @@ bool MixerWindow::drawDialogs() {
                 changed = true;
                 ImGui::CloseCurrentPopup();
             }
+        }
+        if (beginBoundedModal("Set keybind", 550, scale_)) {
+            ImGui::TextWrapped("Press a shortcut, then press Enter or click Use shortcut.\nEscape cancels. Backspace or Delete clears it.");
+            ImGui::Spacing();
+            const auto label = keybindLabel(capturedKeybind_);
+            ImGui::TextUnformatted(label.empty() ? "Unassigned" : label.c_str());
+            if (!captureError_.empty()) {
+                ImGui::Spacing();
+                ImGui::TextWrapped("%s", captureError_.c_str());
+            }
+            ImGui::Spacing();
+            ImGui::BeginDisabled(!captureError_.empty());
+            if (ImGui::Button("Use shortcut") || captureAcceptRequested_) {
+                if (auto *binding = draftKeybind(keybindTarget_)) *binding = capturedKeybind_;
+                keybindError_.clear();
+                keybindTarget_ = -1;
+                captureAcceptRequested_ = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || captureCancelRequested_) {
+                keybindTarget_ = -1;
+                captureCancelRequested_ = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
         if (beginBoundedPopup("Startup setting failed", scale_)) {
             ImGui::TextUnformatted("Could not update Windows startup. Please try again.");

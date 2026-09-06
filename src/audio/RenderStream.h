@@ -49,7 +49,8 @@ public:
     RenderStream(const RenderStream&) = delete;
     RenderStream& operator=(const RenderStream&) = delete;
 
-    void start(DeviceManager& devices, const DeviceRef& ref, IMixSource* mixer, bool preferExclusive);
+    void start(DeviceManager& devices, const DeviceRef& ref, IMixSource* mixer, bool preferExclusive,
+               const char* reason = "explicit start/restart request");
     void stop();
 
     StreamState  state() const noexcept { return state_.load(std::memory_order_acquire); }

@@ -54,8 +54,10 @@ void RenderStream::logOpenFailureOnce() {
 }
 
 void RenderStream::start(DeviceManager& devices, const DeviceRef& ref,
-                         IMixSource* mixer, bool preferExclusive) {
+                         IMixSource* mixer, bool preferExclusive, const char* reason) {
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    LOG_INFO("render: start requested for '%s': reason=%s; previous state=%s; previous error=%s",
+             toUtf8(ref.nameMatch).c_str(), reason, streamStateName(state()), lastError().c_str());
     stopLocked();
     devices_         = &devices;
     mixer_           = mixer;
@@ -487,7 +489,10 @@ void RenderStream::threadMain(DeviceRef ref) {
                 LOG_INFO("render: started; entering render loop");
                 state_.store(StreamState::Running, std::memory_order_release);
                 renderLoop();
-                LOG_INFO("render: loop exited");
+                if (wantsRetry())
+                    LOG_WARN("render: loop exited: runtime failure; %s", lastError().c_str());
+                else
+                    LOG_INFO("render: loop exited: stop requested");
             } else {
                 setError("IAudioClient::Start", hr);
             }

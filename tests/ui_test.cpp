@@ -28,6 +28,12 @@ struct AudioEngineTestAccess {
     static void setMonitoringState(AudioEngine &engine, bool monitoring) {
         engine.monitoringState_.store(monitoring ? 3u : 2u);
     }
+    static bool sourceMuted(const AudioEngine &engine, size_t index) {
+        return engine.channels_[index]->muted.load();
+    }
+    static bool outputMuted(const AudioEngine &engine, size_t index) {
+        return engine.outputMuted_[index].load();
+    }
 };
 } // namespace audiomon
 
@@ -38,14 +44,18 @@ struct MixerWindowTestAccess {
         mixer.statusDetail_.clear();
         mixer.severity_ = 0;
         mixer.dropoutTimer_ = 0;
+        mixer.dropoutBaselineValid_ = false;
         mixer.lastUnderruns_ = 0;
         mixer.lastDropped_ = 0;
     }
     static void refreshDropoutStatus(MixerWindow &mixer, StreamState outputState,
-                                     uint64_t underruns, uint64_t dropped) {
+                                     uint64_t underruns, uint64_t dropped, float dt = 1.f / 60.f) {
         mixer.statusDetail_.clear();
         mixer.severity_ = 0;
-        mixer.refreshDropoutStatus(outputState, underruns, dropped, 1.f / 60.f);
+        mixer.refreshDropoutStatus(outputState, underruns, dropped, dt);
+    }
+    static bool dropoutTrackingReset(const MixerWindow &mixer) {
+        return !mixer.dropoutBaselineValid_ && mixer.dropoutTimer_ == 0.f;
     }
     static bool updateStartupSettling(MixerWindow &mixer, bool running,
                                       bool allStreamsReady, float dt) {
@@ -61,6 +71,19 @@ struct MixerWindowTestAccess {
     }
     static int settingsPage(const MixerWindow &mixer) {
         return mixer.settingsPage_;
+    }
+    static Config &settingsDraft(MixerWindow &mixer) { return mixer.settingsDraft_; }
+    static const Keybind &capturedKeybind(const MixerWindow &mixer) {
+        return mixer.capturedKeybind_;
+    }
+    static int keybindTarget(const MixerWindow &mixer) { return mixer.keybindTarget_; }
+    static void captureKeybind(MixerWindow &mixer, uint32_t key, uint32_t modifiers,
+                               bool repeated = false) {
+        mixer.captureKeybind(key, modifiers, repeated);
+    }
+    static bool executeHotkeyAction(MixerWindow &mixer, Hotkeys::ActionKind kind,
+                                    size_t index = 0) {
+        return mixer.executeHotkeyAction({kind, index});
     }
     static void setPlaybackDevices(MixerWindow &mixer,
                                    const std::vector<DeviceInfo> &devices) {
@@ -140,6 +163,13 @@ int main() {
                 ++failed;
             }
         };
+        expect(config.monitoringKeybind == Keybind{} &&
+                   config.output.muteKeybind == Keybind{} &&
+                   std::all_of(config.sources.begin(), config.sources.end(),
+                               [](const ChannelConfig &source) {
+                                   return source.muteKeybind == Keybind{};
+                               }),
+               "Initial monitoring or device keybind was not blank");
         auto popup = []() -> ImGuiWindow * {
             const auto &stack = ImGui::GetCurrentContext()->OpenPopupStack;
             return stack.empty() ? nullptr : stack.back().Window;
@@ -300,6 +330,73 @@ int main() {
         expect(ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") !=
                    std::string::npos,
                "Running output did not report a newly dropped capture frame");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Stopped, 0, 2);
+        expect(ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") ==
+                   std::string::npos,
+               "Stopped output retained a recent dropout warning");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 0, 3);
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 0, 3, 2.f);
+        expect(ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") !=
+                   std::string::npos,
+               "Recent dropout warning expired before its display interval");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 0, 3, 2.f);
+        expect(ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") ==
+                   std::string::npos,
+               "Unchanged dropout totals kept renewing an expired warning");
+
+        // Cumulative counters can already be nonzero when the dashboard is
+        // restored from the tray. Its first snapshot establishes a baseline;
+        // only an increase observed afterward represents a recent dropout.
+        ui::MixerWindowTestAccess::resetDropoutState(mixer);
+        auto hasDropoutWarning = [&] {
+            return ui::MixerWindowTestAccess::statusDetail(mixer).find("Audio dropouts") !=
+                   std::string::npos;
+        };
+        mixer.setVisible(true);
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 14, 27);
+        expect(!hasDropoutWarning(), "Initial historic counters were reported as recent dropouts");
+        mixer.setVisible(true); // Repeating the current visibility must keep the baseline.
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 14, 28);
+        expect(hasDropoutWarning(), "A new dropout after the initial baseline was ignored");
+        mixer.setVisible(false);
+        expect(ui::MixerWindowTestAccess::dropoutTrackingReset(mixer),
+               "Hiding the dashboard retained its dropout baseline or warning timer");
+        mixer.setVisible(true);
+        expect(ui::MixerWindowTestAccess::dropoutTrackingReset(mixer),
+               "Restoring the dashboard reused its previous dropout baseline or timer");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 31, 62);
+        expect(!hasDropoutWarning(), "Tray restore replayed dropouts accumulated while hidden");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 32, 62);
+        expect(hasDropoutWarning(), "A fresh underrun after tray restore was ignored");
+
+        // Stop/Start Monitoring preserves the metering session and its historic
+        // totals, but must invalidate the old warning's observation baseline.
+        AudioEngineTestAccess::prepareMeterSession(engine, config);
+        AudioEngineTestAccess::setMonitoringState(engine, true);
+        expect(ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::Monitoring) &&
+                   engine.running() && !engine.monitoring() &&
+                   ui::MixerWindowTestAccess::dropoutTrackingReset(mixer),
+               "Stop Monitoring retained an active dropout warning or stopped source metering");
+        expect(ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::Monitoring) &&
+                   engine.running() && engine.monitoring() &&
+                   ui::MixerWindowTestAccess::dropoutTrackingReset(mixer),
+               "Start Monitoring reused an old dropout observation baseline");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 32, 62);
+        expect(!hasDropoutWarning(), "Stop/Start Monitoring replayed historic dropout totals");
+        ui::MixerWindowTestAccess::refreshDropoutStatus(
+            mixer, StreamState::Running, 32, 63);
+        expect(hasDropoutWarning(), "A new dropout after Stop/Start Monitoring was ignored");
+        AudioEngineTestAccess::setMonitoringState(engine, false);
+        mixer.setVisible(false);
         ui::MixerWindowTestAccess::resetDropoutState(mixer);
 
         expect(!ui::MixerWindowTestAccess::updateStartupSettling(mixer, false, false, .1f),
@@ -755,7 +852,8 @@ int main() {
             return a.label == b.label && a.kind == b.kind && a.enabled == b.enabled &&
                    a.processPath == b.processPath && a.deviceId == b.deviceId &&
                    a.deviceNameMatch == b.deviceNameMatch && a.icon == b.icon &&
-                   a.gain == b.gain && a.volume == b.volume && a.muted == b.muted;
+                   a.gain == b.gain && a.volume == b.volume && a.muted == b.muted &&
+                   a.muteKeybind == b.muteKeybind;
         };
 
         click(1480, 618); // Add Output.
@@ -1292,6 +1390,10 @@ int main() {
                       settings->DC.CursorStartPos.y + 716);
             expect(!popup(), "Restored settings could not be saved or canceled");
         };
+        config.monitoringKeybind = {MOD_CONTROL | MOD_ALT, 'R'};
+        config.sources.front().muteKeybind = {MOD_CONTROL | MOD_ALT, 'S'};
+        config.output.muteKeybind = {MOD_CONTROL | MOD_ALT, 'O'};
+        const auto monitoringKeybindBeforeRestore = config.monitoringKeybind;
         const auto sourceRoutesBeforeRestore = config.sources;
         const auto outputBeforeRestore = config.output;
         config.bufferMillis = 150;
@@ -1302,10 +1404,12 @@ int main() {
                    config.sources.size() == sourceRoutesBeforeRestore.size() &&
                    std::equal(config.sources.begin(), config.sources.end(),
                               sourceRoutesBeforeRestore.begin(), sameChannel) &&
-                   config.bufferMillis == 150 && engine.monitoring(),
+                   config.bufferMillis == 150 && engine.monitoring() &&
+                   config.monitoringKeybind == monitoringKeybindBeforeRestore,
                "Cancel committed a staged Restore Defaults");
         restorePreferences();
         expect(config.sources.empty() && config.outputCount() == 0 && !engine.running() &&
+                   config.monitoringKeybind == Keybind{} &&
                    config.bufferMillis == Config::defaults().bufferMillis,
                "Confirmed and saved Restore Defaults did not leave an empty setup");
         // Subsequent ordinary Save must not retain the reset request.
@@ -1368,6 +1472,205 @@ int main() {
                   dialog->DC.CursorStartPos.y + 716);
         expect(!popup() && config.output.deviceId == L"freshly-resolved-output-id",
                "Saving preferences restored an obsolete output ID from the settings draft");
+
+        // Capture shortcuts through the real modal and keep them staged until
+        // Settings is saved. No global keys or audio devices are opened.
+        config.monitoringKeybind = {};
+        for (auto &source : config.sources) source.muteKeybind = {};
+        for (size_t i = 0; i < config.outputCount(); ++i) config.outputAt(i).muteKeybind = {};
+        auto openKeybindSettings = [&] {
+            click(670, 900);
+            if (auto *settings = popup())
+                click(settings->DC.CursorStartPos.x + 80, settings->DC.CursorStartPos.y + 291);
+            expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
+                       ui::MixerWindowTestAccess::settingsPage(mixer) == 3,
+                   "Could not open Keybinds settings");
+        };
+        auto keybindList = [&]() -> ImGuiWindow * {
+            for (auto *window : ImGui::GetCurrentContext()->Windows)
+                if (window->Active && std::strstr(window->Name, "/Keybind list_")) return window;
+            return nullptr;
+        };
+        auto clickKeybindRow = [&](int target, bool clear = false) {
+            auto *list = keybindList();
+            expect(list != nullptr, "Keybind list is missing");
+            if (!list) return;
+            const int ordinal = target <= kMaxSources ? target :
+                static_cast<int>(ui::MixerWindowTestAccess::settingsDraft(mixer).sources.size()) +
+                    target - kMaxSources;
+            const float rowStep = 96.f + ImGui::GetStyle().ItemSpacing.y;
+            ImGui::SetScrollY(list, std::max(0.f, ordinal * rowStep - 100.f));
+            frame(1600, 986);
+            click(list->DC.CursorStartPos.x + (clear ? list->WorkRect.GetWidth() - 38.f : 30.f),
+                  list->DC.CursorStartPos.y + ordinal * rowStep + 56.f);
+            if (!clear)
+                expect(popup() && std::strcmp(popup()->Name, "Set keybind") == 0 &&
+                           ui::MixerWindowTestAccess::keybindTarget(mixer) == target,
+                       "A shortcut field opened the wrong capture target");
+        };
+        auto closeCapture = [&](bool accept) {
+            auto *capture = popup();
+            expect(capture && std::strcmp(capture->Name, "Set keybind") == 0,
+                   "Expected the shortcut capture modal");
+            if (!capture || std::strcmp(capture->Name, "Set keybind") != 0) return;
+            // Cancel is the last item. Use its rendered row bounds because
+            // the dialog font is larger than the default test-context font.
+            click(accept ? capture->DC.CursorStartPos.x + 25.f :
+                           capture->DC.CursorPosPrevLine.x - 20.f,
+                  capture->DC.CursorPosPrevLine.y + capture->DC.PrevLineSize.y * .5f);
+            expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
+                       ui::MixerWindowTestAccess::keybindTarget(mixer) == -1,
+                   "Capture did not return to Settings");
+        };
+        auto closeKeybindSettings = [&](bool save) {
+            if (auto *settings = popup())
+                click(settings->DC.CursorStartPos.x + (save ? 633.f : 453.f),
+                      settings->DC.CursorStartPos.y + 716);
+        };
+        const Keybind monitoringShortcut{MOD_CONTROL | MOD_ALT, 'M'};
+        openKeybindSettings();
+        clickKeybindRow(0);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, VK_LCONTROL, MOD_CONTROL);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT, true);
+        expect(ui::MixerWindowTestAccess::capturedKeybind(mixer) == Keybind{},
+               "Modifier-only or repeated input assigned a shortcut");
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT);
+        expect(ui::MixerWindowTestAccess::capturedKeybind(mixer) == monitoringShortcut,
+               "Shortcut capture lost the pressed key or modifiers");
+        expect(ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == Keybind{} &&
+                   config.monitoringKeybind == Keybind{},
+               "Typing a shortcut committed it before accepting the capture");
+        ui::MixerWindowTestAccess::captureKeybind(mixer, VK_BACK, 0);
+        expect(ui::MixerWindowTestAccess::capturedKeybind(mixer) == Keybind{},
+               "Backspace did not clear the captured shortcut");
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, VK_DELETE, 0);
+        expect(ui::MixerWindowTestAccess::capturedKeybind(mixer) == Keybind{},
+               "Delete did not clear the captured shortcut");
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, VK_ESCAPE, 0);
+        frame(1600, 986);
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
+                   ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == Keybind{},
+               "Escape saved a capture or closed the parent settings");
+        clickKeybindRow(0);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT);
+        closeCapture(false);
+        expect(ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == Keybind{},
+               "Cancel committed a shortcut capture");
+        clickKeybindRow(0);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'K', MOD_CONTROL);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, VK_RETURN, 0);
+        frame(1600, 986);
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
+                   ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == Keybind{MOD_CONTROL, 'K'} &&
+                   config.monitoringKeybind == Keybind{},
+               "Enter did not accept a captured shortcut into the settings draft");
+        clickKeybindRow(0);
+        ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT);
+        closeCapture(true);
+        expect(ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == monitoringShortcut &&
+                   config.monitoringKeybind == Keybind{},
+               "Accepting a capture did not remain staged in Settings");
+        closeKeybindSettings(false);
+        expect(!popup() && config.monitoringKeybind == Keybind{},
+               "Cancel Settings saved a staged shortcut");
+
+        // Independent source/output bindings must not overwrite runtime mute
+        // changes or refreshed endpoint IDs made while Settings remains open.
+        ChannelConfig secondShortcutOutput;
+        secondShortcutOutput.label = "Second shortcut output";
+        secondShortcutOutput.deviceId = L"shortcut-output-two";
+        expect(config.addOutput(secondShortcutOutput), "Could not add a second shortcut output");
+        const Keybind firstSourceShortcut{MOD_CONTROL | MOD_ALT, '1'};
+        const Keybind secondSourceShortcut{MOD_CONTROL | MOD_ALT, '2'};
+        const Keybind firstOutputShortcut{MOD_CONTROL | MOD_ALT, '3'};
+        const Keybind secondOutputShortcut{MOD_CONTROL | MOD_ALT, '4'};
+        openKeybindSettings();
+        auto assignShortcut = [&](int target, const Keybind &shortcut) {
+            clickKeybindRow(target);
+            ui::MixerWindowTestAccess::captureKeybind(mixer, shortcut.key, shortcut.modifiers);
+            closeCapture(true);
+        };
+        assignShortcut(0, monitoringShortcut);
+        assignShortcut(1, firstSourceShortcut);
+        assignShortcut(2, secondSourceShortcut);
+        assignShortcut(1 + kMaxSources, firstOutputShortcut);
+        assignShortcut(2 + kMaxSources, secondOutputShortcut);
+        config.sources[0].muted = true;
+        config.sources[1].muted = false;
+        config.outputAt(0).muted = true;
+        config.outputAt(1).muted = false;
+        config.outputAt(1).deviceId = L"newly-resolved-shortcut-output";
+        closeKeybindSettings(true);
+        expect(!popup() && config.monitoringKeybind == monitoringShortcut &&
+                   config.sources[0].muteKeybind == firstSourceShortcut &&
+                   config.sources[1].muteKeybind == secondSourceShortcut &&
+                   config.outputAt(0).muteKeybind == firstOutputShortcut &&
+                   config.outputAt(1).muteKeybind == secondOutputShortcut,
+               "Save did not retain independent monitoring, source and output shortcuts");
+        expect(config.sources[0].muted && !config.sources[1].muted &&
+                   config.outputAt(0).muted && !config.outputAt(1).muted &&
+                   config.outputAt(1).deviceId == L"newly-resolved-shortcut-output",
+               "Saving shortcuts reverted live device state from the settings draft");
+        openKeybindSettings();
+        clickKeybindRow(0, true);
+        expect(ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == Keybind{} &&
+                   config.monitoringKeybind == monitoringShortcut,
+               "Clear did not remain staged until Settings is saved");
+        closeKeybindSettings(false);
+        expect(config.monitoringKeybind == monitoringShortcut,
+               "Cancel Settings saved a cleared shortcut");
+        openKeybindSettings();
+        clickKeybindRow(0, true);
+        closeKeybindSettings(true);
+        expect(!popup() && config.monitoringKeybind == Keybind{} &&
+                   config.sources[0].muteKeybind == firstSourceShortcut,
+               "Clearing monitoring also cleared an independent device shortcut");
+
+        // Duplicate shortcuts are rejected without committing any preferences.
+        openKeybindSettings();
+        assignShortcut(0, firstSourceShortcut);
+        ui::MixerWindowTestAccess::settingsDraft(mixer).bufferMillis = 123;
+        const auto bufferBeforeDuplicate = config.bufferMillis;
+        closeKeybindSettings(true);
+        expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
+                   config.monitoringKeybind == Keybind{} && config.bufferMillis == bufferBeforeDuplicate,
+               "A duplicate shortcut partially committed the settings draft");
+        closeKeybindSettings(false);
+
+        // Exercise the same action dispatcher used by WM_HOTKEY, with a
+        // deterministic running engine instead of reserving global OS keys.
+        AudioEngineTestAccess::prepareMeterSession(engine, config);
+        mixer.setVisible(true);
+        for (const bool monitoring : {true, false}) {
+            expect(ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::Monitoring),
+                   "Monitoring shortcut action was rejected");
+            expect(engine.running() && engine.monitoring() == monitoring,
+                   "Monitoring shortcut restarted or stopped the shared capture session");
+        }
+        for (const bool muted : {true, false}) {
+            expect(ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::SourceMute, 1),
+                   "Source mute shortcut action was rejected");
+            expect(config.sources[1].muted == muted &&
+                       AudioEngineTestAccess::sourceMuted(engine, 1) == muted && config.sources[0].muted &&
+                       config.outputAt(0).muted && !config.outputAt(1).muted,
+                   "Source shortcut changed a different device or failed to toggle");
+        }
+        for (const bool muted : {true, false}) {
+            expect(ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::OutputMute, 1),
+                   "Output mute shortcut action was rejected");
+            expect(config.outputAt(1).muted == muted &&
+                       AudioEngineTestAccess::outputMuted(engine, 1) == muted && config.outputAt(0).muted &&
+                       config.sources[0].muted && !config.sources[1].muted,
+                   "Output shortcut changed a different device or failed to toggle");
+        }
+        expect(!ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::SourceMute,
+                                                               config.sources.size()) &&
+                   !ui::MixerWindowTestAccess::executeHotkeyAction(mixer, Hotkeys::ActionKind::OutputMute,
+                                                                  config.outputCount()),
+               "A stale shortcut action accessed a removed device");
+        mixer.setVisible(false);
 
         ImGui::DestroyContext();
     }

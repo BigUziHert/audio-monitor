@@ -158,7 +158,12 @@ std::string formatDiagnosticReport(const DiagnosticSample& current,
         << "falling silent can still report flowing briefly, so these are not necessarily audible glitches.\n"
         << "Output overflow/trim: canonical 48 kHz frames; output shortfall: output-native frames.\n"
         << "Underruns and starvation counts are events, not frames. Pump misses are global, not per output.\n"
-        << "Capture overflow counters reset on capture restart (epoch changes); other counters reset at engine start.\n"
+        << "A capture epoch is a timeline break, not a device restart count.\n"
+        << "Capture epochs advance on start requests, WASAPI DATA_DISCONTINUITY packets, and ring overflow drops.\n"
+        << "Capture start requests include the initial start and failed opens; they are not successful reopen counts.\n"
+        << "Initial discontinuities flag the first nonempty packet after each start; later flagged packets are counted separately.\n"
+        << "Capture overflow frame counters reset on capture start, not on packet discontinuities; other counters reset at engine start.\n"
+        << "Capture timeline event logs are coalesced by the supervisor; their timestamps are observation times.\n"
         << "History survives engine stop/restart in this process only; no audio samples are recorded.\n"
         << "Retained history: " << history.samples.size() << " / " << DiagnosticHistory::kMaxSamples
         << " samples (nominal 5 s cadence, about 2 h; lifecycle boundaries also sampled); discarded "
@@ -171,6 +176,14 @@ std::string formatDiagnosticReport(const DiagnosticSample& current,
             out << "Session " << session.id << " last sampled runtime details at engine uptime "
                 << session.latestDevicesElapsedMillis << " ms (retained before stop cleared stream identity):\n"
                 << session.latestDevices << "\n";
+    }
+    out << "\nCAPTURE TIMELINE CAUSES (counts since engine start; retained after stop)\n";
+    for (size_t i = 0; i < current.sourceCount; ++i) {
+        const auto& s = current.sources[i];
+        out << "Source " << i << ": start requests=" << s.captureStartRequests
+            << "; initial packet discontinuities=" << s.captureInitialDiscontinuities
+            << "; later packet discontinuities=" << s.captureDiscontinuities
+            << "; ring overflow breaks=" << s.captureOverflowEvents << "\n";
     }
     out << "\nQUEUE TRENDS (last active segment, most recent 5 min maximum; retained after pause/stop)\n"
         << "Possible growth requires >=3 min and persistent increases in minute medians. Packet phase\n"
@@ -208,12 +221,14 @@ std::string formatDiagnosticReport(const DiagnosticSample& current,
                     << ',' << (s.queueRate ? double(s.queueFrames)*1000.0/s.queueRate : 0.0)
                     << ',' << s.correctionPpm << ',' << s.overflowFrames << ',' << s.trimmedFrames
                     << ',' << s.starvedFrames << ',' << s.starvationEvents << ',' << s.underrunEvents
-                    << ',' << s.latencyCorrections << '\n';
+                    << ',' << s.latencyCorrections << ',' << s.captureStartRequests
+                    << ',' << s.captureInitialDiscontinuities << ',' << s.captureDiscontinuities
+                    << ',' << s.captureOverflowEvents << '\n';
             }
         }
     };
     out << "\nNUMERIC HISTORY CSV\n"
-        << "kind,session,elapsed_ms,utc_unix_ms,forwarding_generation,engine_running,forwarding,pump_misses,type,index,state,valid,flowing,priming,muted,exclusive,epoch,native_hz,queue_hz,queue_frames,target_frames,capacity_frames,max_callback_frames,queue_ms,correction_ppm,overflow_frames,trimmed_frames,shortfall_frames,shortfall_events,render_underrun_events,latency_correction_events\n";
+        << "kind,session,elapsed_ms,utc_unix_ms,forwarding_generation,engine_running,forwarding,pump_misses,type,index,state,valid,flowing,priming,muted,exclusive,epoch,native_hz,queue_hz,queue_frames,target_frames,capacity_frames,max_callback_frames,queue_ms,correction_ppm,overflow_frames,trimmed_frames,shortfall_frames,shortfall_events,render_underrun_events,latency_correction_events,capture_start_requests,capture_initial_discontinuities,capture_discontinuities,capture_overflow_events\n";
     for (const auto& sample : history.samples) rows(sample, "history");
     rows(current, "current");
     out << "\nRECENT RUNTIME LOG (bounded in-memory tail; local wall-clock timestamps)\n" << recentLog;

@@ -4,6 +4,7 @@
 #include "audio/Spectrum.h"
 #include "audio/Overlap.h"
 #include "util/DiagnosticExport.h"
+#include "util/Hotkeys.h"
 #include <array>
 #include <future>
 
@@ -16,6 +17,8 @@ class MixerWindow {
     void shutdown();
     bool draw(float dt, int width, int height);
     bool hitTitleBar(int x, int y, int width, int height) const;
+    bool handleHotkey(int id, intptr_t chord);
+    bool handleKeybindMessage(uint32_t message, uintptr_t key, intptr_t data);
     bool exitRequested() const {
         return exitRequested_;
     }
@@ -28,6 +31,7 @@ class MixerWindow {
     void refreshDevices();
     void syncMeteringVisibility();
     void refreshStatus(float dt);
+    void resetDropoutTracking();
     bool updateDropoutTimer(StreamState outputState, uint64_t underruns, uint64_t dropped,
                             float dt);
     bool updateStartupSettling(bool running, bool allStreamsReady, float dt);
@@ -35,6 +39,10 @@ class MixerWindow {
     void refreshDropoutStatus(StreamState outputState, uint64_t underruns, uint64_t dropped,
                               float dt);
     void restart();
+    bool toggleMonitoring();
+    bool executeHotkeyAction(const Hotkeys::Action &action);
+    void captureKeybind(uint32_t key, uint32_t modifiers, bool repeated = false);
+    Keybind *draftKeybind(int target);
     void startDiagnosticExport(const std::wstring &directory);
     void pollDiagnosticExport();
     bool drawSource(size_t index, float width, SpatialNavigation &navigation);
@@ -58,6 +66,7 @@ class MixerWindow {
     float spectrumRefreshTimer_ = 0;
     float startupSettleTimer_ = 0;
     uint64_t lastUnderruns_ = 0, lastDropped_ = 0;
+    bool dropoutBaselineValid_ = false;
     bool monitoringWasRunning_ = false;
     bool lastStatusMonitoring_ = false;
     bool statusRefreshForced_ = true;
@@ -69,6 +78,14 @@ class MixerWindow {
     int settingsPage_ = 1;
     bool resetDevicesOnSave_ = false;
     Config settingsDraft_;
+    Hotkeys hotkeys_;
+    int keybindTarget_ = -1;
+    Keybind capturedKeybind_;
+    bool captureCancelRequested_ = false;
+    bool captureAcceptRequested_ = false;
+    bool capturedKeybindChanged_ = false;
+    std::string keybindError_;
+    std::string captureError_;
     int editSource_ = -1;
     size_t selectedOutput_ = 0;
     int editOutput_ = 0; // -1 while adding a destination

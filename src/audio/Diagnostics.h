@@ -35,6 +35,10 @@ struct DiagnosticStream {
     uint64_t starvationEvents = 0;
     uint64_t underrunEvents = 0;
     uint64_t latencyCorrections = 0;
+    uint64_t captureStartRequests = 0;
+    uint64_t captureInitialDiscontinuities = 0;
+    uint64_t captureDiscontinuities = 0;
+    uint64_t captureOverflowEvents = 0;
 };
 
 struct DiagnosticSample {

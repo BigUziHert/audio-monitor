@@ -145,6 +145,16 @@ void saveConfigIfDirty(App& app, bool force) {
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     App* app = g_app;
 
+    if (app && msg == WM_HOTKEY) {
+        if (app->mixer.handleHotkey(static_cast<int>(wp), lp)) {
+            app->configDirty = true;
+            // The tray loop has no frame timer to flush a mute change later.
+            saveConfigIfDirty(*app, true);
+        }
+        return 0;
+    }
+    if (app && app->visible && app->mixer.handleKeybindMessage(msg, wp, lp)) return 0;
+
     if (app && app->visible && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp)) return true;
 
     if (msg == ui::TrayIcon::taskbarCreatedMessage() && app) {

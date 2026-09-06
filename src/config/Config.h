@@ -24,6 +24,15 @@ inline constexpr int kMaxOutputs = 4;
 enum class SourceKind { Playback, Microphone, Application };
 enum class ColorTheme { Dark, Light, System };
 
+// Windows virtual key plus MOD_ALT/CONTROL/SHIFT/WIN bits. A zero key is
+// unassigned; keybinds never acquire a default chord during migration.
+struct Keybind {
+    uint32_t modifiers = 0;
+    uint32_t key = 0;
+    bool empty() const noexcept { return key == 0; }
+    bool operator==(const Keybind&) const = default;
+};
+
 struct ChannelConfig {
     std::string  label;
     SourceKind   kind = SourceKind::Playback;
@@ -35,6 +44,7 @@ struct ChannelConfig {
     float        gain   = 1.0f;    // mix gain, 0..4 (100% is 1.0)
     float        volume = 1.0f;    // dashboard volume, 0..1
     bool         muted = false;
+    Keybind      muteKeybind;
 };
 
 inline float effectiveGain(const ChannelConfig& channel) noexcept {
@@ -80,6 +90,7 @@ struct Config {
 
     bool     mono             = false;
     bool     closeToTray      = false;
+    Keybind  monitoringKeybind;
 
     bool     exclusiveOutput  = true;
     bool     startWithWindows = false;

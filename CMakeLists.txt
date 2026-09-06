@@ -20,6 +20,10 @@ if(BUILD_TESTING)
   add_executable(config-test tests/config_test.cpp)
   target_link_libraries(config-test PRIVATE audiomon_core)
   add_test(NAME config COMMAND config-test)
+  add_executable(hotkeys-test tests/hotkeys_test.cpp)
+  target_link_libraries(hotkeys-test PRIVATE audiomon_core)
+  add_test(NAME hotkeys COMMAND hotkeys-test)
+  set_tests_properties(hotkeys PROPERTIES TIMEOUT 15)
   add_executable(audio-engine-test tests/audio_engine_test.cpp)
   target_link_libraries(audio-engine-test PRIVATE audiomon_core)
   add_test(NAME audio-engine COMMAND audio-engine-test)
@@ -107,6 +111,7 @@ add_library(audiomon_core STATIC
   src/util/DiagnosticExport.cpp
   src/util/Text.cpp
   src/util/Startup.cpp
+  src/util/Hotkeys.cpp
 )
 target_include_directories(audiomon_core PUBLIC src)
 target_compile_definitions(audiomon_core PRIVATE AUDIOMON_VERSION="${PROJECT_VERSION}")

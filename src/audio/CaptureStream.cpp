@@ -47,6 +47,12 @@ void CaptureStream::configure(const char* label, CaptureMode mode, uint32_t ring
     // in the ordinary 48 kHz case.
     ring_.init(kMaxSupportedRateKHz * ringMillis_);
     QueryPerformanceFrequency(&qpcFreq_);
+    startRequests_.store(0, std::memory_order_relaxed);
+    initialDiscontinuities_.store(0, std::memory_order_relaxed);
+    discontinuities_.store(0, std::memory_order_relaxed);
+    overflowEvents_.store(0, std::memory_order_relaxed);
+    havePacket_ = false;
+    loggedTimeline_ = {};
 }
 
 std::wstring CaptureStream::resolvedName() const {
@@ -66,13 +72,43 @@ StreamDiagnosticInfo CaptureStream::diagnosticInfo() const {
     return {resolvedName_, resolvedId_, lastError_, diagnosticFormat_};
 }
 
+CaptureTimelineStats CaptureStream::timelineStats() const noexcept {
+    return {startRequests_.load(std::memory_order_relaxed),
+            initialDiscontinuities_.load(std::memory_order_relaxed),
+            discontinuities_.load(std::memory_order_relaxed),
+            overflowEvents_.load(std::memory_order_relaxed)};
+}
+
+void CaptureStream::flushDiagnostics() {
+    std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    flushDiagnosticsLocked();
+}
+
+void CaptureStream::flushDiagnosticsLocked() {
+    const auto current = timelineStats();
+    const auto initial = current.initialDiscontinuities - loggedTimeline_.initialDiscontinuities;
+    const auto discontinuities = current.discontinuities - loggedTimeline_.discontinuities;
+    const auto overflows = current.overflowEvents - loggedTimeline_.overflowEvents;
+    if (initial || discontinuities || overflows) {
+        LOG_INFO("%s: capture timeline events observed: WASAPI DATA_DISCONTINUITY first packet +%llu, "
+                 "later packets +%llu; ring overflow breaks +%llu; current epoch=%u; start requests=%llu "
+                 "(coalesced since previous observation)", label_.c_str(),
+                 static_cast<unsigned long long>(initial), static_cast<unsigned long long>(discontinuities),
+                 static_cast<unsigned long long>(overflows), epoch(),
+                 static_cast<unsigned long long>(current.startRequests));
+    }
+    loggedTimeline_ = current;
+}
+
 void CaptureStream::setError(const char* what, HRESULT hr) {
     std::lock_guard<std::mutex> lock(infoMutex_);
     lastError_ = std::string(what) + ": " + log::hrString(hr);
 }
 
-void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
+void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref, const char* reason) {
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
+    LOG_INFO("%s: capture start requested: reason=%s; previous state=%s; previous error=%s",
+             label_.c_str(), reason, streamStateName(state()), lastError().c_str());
     stopLocked();
     devices_ = &devices;
 
@@ -94,7 +130,11 @@ void CaptureStream::start(DeviceManager& devices, const DeviceRef& ref) {
     // A restart is a timeline break: whatever is still sitting in the ring
     // predates this device and may even be at a different sample rate. Bumping
     // the epoch makes the mixer drop it and re-prime.
+    startRequests_.fetch_add(1, std::memory_order_relaxed);
     epoch_.fetch_add(1, std::memory_order_release);
+    havePacket_ = false;
+    LOG_INFO("%s: capture epoch=%u: start request #%llu (%s)", label_.c_str(), epoch(),
+             static_cast<unsigned long long>(startRequests_.load(std::memory_order_relaxed)), reason);
     dropped_.store(0, std::memory_order_relaxed);
     retryable_.store(true, std::memory_order_release);
     quit_.store(false, std::memory_order_relaxed);
@@ -109,15 +149,11 @@ void CaptureStream::stop() {
 }
 
 void CaptureStream::stopLocked() {
-    {
-        std::lock_guard<std::mutex> info(infoMutex_);
-        resolvedId_.clear();
-        resolvedName_.clear();
-        lastError_.clear();
-    }
+    // Retain errors until the worker has logged its exit reason and joined.
     quit_.store(true, std::memory_order_relaxed);
     if (stopEvent_) SetEvent(stopEvent_);
     if (thread_.joinable()) thread_.join();
+    flushDiagnosticsLocked();
     if (stopEvent_) { CloseHandle(stopEvent_); stopEvent_ = nullptr; }
     state_.store(StreamState::Stopped, std::memory_order_release);
     flowing_.store(false, std::memory_order_release);
@@ -340,9 +376,13 @@ void CaptureStream::drainPackets() {
 
         if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
             // The frames in this packet do not follow the previous ones. The
-            // rate controller's history is meaningless now.
+            // rate controller's history is meaningless now. Record the cause
+            // using atomics only; the supervisor writes the diagnostic log.
+            if (havePacket_) discontinuities_.fetch_add(1, std::memory_order_relaxed);
+            else initialDiscontinuities_.fetch_add(1, std::memory_order_relaxed);
             epoch_.fetch_add(1, std::memory_order_release);
         }
+        havePacket_ = true;
 
         const uint32_t cap = static_cast<uint32_t>(scratch_.size() / 2);
         const uint32_t n   = std::min<uint32_t>(frames, cap);
@@ -372,6 +412,7 @@ void CaptureStream::drainPackets() {
             // the whole packet. Holding it to apply back-pressure would stall
             // the engine and glitch the user's own headset output.
             dropped_.fetch_add(n - w, std::memory_order_relaxed);
+            overflowEvents_.fetch_add(1, std::memory_order_relaxed);
             epoch_.fetch_add(1, std::memory_order_release);
         }
 
@@ -431,6 +472,7 @@ void CaptureStream::threadMain(DeviceRef ref) {
             diagnosticFormat_ = format_.describe() + (eventDriven_ ? ", event-driven" : ", polling fallback");
         }
         state_.store(StreamState::Running, std::memory_order_release);
+        LOG_INFO("%s: capture running; epoch=%u", label_.c_str(), epoch());
         QueryPerformanceCounter(&lastPacketQpc_);
 
         HANDLE waits[2] = { stopEvent_, timer_ };
@@ -466,6 +508,11 @@ void CaptureStream::threadMain(DeviceRef ref) {
                 : 0.0;
             flowing_.store(since < kIdleAfterSeconds, std::memory_order_release);
         }
+        // The packet loop has ended; file logging cannot delay capture now.
+        if (state() == StreamState::Failed)
+            LOG_WARN("%s: capture loop exited: runtime failure; %s", label_.c_str(), lastError().c_str());
+        else
+            LOG_INFO("%s: capture loop exited: stop requested", label_.c_str());
     }
 
     closeDevice();

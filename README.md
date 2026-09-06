@@ -56,6 +56,11 @@ arrives over HDMI as a single feed.
 - **Tray support.** Minimize keeps audio running and releases the renderer.
   Close exits by default; Settings can make Close hide to the tray instead.
   Optional Windows startup and hidden manual launch remain available.
+- **Global keybinds.** In **Settings > Keybinds**, assign a shortcut to Start/Stop
+  Monitoring or to mute/unmute an individual source or output. Every keybind
+  starts blank. Shortcuts work while the app is in the tray and mute only audio
+  forwarded by this app; they never change Windows device mute.
+  Use **Clear** to remove a shortcut, then **Save** to apply your changes.
 
 Application capture requires **Windows build 20348 or later** (Windows 11
 recommended) and a Windows SDK that includes `audioclientactivationparams.h`.
@@ -69,8 +74,7 @@ See Microsoft's [process loopback documentation](https://learn.microsoft.com/en-
 Adding, removing, or replacing a source or output briefly restarts a running mix.
 Volume, mute, stereo/mono, and buffer changes apply live. Sample Rate displays
 the fixed 48,000 Hz internal mix rate; its Settings link opens the classic Windows
-Sound control panel for device-format changes. A Keybinds settings category is
-reserved for future shortcut controls.
+Sound control panel for device-format changes.
 Dark, Light, and System theme choices apply immediately and save automatically,
 even if the settings dialog is canceled or closed. Other preferences still use
 Save/Cancel. Restore Defaults resets preferences and clears both Devices and
@@ -230,13 +234,14 @@ whenever you change something in the UI.
 
 ```json
 {
-  "version": 6,
+  "version": 7,
   "sources": [
     { "label": "Headphones", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Game", "gain": 1, "volume": 1, "muted": false },
     { "label": "Chat Audio", "kind": "playback", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "Arctis Pro Wireless Chat", "gain": 1, "volume": 1, "muted": false },
     { "label": "Microphone", "kind": "microphone", "enabled": true, "processPath": "", "deviceId": "", "deviceName": "USB Advanced Audio Device", "gain": 1, "volume": 1, "muted": false }
   ],
   "outputs": [],
+  "monitoringKeybind": { "modifiers": 0, "key": 0 },
   "mono": false,
   "closeToTray": false,
   "exclusiveOutput": true,
@@ -255,6 +260,9 @@ from zero to four. A nonempty list also writes `output` as a legacy mirror of
 its first item. An explicit `outputs: []` always means no destinations, even
 if an old `output` field remains in the file. Legacy single-output files are
 migrated without changing the user's selected device.
+`monitoringKeybind` and each channel's `muteKeybind` store a Windows modifier
+mask and virtual key code. Missing bindings and `{ "modifiers": 0, "key": 0 }`
+are unassigned; existing configurations keep all shortcuts blank until you set them.
 
 On the first save of a version 1 configuration, the original is preserved as
 `config.json.v1.bak` beside `config.json`. To return to an older build, exit the

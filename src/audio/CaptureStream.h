@@ -29,6 +29,15 @@ namespace audiomon {
 
 enum class CaptureMode { Loopback, Microphone, Application };
 
+// Cumulative within an engine session (configure resets them). A packet
+// discontinuity can change the epoch while the same device remains open.
+struct CaptureTimelineStats {
+    uint64_t startRequests = 0;
+    uint64_t initialDiscontinuities = 0;
+    uint64_t discontinuities = 0;
+    uint64_t overflowEvents = 0;
+};
+
 class CaptureStream {
 public:
     CaptureStream() = default;
@@ -44,7 +53,8 @@ public:
 
     // Starts (or restarts) the capture worker against the given endpoint.
     // Non-blocking: resolution and device setup happen on the worker.
-    void start(DeviceManager& devices, const DeviceRef& ref);
+    void start(DeviceManager& devices, const DeviceRef& ref,
+               const char* reason = "explicit start/restart request");
     void stop();
 
     // --- read by the mixer thread ---
@@ -75,10 +85,15 @@ public:
     std::string         lastError() const;
     uint32_t processId() const { return processId_.load(std::memory_order_relaxed); }
     StreamDiagnosticInfo diagnosticInfo() const;
+    CaptureTimelineStats timelineStats() const noexcept;
+    // Non-real-time only. Coalesces packet events since the previous poll;
+    // timestamps indicate observation time, not the exact packet time.
+    void flushDiagnostics();
 
 private:
     friend struct AudioEngineTestAccess;
     void stopLocked();          // caller holds lifecycleMutex_
+    void flushDiagnosticsLocked();
     void threadMain(DeviceRef ref);
     bool openDevice(const DeviceRef& ref);
     bool openProcess(const std::wstring& path);
@@ -118,6 +133,12 @@ private:
     std::atomic<uint32_t>    epoch_{0};
     std::atomic<uint32_t>    sampleRate_{0};
     std::atomic<uint64_t>    dropped_{0};
+    std::atomic<uint64_t>    startRequests_{0};
+    std::atomic<uint64_t>    initialDiscontinuities_{0};
+    std::atomic<uint64_t>    discontinuities_{0};
+    std::atomic<uint64_t>    overflowEvents_{0};
+    bool havePacket_ = false; // worker-owned; reset before a new worker starts
+    CaptureTimelineStats loggedTimeline_{}; // protected by lifecycleMutex_
     std::atomic<bool>        quit_{false};
 
     mutable std::mutex   infoMutex_;

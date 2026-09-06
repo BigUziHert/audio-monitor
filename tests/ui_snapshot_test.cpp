@@ -295,6 +295,7 @@ enum class Scene {
     FocusedPercentage,
     AudioSettings,
     GeneralSettings,
+    KeybindSettings,
     About,
     AddSource,
     ConfigureOutput
@@ -330,6 +331,7 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
         case Scene::FocusedPercentage: break;
         case Scene::AudioSettings: ui::MixerWindowTestAccess::openSettings(mixer, 0); break;
         case Scene::GeneralSettings: ui::MixerWindowTestAccess::openSettings(mixer, 1); break;
+        case Scene::KeybindSettings: ui::MixerWindowTestAccess::openSettings(mixer, 3); break;
         case Scene::About: ui::MixerWindowTestAccess::openSettings(mixer, 4); break;
         case Scene::AddSource: ui::MixerWindowTestAccess::openAddSource(mixer); break;
         case Scene::ConfigureOutput:
@@ -473,12 +475,15 @@ int main() {
         {L"settings-audio-dark-1440x890.bmp", ColorTheme::Dark, Scene::AudioSettings, 1440, 890},
         {L"settings-audio-light-1440x890.bmp", ColorTheme::Light, Scene::AudioSettings, 1440, 890},
         {L"settings-general-dark-1440x890.bmp", ColorTheme::Dark, Scene::GeneralSettings, 1440, 890},
+        {L"settings-keybinds-dark-1440x890.bmp", ColorTheme::Dark, Scene::KeybindSettings, 1440, 890},
+        {L"settings-keybinds-light-1440x890.bmp", ColorTheme::Light, Scene::KeybindSettings, 1440, 890},
         {L"settings-about-dark-1440x890.bmp", ColorTheme::Dark, Scene::About, 1440, 890},
         {L"add-source-dark-1440x890.bmp", ColorTheme::Dark, Scene::AddSource, 1440, 890},
         {L"add-source-light-1440x890.bmp", ColorTheme::Light, Scene::AddSource, 1440, 890},
         {L"configure-output-dark-1440x890.bmp", ColorTheme::Dark, Scene::ConfigureOutput, 1440, 890},
         {L"dashboard-light-960x600.bmp", ColorTheme::Light, Scene::Dashboard, 960, 600},
         {L"settings-about-light-960x600.bmp", ColorTheme::Light, Scene::About, 960, 600},
+        {L"settings-keybinds-light-960x600.bmp", ColorTheme::Light, Scene::KeybindSettings, 960, 600},
     };
 
     int failures = 0;

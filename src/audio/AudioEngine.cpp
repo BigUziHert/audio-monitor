@@ -140,7 +140,7 @@ bool AudioEngine::start(const Config& config, bool monitoring) {
             if (source.enabled) channels_[i]->stream.start(
                 devices_, source.kind == SourceKind::Application
                               ? DeviceRef{L"", source.processPath}
-                              : DeviceRef{source.deviceId, source.deviceNameMatch});
+                              : DeviceRef{source.deviceId, source.deviceNameMatch}, "engine start");
         }
 
         mixPump_ = std::thread(&AudioEngine::mixPumpMain, this);
@@ -171,6 +171,7 @@ void AudioEngine::stopLocked() {
         !mixPumpScheduler_.ready())
         return;
 
+    LOG_INFO("engine: stop requested");
     quit_.store(true, std::memory_order_relaxed);
     if (mixPumpScheduler_.ready())
         mixPumpScheduler_.signalStop();
@@ -203,6 +204,8 @@ void AudioEngine::setMonitoring(bool enabled) {
         if (monitoringState_.compare_exchange_weak(state, next,
                 std::memory_order_acq_rel, std::memory_order_acquire)) break;
     }
+    LOG_INFO("engine: monitoring %s requested; generation=%llu", enabled ? "on" : "off",
+             static_cast<unsigned long long>((state & ~uint64_t{1}) + 2 + (enabled ? 1 : 0)));
     // Peak hand-offs are atomics, so clearing them here cannot block either
     // worker. The pump also clears paused outputs at its next block boundary.
     for (auto& peak : outputPeaks_) { peak.l.take(); peak.r.take(); }
@@ -250,8 +253,11 @@ void AudioEngine::setEnabled(int channel, bool enabled) {
     channels_[channel]->muted.store(source.muted || !enabled);
     if (!running()) return;
     if (enabled) channels_[channel]->stream.start(devices_, source.kind == SourceKind::Application
-        ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
-    else channels_[channel]->stream.stop();
+        ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch}, "source enabled");
+    else {
+        LOG_INFO("engine: source %d disabled; stopping capture", channel);
+        channels_[channel]->stream.stop();
+    }
 }
 
 void AudioEngine::setOutputGain(size_t output, float g) noexcept {
@@ -754,6 +760,8 @@ bool AudioEngine::synchronizeOutputs(uint64_t state) {
         if (quit_.load(std::memory_order_relaxed) ||
             monitoringState_.load(std::memory_order_acquire) != state) return false;
         std::lock_guard<std::mutex> lock(configMutex_);
+        LOG_INFO("supervisor: output %zu synchronizing monitoring generation=%llu (%s)", i,
+                 static_cast<unsigned long long>(state), (state & 1u) ? "on" : "off");
         renders_[i]->stop();
         outputBuses_[i]->requestReset();
         if ((state & 1u) == 0) continue;
@@ -763,7 +771,8 @@ bool AudioEngine::synchronizeOutputs(uint64_t state) {
         // drops the old ring after the old producer has acknowledged pause.
         try {
             renders_[i]->start(devices_, {output.deviceId, output.deviceNameMatch},
-                               outputGates_[i].get(), config_.exclusiveOutput);
+                               outputGates_[i].get(), config_.exclusiveOutput,
+                               "monitoring generation changed");
         } catch (const std::exception& e) {
             LOG_ERR("supervisor: output worker start failed: %s", e.what());
             setMonitoring(false);
@@ -855,6 +864,7 @@ void AudioEngine::supervisorMain() {
                 std::lock_guard<std::mutex> lock(configMutex_);
                 const auto& source = config_.sources[i];
                 auto& ch = *channels_[i];
+                ch.stream.flushDiagnostics(); // non-real-time, including while forwarding is paused
                 if (!source.enabled || ch.stream.state() == StreamState::Running) {
                     captureFailures[i] = 0;
                     captureRetryAt[i] = {};
@@ -863,7 +873,8 @@ void AudioEngine::supervisorMain() {
                 if (!shouldRestart(ch.stream.state(), ch.stream.retryable(), woken) ||
                     (!woken && now < captureRetryAt[i])) continue;
                 ch.stream.start(devices_, source.kind == SourceKind::Application
-                    ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch});
+                    ? DeviceRef{L"", source.processPath} : DeviceRef{source.deviceId, source.deviceNameMatch},
+                    woken ? "supervisor retry after device notification" : "supervisor retry after stream failure/stop");
                 ++captureFailures[i];
                 captureRetryAt[i] = now + std::chrono::milliseconds(
                     retryBackoffMillis(captureFailures[i]));
@@ -885,7 +896,8 @@ void AudioEngine::supervisorMain() {
                     LOG_WARN("supervisor: output %zu became a system default; reopening shared", i);
                     outputBuses_[i]->requestReset();
                     render.start(devices_, {output.deviceId, output.deviceNameMatch},
-                                 outputGates_[i].get(), config_.exclusiveOutput);
+                                 outputGates_[i].get(), config_.exclusiveOutput,
+                                 "output became a system default; reopen shared");
                     outputFailures[i] = 0;
                     outputRetryAt[i] = {};
                 }
@@ -899,7 +911,8 @@ void AudioEngine::supervisorMain() {
                              render.lastError().c_str());
                     outputBuses_[i]->requestReset();
                     render.start(devices_, {output.deviceId, output.deviceNameMatch},
-                                 outputGates_[i].get(), config_.exclusiveOutput);
+                                 outputGates_[i].get(), config_.exclusiveOutput,
+                                 woken ? "supervisor retry after device notification" : "supervisor retry after stream failure/stop");
                     ++outputFailures[i];
                     outputRetryAt[i] = now + std::chrono::milliseconds(
                         retryBackoffMillis(outputFailures[i]));
@@ -945,6 +958,11 @@ DiagnosticSample AudioEngine::collectDiagnosticsLocked() const {
         auto& s = sample.sources[i];
         s.state = ch.stream.state();
         s.epoch = ch.stream.epoch();
+        const auto timeline = ch.stream.timelineStats();
+        s.captureStartRequests = timeline.startRequests;
+        s.captureInitialDiscontinuities = timeline.initialDiscontinuities;
+        s.captureDiscontinuities = timeline.discontinuities;
+        s.captureOverflowEvents = timeline.overflowEvents;
         s.valid = sample.running && config_.sources[i].enabled && s.state == StreamState::Running &&
                   s.epoch == ch.epochOut.load(std::memory_order_acquire);
         s.flowing = ch.stream.flowing();
@@ -1138,7 +1156,7 @@ void AudioEngine::setChannelDevice(int channel, const DeviceRef& ref) {
 
     if (!running()) return;
     if (size_t(channel) < sourceCount_ && target.enabled)
-        channels_[channel]->stream.start(devices_, ref);
+        channels_[channel]->stream.start(devices_, ref, "source device selection changed");
 }
 
 void AudioEngine::setOutputDevice(size_t output, const DeviceRef& ref) {
@@ -1150,7 +1168,7 @@ void AudioEngine::setOutputDevice(size_t output, const DeviceRef& ref) {
     if (!monitoring()) return;
     outputBuses_[output]->requestReset();
     renders_[output]->start(devices_, ref, outputGates_[output].get(),
-                            config_.exclusiveOutput);
+                            config_.exclusiveOutput, "output device selection changed");
 }
 
 bool AudioEngine::updateConfigFromRuntime(Config& config) const {

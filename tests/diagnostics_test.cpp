@@ -3,12 +3,54 @@
 #include "audio/OutputBus.h"
 #include "util/Log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <thread>
+#include <vector>
 
 namespace audiomon {
+// Exercise the real packet drain without a device, worker, or COM activation.
+struct FakeCapturePackets final : IAudioCaptureClient {
+    struct Packet {
+        UINT32 frames = 4;
+        DWORD flags = AUDCLNT_BUFFERFLAGS_SILENT;
+        HRESULT result = S_OK;
+    };
+    std::vector<Packet> packets;
+    size_t next = 0;
+    uint32_t releases = 0;
+    UINT32 lastReleasedFrames = 0;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** object) override {
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE GetNextPacketSize(UINT32* frames) override {
+        *frames = next < packets.size() ? std::max<UINT32>(packets[next].frames, 1) : 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetBuffer(BYTE** data, UINT32* frames, DWORD* flags,
+                                        UINT64* devicePosition, UINT64* qpcPosition) override {
+        const auto& packet = packets[next];
+        *data = nullptr; // all successful packets are explicitly silent
+        *frames = packet.frames;
+        *flags = packet.flags;
+        *devicePosition = *qpcPosition = 0;
+        if (packet.result == AUDCLNT_S_BUFFER_EMPTY) ++next;
+        return packet.result;
+    }
+    HRESULT STDMETHODCALLTYPE ReleaseBuffer(UINT32 frames) override {
+        ++releases;
+        lastReleasedFrames = frames;
+        ++next;
+        return S_OK;
+    }
+};
+
 struct AudioEngineTestAccess {
     static void prepare(AudioEngine& engine) {
         engine.sourceCount_ = 1;
@@ -57,6 +99,28 @@ struct AudioEngineTestAccess {
     static void changeSelections(AudioEngine& engine) {
         engine.config_.sources[0].deviceNameMatch = L"new source";
         engine.config_.output.deviceNameMatch = L"new output";
+    }
+    static void prepareCapture(CaptureStream& stream) {
+        stream.configure("packet diagnostic fixture", CaptureMode::Microphone);
+        stream.scratch_.assign(32, 0.0f);
+        stream.state_.store(StreamState::Running);
+    }
+    static void drain(CaptureStream& stream, FakeCapturePackets& packets) {
+        stream.capture_.attach(&packets);
+        stream.drainPackets();
+        stream.capture_.detach(); // the fixture lives on the stack
+    }
+    static void fillCaptureRing(CaptureStream& stream) {
+        const auto frames = stream.ring().beginWrite();
+        for (uint32_t i = 0; i < frames; ++i) stream.ring().writeFrame(i, 0.0f, 0.0f);
+        stream.ring().endWrite(frames);
+    }
+    static void seedCaptureCounters(AudioEngine& engine) {
+        auto& stream = engine.channels_[0]->stream;
+        stream.startRequests_.store(3);
+        stream.initialDiscontinuities_.store(2);
+        stream.discontinuities_.store(18);
+        stream.overflowEvents_.store(4);
     }
 };
 }
@@ -142,6 +206,10 @@ void historyAndReport() {
     check(copy.sessions.size() == 32 && copy.sessions.front().id == 9, "topology history bounded");
     check(copy.samples.front().elapsedMillis == 50000, "oldest sample evicted in order");
     auto current = copy.samples.back(); current.outputs[0].latencyCorrections = 7;
+    current.sources[0].captureStartRequests = 3;
+    current.sources[0].captureInitialDiscontinuities = 2;
+    current.sources[0].captureDiscontinuities = 18;
+    current.sources[0].captureOverflowEvents = 4;
     const auto report = formatDiagnosticReport(current, copy, "Synthetic device", "log-tail-marker");
     check(report.find("NOT measured end-to-end latency or A/V sync") != std::string::npos,
           "report does not claim measured A/V sync");
@@ -150,6 +218,16 @@ void historyAndReport() {
     check(report.find("latency_correction_events") != std::string::npos &&
           report.find("log-tail-marker") != std::string::npos && report.find("Synthetic device") != std::string::npos,
           "report includes recoveries, runtime log and device context");
+    check(report.find("A capture epoch is a timeline break, not a device restart count.") != std::string::npos,
+          "report distinguishes capture epochs from device restarts");
+    check(report.find("capture_start_requests,capture_initial_discontinuities,capture_discontinuities,capture_overflow_events") != std::string::npos,
+          "CSV names separate capture timeline causes");
+    const auto currentRow = report.find("\ncurrent,");
+    const auto currentRowEnd = report.find('\n', currentRow + 1);
+    const auto currentLine = currentRow == std::string::npos ? std::string{} :
+        report.substr(currentRow, currentRowEnd-currentRow);
+    check(currentLine.size() >= 9 && currentLine.compare(currentLine.size()-9, 9, ",3,2,18,4") == 0,
+          "CSV current source row contains timeline cause counts in header order");
     std::atomic<bool> finished{false};
     std::thread writer([&] {
         for (uint64_t i = 0; i < 2000; ++i) history.record(sampleAt(8000000 + i*5000));
@@ -165,12 +243,18 @@ void audioMirrors() {
     check(engine.diagnosticReport().find("Configured sources: 0; outputs: 0") != std::string::npos,
           "fresh engine does not invent a configured output");
     AudioEngineTestAccess::prepare(engine);
+    AudioEngineTestAccess::seedCaptureCounters(engine);
     float block[960]{};
     engine.renderMix(block, 480);
     const auto first = AudioEngineTestAccess::sample(engine);
     check(first.sources[0].valid && first.sources[0].queueRate == 48000 &&
           first.sources[0].targetFrames == 960 && first.sources[0].queueFrames == 1440,
           "source diagnostics use actual consumer depth and native target");
+    check(first.sources[0].captureStartRequests == 3 &&
+          first.sources[0].captureInitialDiscontinuities == 2 &&
+          first.sources[0].captureDiscontinuities == 18 &&
+          first.sources[0].captureOverflowEvents == 4,
+          "diagnostic collector preserves separate capture timeline cause counters");
     for (int i = 0; i < 5; ++i) engine.renderMix(block, 480);
     const auto starved = AudioEngineTestAccess::sample(engine);
     check(starved.sources[0].starvedFrames > 0 && starved.sources[0].starvationEvents > 0,
@@ -254,10 +338,101 @@ void recentLog() {
     check(tail.size() <= 128*1024 && tail.find("final-diagnostic-log-marker") != std::string::npos,
           "recent log tail bounded and available without an open file");
 }
+
+void captureTimelineDiagnostics() {
+    constexpr DWORD discontinuous = AUDCLNT_BUFFERFLAGS_SILENT | AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+    {
+        CaptureStream stream;
+        AudioEngineTestAccess::prepareCapture(stream);
+        FakeCapturePackets packets;
+        packets.packets = {{4, discontinuous}, {4, discontinuous}, {4, discontinuous}};
+        const auto beforeLog = log::recentText();
+        const auto beforeEpoch = stream.epoch();
+        AudioEngineTestAccess::drain(stream, packets);
+        const auto stats = stream.timelineStats();
+        check(stats.initialDiscontinuities == 1 && stats.discontinuities == 2 &&
+              stats.startRequests == 0 && stats.overflowEvents == 0 && stream.epoch() == beforeEpoch + 3,
+              "actual flagged packets distinguish initial and later timeline breaks without inventing restarts");
+        check(packets.releases == 3 && stream.ring().depth() == 12 &&
+              log::recentText() == beforeLog,
+              "packet diagnostics preserve audio delivery and perform no packet-path logging");
+        stream.flushDiagnostics();
+        const auto afterFlush = log::recentText();
+        const auto addedLog = afterFlush.substr(beforeLog.size());
+        const auto eventLine = addedLog.find("capture timeline events observed");
+        check(eventLine != std::string::npos &&
+              addedLog.find("capture timeline events observed", eventLine + 1) == std::string::npos,
+              "one deferred flush aggregates multiple capture timeline events");
+        stream.flushDiagnostics();
+        check(log::recentText() == afterFlush, "unchanged capture counters produce no repeated log entries");
+        stream.stop();
+        check(stream.timelineStats().discontinuities == 2,
+              "stopping capture preserves timeline diagnostics for export");
+        stream.configure("new diagnostic session", CaptureMode::Microphone);
+        const auto reset = stream.timelineStats();
+        check(reset.startRequests == 0 && reset.initialDiscontinuities == 0 &&
+              reset.discontinuities == 0 && reset.overflowEvents == 0,
+              "configuring a new engine session clears timeline counters");
+    }
+    {
+        CaptureStream stream;
+        AudioEngineTestAccess::prepareCapture(stream);
+        FakeCapturePackets packets;
+        packets.packets = {{4, AUDCLNT_BUFFERFLAGS_SILENT}, {4, discontinuous}};
+        AudioEngineTestAccess::drain(stream, packets);
+        const auto stats = stream.timelineStats();
+        check(stats.initialDiscontinuities == 0 && stats.discontinuities == 1 && stream.epoch() == 1,
+              "an unflagged first packet makes a subsequent discontinuity an ongoing event");
+    }
+    {
+        CaptureStream stream;
+        AudioEngineTestAccess::prepareCapture(stream);
+        FakeCapturePackets packets;
+        packets.packets = {{4, discontinuous, AUDCLNT_S_BUFFER_EMPTY}};
+        AudioEngineTestAccess::drain(stream, packets);
+        check(packets.releases == 0 && stream.epoch() == 0,
+              "BUFFER_EMPTY is neither released nor counted as a timeline event");
+        packets.packets.push_back({0, discontinuous});
+        AudioEngineTestAccess::drain(stream, packets);
+        check(packets.releases == 1 && packets.lastReleasedFrames == 0 && stream.epoch() == 0,
+              "zero-frame packets do not consume first-packet classification");
+        packets.packets.push_back({4, discontinuous});
+        AudioEngineTestAccess::drain(stream, packets);
+        check(stream.timelineStats().initialDiscontinuities == 1 &&
+              stream.timelineStats().discontinuities == 0,
+              "first positive packet remains initial after empty and zero-frame packets");
+    }
+    {
+        CaptureStream stream;
+        AudioEngineTestAccess::prepareCapture(stream);
+        AudioEngineTestAccess::fillCaptureRing(stream);
+        FakeCapturePackets packets;
+        packets.packets = {{4, discontinuous}};
+        const auto beforeLog = log::recentText();
+        AudioEngineTestAccess::drain(stream, packets);
+        const auto stats = stream.timelineStats();
+        check(stats.initialDiscontinuities == 1 && stats.overflowEvents == 1 &&
+              stream.epoch() == 2 && stream.droppedFrames() == 4 && packets.lastReleasedFrames == 4,
+              "combined packet discontinuity and ring overflow retain both epoch causes and release full packet");
+        check(log::recentText() == beforeLog, "overflow diagnostics perform no packet-path logging");
+    }
+    {
+        CaptureStream stream;
+        AudioEngineTestAccess::prepareCapture(stream);
+        FakeCapturePackets packets;
+        packets.packets = {{4, discontinuous, AUDCLNT_E_DEVICE_INVALIDATED}};
+        AudioEngineTestAccess::drain(stream, packets);
+        const auto stats = stream.timelineStats();
+        check(stream.state() == StreamState::Failed && packets.releases == 0 &&
+              stream.lastError().find("AUDCLNT_E_DEVICE_INVALIDATED") != std::string::npos &&
+              stats.initialDiscontinuities == 0 && stats.discontinuities == 0 && stream.epoch() == 0,
+              "capture failure preserves actionable error without miscounting an invalid packet");
+    }
+}
 }
 
 int main() {
-    trends(); historyAndReport(); audioMirrors(); lifecycleExport(); recentLog();
+    trends(); historyAndReport(); audioMirrors(); captureTimelineDiagnostics(); lifecycleExport(); recentLog();
     std::printf("Audio diagnostics: %s\n", failures ? "FAILED" : "PASSED");
     return failures ? 1 : 0;
 }

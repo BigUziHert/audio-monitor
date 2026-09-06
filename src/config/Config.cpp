@@ -2,6 +2,7 @@
 #include "config/Json.h"
 #include "util/Text.h"
 #include "util/Log.h"
+#include "util/Hotkeys.h"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -14,7 +15,30 @@
 namespace audiomon {
 namespace {
 
-constexpr int kConfigVersion = 6;
+constexpr int kConfigVersion = 7;
+
+JsonValue keybindToJson(const Keybind& keybind) {
+    // Do not persist partially captured or otherwise invalid keybinds.
+    const Keybind value = validKeybind(keybind) ? keybind : Keybind{};
+    JsonValue result = JsonValue::object();
+    result.set("modifiers", JsonValue(static_cast<double>(value.modifiers)));
+    result.set("key", JsonValue(static_cast<double>(value.key)));
+    return result;
+}
+
+Keybind keybindFromJson(const JsonValue* value) {
+    if (!value || !value->isObject()) return {};
+    const auto* modifiers = value->find("modifiers");
+    const auto* key = value->find("key");
+    if (!modifiers || modifiers->type() != JsonValue::Type::Number ||
+        !key || key->type() != JsonValue::Type::Number) return {};
+    const double m = modifiers->asNumber(-1);
+    const double k = key->asNumber(-1);
+    if (!(m >= 0 && m <= 15 && k >= 0 && k <= 254)) return {};
+    Keybind result{static_cast<uint32_t>(m), static_cast<uint32_t>(k)};
+    if (m != result.modifiers || k != result.key || !validKeybind(result)) return {};
+    return result;
+}
 
 const char* colorThemeName(ColorTheme theme) noexcept {
     switch (theme) {
@@ -62,6 +86,7 @@ JsonValue channelToJson(const ChannelConfig& c) {
     v.set("gain",       JsonValue(static_cast<double>(c.gain)));
     v.set("volume",     JsonValue(static_cast<double>(c.volume)));
     v.set("muted",      JsonValue(c.muted));
+    v.set("muteKeybind", keybindToJson(c.muteKeybind));
     return v;
 }
 
@@ -89,6 +114,7 @@ ChannelConfig channelFromJson(const JsonValue* v, const ChannelConfig& fallback)
     c.gain   = gain ? static_cast<float>(gain->asNumber(fallback.gain)) : fallback.gain;
     c.volume = volume ? static_cast<float>(volume->asNumber(fallback.volume)) : fallback.volume;
     c.muted  = mute ? mute->asBool(fallback.muted) : fallback.muted;
+    c.muteKeybind = keybindFromJson(v->find("muteKeybind"));
 
     if (!(c.gain >= 0.0f)) c.gain = 0.0f;      // also catches NaN
     if (c.gain > 4.0f)     c.gain = 4.0f;
@@ -311,6 +337,7 @@ Config Config::fromJson(const JsonValue& root) {
     }
     if (auto v = root.find("mono")) c.mono = v->asBool(false);
     if (auto v = root.find("closeToTray")) c.closeToTray = v->asBool(false);
+    c.monitoringKeybind = keybindFromJson(root.find("monitoringKeybind"));
 
     if (const JsonValue* v = root.find("exclusiveOutput"))  c.exclusiveOutput  = v->asBool(def.exclusiveOutput);
     if (const JsonValue* v = root.find("startWithWindows")) c.startWithWindows = v->asBool(def.startWithWindows);
@@ -332,6 +359,7 @@ JsonValue Config::toJson() const {
     root.set("sources", sourcesJson);
     root.set("mono", JsonValue(mono));
     root.set("closeToTray", JsonValue(closeToTray));
+    root.set("monitoringKeybind", keybindToJson(monitoringKeybind));
     JsonValue outputsJson = JsonValue::array();
     if (outputCount() > 0) root.set("output", channelToJson(output));
     for (size_t i = 0; i < outputCount(); ++i)
