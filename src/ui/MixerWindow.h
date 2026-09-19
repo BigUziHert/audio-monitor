@@ -5,6 +5,7 @@
 #include "audio/Overlap.h"
 #include "util/DiagnosticExport.h"
 #include "util/Hotkeys.h"
+#include "util/Updates.h"
 #include <array>
 #include <future>
 
@@ -45,6 +46,8 @@ class MixerWindow {
     Keybind *draftKeybind(int target);
     void startDiagnosticExport(const std::wstring &directory);
     void pollDiagnosticExport();
+    void startUpdateCheck();
+    void pollUpdateCheck();
     bool drawSource(size_t index, float width, SpatialNavigation &navigation);
     bool drawDialogs();
     AudioEngine *engine_ = nullptr;
@@ -97,5 +100,7 @@ class MixerWindow {
     std::wstring diagnosticPath_;
     std::string diagnosticMessage_;
     bool diagnosticExportFailed_ = false;
+    std::future<updates::UpdateResult> updateCheck_;
+    updates::UpdateResult updateResult_;
 };
 } // namespace audiomon::ui

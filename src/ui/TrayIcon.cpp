@@ -25,6 +25,9 @@ UINT TrayIcon::taskbarCreatedMessage() {
 }
 
 bool TrayIcon::add(HWND owner, HICON icon, const wchar_t* tooltip) {
+    // A TaskbarCreated notification invalidates the previous shell icon even
+    // if the first re-add attempt fails while Explorer is still starting.
+    added_ = false;
     data_ = {};
     data_.cbSize           = sizeof(NOTIFYICONDATAW);
     data_.hWnd             = owner;

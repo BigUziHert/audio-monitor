@@ -1,5 +1,50 @@
 cmake_minimum_required(VERSION 3.21)
-project(audio-monitor VERSION 0.1.0 LANGUAGES CXX)
+project(audio-monitor VERSION 0.2.0 LANGUAGES CXX)
+
+# Release builds carry the exact commit so development updates do not depend on
+# someone remembering to change the marketing version on every push.
+find_package(Git QUIET)
+set(_build_commit "unknown")
+set(_build_branch "")
+if(GIT_FOUND)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _build_commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" branch --show-current
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _build_branch OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  foreach(_git_ref HEAD "refs/heads/${_build_branch}" packed-refs)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --git-path "${_git_ref}"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+      OUTPUT_VARIABLE _git_ref_path OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_git_ref_path)
+      get_filename_component(_git_ref_path "${_git_ref_path}" ABSOLUTE
+        BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_git_ref_path}")
+    endif()
+  endforeach()
+endif()
+set(_build_channel "dev")
+if(_build_branch STREQUAL "main")
+  set(_build_channel "main")
+endif()
+if(NOT DEFINED AUDIOMON_BUILD_COMMIT)
+  set(AUDIOMON_BUILD_COMMIT "${_build_commit}")
+endif()
+if(NOT DEFINED AUDIOMON_BUILD_CHANNEL)
+  set(AUDIOMON_BUILD_CHANNEL "${_build_channel}")
+endif()
+if(NOT AUDIOMON_BUILD_CHANNEL MATCHES "^(dev|main)$")
+  message(FATAL_ERROR "AUDIOMON_BUILD_CHANNEL must be dev or main")
+endif()
+if(NOT AUDIOMON_BUILD_COMMIT MATCHES "^[0-9a-fA-F]+$" OR
+   NOT AUDIOMON_BUILD_COMMIT MATCHES "^........................................$")
+  set(AUDIOMON_BUILD_COMMIT "unknown")
+endif()
+
+# Ship self-contained MSVC binaries; startup should not depend on a developer's
+# Visual C++ runtime installation.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +65,12 @@ if(BUILD_TESTING)
   add_executable(config-test tests/config_test.cpp)
   target_link_libraries(config-test PRIVATE audiomon_core)
   add_test(NAME config COMMAND config-test)
+  add_executable(updates-test tests/updates_test.cpp)
+  target_link_libraries(updates-test PRIVATE audiomon_core)
+  add_test(NAME updates COMMAND updates-test)
+  add_executable(startup-test tests/startup_test.cpp)
+  target_link_libraries(startup-test PRIVATE audiomon_core)
+  add_test(NAME startup COMMAND startup-test)
   add_executable(hotkeys-test tests/hotkeys_test.cpp)
   target_link_libraries(hotkeys-test PRIVATE audiomon_core)
   add_test(NAME hotkeys COMMAND hotkeys-test)
@@ -111,13 +162,18 @@ add_library(audiomon_core STATIC
   src/util/DiagnosticExport.cpp
   src/util/Text.cpp
   src/util/Startup.cpp
+  src/util/Updates.cpp
   src/util/Hotkeys.cpp
 )
 target_include_directories(audiomon_core PUBLIC src)
-target_compile_definitions(audiomon_core PRIVATE AUDIOMON_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(audiomon_core PRIVATE
+  AUDIOMON_VERSION="${PROJECT_VERSION}"
+  AUDIOMON_BUILD_CHANNEL="${AUDIOMON_BUILD_CHANNEL}"
+  AUDIOMON_BUILD_COMMIT="${AUDIOMON_BUILD_COMMIT}"
+)
 target_link_libraries(audiomon_core PUBLIC
   audiomon_flags
-  mmdevapi ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32
+  mmdevapi ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32 winhttp
 )
 
 # --------------------------------------------------------------------- cli ---

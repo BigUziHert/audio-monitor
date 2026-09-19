@@ -21,6 +21,7 @@
 #include <imgui_impl_win32.h>
 
 #include <chrono>
+#include <cwchar>
 #include <string>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -37,9 +38,12 @@ constexpr int     kWindowHeight  = 890;
 constexpr uint32_t kForegroundFramesPerSecond = 60;
 constexpr uint32_t kBackgroundFramesPerSecond = 30;
 constexpr DWORD    kOccludedPollMilliseconds = 250;
+constexpr UINT_PTR kTrayRetryTimer = 1;
+constexpr unsigned kTrayRetryLimit = 30;
 
 // Sent by a second instance to bring the running one to the front.
 UINT g_showMessage = 0;
+UINT g_exitForUpdateMessage = 0;
 
 struct App {
     AudioEngine      engine;
@@ -56,6 +60,7 @@ struct App {
     bool             configDirty = false;
     bool             saveFailureLogged = false;
     unsigned         consecutiveBeginFailures = 0;
+    unsigned         trayRetryAttempts = 0;
     std::chrono::steady_clock::time_point lastFrame{};
     std::chrono::steady_clock::time_point lastSave{};
     std::chrono::steady_clock::time_point lastSaveAttempt{};
@@ -100,7 +105,31 @@ void showWindow(App& app) {
 
 void saveConfigIfDirty(App& app, bool force);
 
+bool tryAddTrayIcon(App& app) {
+    const bool added = app.tray.add(app.hwnd,
+        reinterpret_cast<HICON>(GetClassLongPtrW(app.hwnd, GCLP_HICONSM)), kWindowTitle);
+    if (added) {
+        KillTimer(app.hwnd, kTrayRetryTimer);
+        app.trayRetryAttempts = 0;
+    }
+    return added;
+}
+
+bool requestTrayIcon(App& app) {
+    if (tryAddTrayIcon(app)) return true;
+    app.trayRetryAttempts = 0;
+    LOG_WARN("tray: shell icon unavailable; retrying while keeping the mixer accessible");
+    if (!SetTimer(app.hwnd, kTrayRetryTimer, 1000, nullptr))
+        LOG_WARN("tray: could not schedule shell icon retry (%lu)", GetLastError());
+    return false;
+}
+
 void hideWindow(App& app) {
+    // Never leave a running process with neither a window nor a tray icon.
+    if (!app.tray.available() && !requestTrayIcon(app)) {
+        showWindow(app);
+        return;
+    }
     // Every path into the tray flushes first. Putting it here rather than at
     // each call site keeps future hide paths from forgetting.
     saveConfigIfDirty(app, true);
@@ -159,13 +188,29 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     if (msg == ui::TrayIcon::taskbarCreatedMessage() && app) {
         // Explorer restarted and took the icon with it.
-        app->tray.add(hwnd, reinterpret_cast<HICON>(
-                          GetClassLongPtrW(hwnd, GCLP_HICONSM)), kWindowTitle);
+        if (!requestTrayIcon(*app) && !app->visible) showWindow(*app);
         return 0;
     }
     if (g_showMessage && msg == g_showMessage && app) { showWindow(*app); return 0; }
+    if (g_exitForUpdateMessage && msg == g_exitForUpdateMessage && app) {
+        LOG_INFO("application: exiting for an update");
+        saveConfigIfDirty(*app, true);
+        app->quitting = true;
+        DestroyWindow(hwnd);
+        return 0;
+    }
 
     switch (msg) {
+        case WM_TIMER:
+            if (wp == kTrayRetryTimer && app) {
+                if (!tryAddTrayIcon(*app) && ++app->trayRetryAttempts >= kTrayRetryLimit) {
+                    KillTimer(hwnd, kTrayRetryTimer);
+                    LOG_WARN("tray: shell icon still unavailable after 30 retries");
+                    if (!app->visible) showWindow(*app);
+                }
+                return 0;
+            }
+            break;
         case WM_NCCALCSIZE:
             if (wp) {
                 // Keep the client in the work area when maximized.
@@ -279,6 +324,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // NIM_DELETE against a dead window leaves a ghost icon in the
             // notification area until the user hovers over it.
             if (app) app->tray.remove();
+            KillTimer(hwnd, kTrayRetryTimer);
             PostQuitMessage(0);
             return 0;
 
@@ -288,8 +334,13 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 bool commandLineHas(const wchar_t* flag) {
-    const wchar_t* cmd = GetCommandLineW();
-    return cmd && wcsstr(cmd, flag) != nullptr;
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return false;
+    bool found = false;
+    for (int i = 1; i < argc; ++i) found |= std::wcscmp(argv[i], flag) == 0;
+    LocalFree(argv);
+    return found;
 }
 
 } // namespace
@@ -297,6 +348,8 @@ bool commandLineHas(const wchar_t* flag) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     ImGui_ImplWin32_EnableDpiAwareness();
     g_showMessage = RegisterWindowMessageW(L"AudioMonitorShowWindow");
+    g_exitForUpdateMessage = RegisterWindowMessageW(L"AudioMonitor.ExitForUpdate");
+    const bool trayLaunch = commandLineHas(L"--tray");
 
     // Single instance: a second launch just raises the first one's window.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
@@ -329,8 +382,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     App app;
     g_app = &app;
     app.config = Config::load();
-    // Keep the checkbox honest if the user removed the Run entry by hand.
-    app.config.startWithWindows = startup::isEnabled();
+    // Manual launches of another build repair an existing enabled Run path.
+    // Windows' own disabled/missing startup setting always remains respected.
+    app.config.startWithWindows = trayLaunch ? startup::isEnabled()
+                                             : startup::refreshRegistration();
+    LOG_INFO("startup: launch=%s, start with Windows=%s", trayLaunch ? "tray" : "manual",
+             app.config.startWithWindows ? "enabled" : "disabled");
 
     HICON icon = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                                0, 0, LR_DEFAULTSIZE | LR_SHARED));
@@ -355,16 +412,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
 
     CHANGEFILTERSTRUCT filter{sizeof(filter)};
     ChangeWindowMessageFilterEx(app.hwnd, g_showMessage, MSGFLT_ALLOW, &filter);
+    ChangeWindowMessageFilterEx(app.hwnd, g_exitForUpdateMessage, MSGFLT_ALLOW, &filter);
     ChangeWindowMessageFilterEx(app.hwnd, ui::TrayIcon::taskbarCreatedMessage(),
                                 MSGFLT_ALLOW, &filter);
 
     SetWindowPos(app.hwnd,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED);
     const DWORD cornerPreference=2; // DWMWCP_ROUND, harmless on older Windows.
     DwmSetWindowAttribute(app.hwnd,33,&cornerPreference,sizeof(cornerPreference));
-    app.tray.add(app.hwnd, icon, kWindowTitle);
+    const bool trayReady = requestTrayIcon(app);
     app.mixer.init(&app.engine, &app.config, app.hwnd);
 
-    const bool startHidden = app.config.startMinimized || commandLineHas(L"--tray");
+    const bool startHidden = trayReady && (app.config.startMinimized || trayLaunch);
     // An explicitly empty output list has nothing to forward. A tray launch
     // must not keep meter-only capture workers alive with no visible meters;
     // showing the window later starts them through syncMeteringVisibility().
@@ -461,7 +519,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         } else {
             // Hidden: block. The process should be doing nothing at all here
             // beyond the audio threads.
-            if (!GetMessageW(&msg, nullptr, 0, 0)) { running = false; break; }
+            if (GetMessageW(&msg, nullptr, 0, 0) <= 0) { running = false; break; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

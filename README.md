@@ -127,6 +127,26 @@ Passivity is enforced structurally rather than by good intentions:
   yielding control, never following the default.
 - No endpoint volume, mute, or default-device state is ever written.
 
+## Install and update
+
+Download `audio-monitor-win64.zip` from the [development release](https://github.com/BigUziHert/audio-monitor/releases/tag/dev)
+or, after promotion, the [main release](https://github.com/BigUziHert/audio-monitor/releases/tag/main).
+Extract the ZIP and run `Install.cmd`. The installer uses
+`%LOCALAPPDATA%\Programs\Audio Monitor`, creates a Start Menu shortcut, and keeps
+your audio configuration. A fresh installation starts in the tray when you sign
+in to Windows. Existing startup preferences are preserved during updates.
+
+Open **Settings > General > Check For Updates**, then **Download Update** when
+a newer build is available. Extract that download and run `Install.cmd` again.
+Checking runs in the background and does not interrupt audio. The app checks
+its own channel (`dev` or `main`); **Settings > About** shows the version,
+channel, and source commit. It does not install updates automatically.
+
+Every successful push to `devchatgpt` publishes the `dev` download after Windows
+tests, installer tests, and the Linux cross-build pass. A tested commit promoted
+to `main` publishes the `main` download. These are release tags; the only source
+branches are `devchatgpt` and `main`.
+
 ## Building
 
 Requires **Visual Studio 2022** (or the standalone Build Tools) with the
@@ -177,6 +197,11 @@ git pull --ff-only origin devchatgpt
 Make changes on `devchatgpt`. `main` holds the published version; promote a
 tested `devchatgpt` commit when publishing. Windows CI uses the `windows-2022`
 image to match the Visual Studio 2022 build tools used locally.
+
+To create the same installable ZIP locally, run
+`./scripts/package.ps1 -BuildDir build -Config Release` after building and testing.
+It writes `build/package/audio-monitor-win64.zip`. MSVC builds include the C++
+runtime, so they also work on PCs without Visual Studio installed.
 
 `-BuildDir` is optional and defaults to `build`. `-Test` runs the DSP and sample
 format checks, configuration persistence and migration tests, deterministic
@@ -298,6 +323,11 @@ in the app and choose the endpoint explicitly; the exact ID is then persisted.
 `startWithWindows` registers `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 — per-user, so it needs no administrator rights — with a `--tray` flag so a
 boot launch goes straight to the notification area.
+The app validates the registered command and respects disabling it in Windows
+Startup Apps. A manual launch repairs an existing registration after an update
+moves the executable. Saving a changed startup preference registers the current
+copy. If Explorer is not ready for the tray icon, the app retries and keeps the
+window accessible instead of silently hiding without an icon.
 
 ## Design notes
 

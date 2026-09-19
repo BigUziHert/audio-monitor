@@ -129,6 +129,13 @@ struct MixerWindowTestAccess {
     static bool exportPending(const MixerWindow &mixer) { return mixer.diagnosticExport_.valid(); }
     static const std::wstring &exportPath(const MixerWindow &mixer) { return mixer.diagnosticPath_; }
     static bool exportFailed(const MixerWindow &mixer) { return mixer.diagnosticExportFailed_; }
+    static void setUpdateFuture(MixerWindow &mixer, std::future<updates::UpdateResult> future) {
+        mixer.updateCheck_ = std::move(future);
+    }
+    static bool updatePending(const MixerWindow &mixer) { return mixer.updateCheck_.valid(); }
+    static const updates::UpdateResult &updateResult(const MixerWindow &mixer) {
+        return mixer.updateResult_;
+    }
     static void startExport(MixerWindow &mixer, const std::wstring &directory) {
         mixer.startDiagnosticExport(directory);
     }
@@ -584,6 +591,29 @@ int main() {
             expect(!mixer.hitTitleBar(1493, 53, 1600, 986), "Modal drag behavior overlaps maximize");
             ImGui::SetWindowPos(dialog, originalPosition);
             frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 80, dialog->DC.CursorStartPos.y + 117); // General
+            const int beforeUpdate = changedFrames;
+            std::promise<updates::UpdateResult> pendingUpdate;
+            ui::MixerWindowTestAccess::setUpdateFuture(mixer, pendingUpdate.get_future());
+            click(dialog->DC.CursorStartPos.x + 560, dialog->DC.CursorStartPos.y + 380);
+            expect(ui::MixerWindowTestAccess::updatePending(mixer),
+                   "Clicking a pending update check launched another check");
+            updates::UpdateResult available;
+            available.status = updates::UpdateStatus::Available;
+            available.message = "A newer dev build is ready to download.";
+            pendingUpdate.set_value(available);
+            frame(1600, 986);
+            expect(!ui::MixerWindowTestAccess::updatePending(mixer) &&
+                       ui::MixerWindowTestAccess::updateResult(mixer).status == updates::UpdateStatus::Available,
+                   "Completed update check was not shown");
+            std::promise<updates::UpdateResult> failedUpdate;
+            ui::MixerWindowTestAccess::setUpdateFuture(mixer, failedUpdate.get_future());
+            failedUpdate.set_exception(std::make_exception_ptr(std::runtime_error("offline")));
+            frame(1600, 986);
+            expect(ui::MixerWindowTestAccess::updateResult(mixer).status == updates::UpdateStatus::Error &&
+                       ui::MixerWindowTestAccess::updateResult(mixer).downloadUrl.empty(),
+                   "Failed update check retained a stale download");
+            expect(changedFrames == beforeUpdate, "Update checking changed audio preferences");
             click(dialog->DC.CursorStartPos.x + 80, dialog->DC.CursorStartPos.y + 349); // About
             expect(ui::MixerWindowTestAccess::settingsPage(mixer) == 4, "About did not open");
             const int beforeExport = changedFrames;

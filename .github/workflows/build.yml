@@ -2,9 +2,16 @@ name: build
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, devchatgpt ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # The supported build: MSVC on Windows.
@@ -14,18 +21,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        shell: pwsh
+        run: |
+          $channel = if ($env:GITHUB_REF_NAME -eq 'main') { 'main' } else { 'dev' }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DAUDIOMON_BUILD_CHANNEL=$channel" "-DAUDIOMON_BUILD_COMMIT=$env:GITHUB_SHA"
       - name: Build
         run: cmake --build build --config Release
       - name: Run CTest suite except app capture
         run: ctest --test-dir build -C Release --output-on-failure -E app-capture
-      - name: Show artifacts
-        run: Get-ChildItem build\Release -Filter *.exe
+      - name: Test installer
+        run: ./tests/installer_test.ps1
+        shell: pwsh
+      - name: Package installable download
+        run: ./scripts/package.ps1 -BuildDir build -Config Release
         shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
           name: audio-monitor-win64
-          path: build/Release/*.exe
+          path: build/package/audio-monitor-win64.zip
 
   # Host-native platform-independent tests plus a Windows cross-compile check.
   linux-crosscheck:
@@ -38,3 +51,62 @@ jobs:
         run: ./scripts/run_tests.sh
       - name: Cross-compile for Windows
         run: ./scripts/crossbuild.sh ON
+
+  release:
+    needs: [msvc, linux-crosscheck]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/devchatgpt')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: audio-monitor-win64
+          path: package
+      - name: Publish tested channel build
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const branch = context.ref.replace('refs/heads/', '');
+            const channel = branch === 'main' ? 'main' : 'dev';
+            const head = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+            if (head.data.object.sha !== context.sha) {
+              core.info('A newer commit is queued; it will publish the next download.');
+              return;
+            }
+            const tagRef = `tags/${channel}`;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: tagRef });
+              await github.rest.git.updateRef({ owner, repo, ref: tagRef, sha: context.sha, force: true });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({ owner, repo, ref: `refs/${tagRef}`, sha: context.sha });
+            }
+            const details = {
+              owner, repo, tag_name: channel, target_commitish: context.sha,
+              name: `Audio Monitor ${channel} (${context.sha.slice(0, 7)})`,
+              body: `Tested build from ${branch}, commit ${context.sha}.\n\nDownload audio-monitor-win64.zip, extract it, then run Install.cmd. It replaces the per-user installation and keeps your audio settings.`,
+              prerelease: channel === 'dev', make_latest: channel === 'main' ? 'true' : 'false'
+            };
+            let release;
+            try {
+              release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag: channel })).data;
+              // Hide the release during replacement so checkers cannot pair a
+              // new commit with the previous build's download.
+              release = (await github.rest.repos.updateRelease({ ...details, release_id: release.id, draft: true })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              release = (await github.rest.repos.createRelease({ ...details, draft: true })).data;
+            }
+            for (const asset of release.assets) {
+              if (asset.name === 'audio-monitor-win64.zip')
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+            }
+            const data = fs.readFileSync('package/audio-monitor-win64.zip');
+            await github.rest.repos.uploadReleaseAsset({
+              owner, repo, release_id: release.id, name: 'audio-monitor-win64.zip',
+              headers: { 'content-type': 'application/zip', 'content-length': data.length }, data
+            });
+            await github.rest.repos.updateRelease({ ...details, release_id: release.id, draft: false });

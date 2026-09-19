@@ -843,6 +843,7 @@ void MixerWindow::setVisible(bool visible) {
 }
 void MixerWindow::shutdown() {
     hotkeys_.clear();
+    if (updateCheck_.valid()) updateCheck_.wait();
     // Export owns an engine pointer, never ImGui or a window handle. Finish it
     // before application teardown destroys the engine or logging service.
     if (diagnosticExport_.valid()) diagnosticExport_.wait();
@@ -886,6 +887,29 @@ void MixerWindow::pollDiagnosticExport() {
     } catch (...) {
         diagnosticExportFailed_ = true;
         diagnosticMessage_ = "Could not export the debug log. Please try again.";
+    }
+}
+void MixerWindow::startUpdateCheck() {
+    if (updateCheck_.valid()) return;
+    updateResult_ = {};
+    updateResult_.message = "Checking GitHub for updates...";
+    try {
+        updateCheck_ = std::async(std::launch::async, [] { return updates::checkForUpdates(); });
+    } catch (...) {
+        updateResult_.status = updates::UpdateStatus::Error;
+        updateResult_.message = "Could not start the update check. Please try again.";
+    }
+}
+void MixerWindow::pollUpdateCheck() {
+    if (!updateCheck_.valid() ||
+        updateCheck_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+    try {
+        updateResult_ = updateCheck_.get();
+    } catch (...) {
+        updateResult_ = {};
+        updateResult_.status = updates::UpdateStatus::Error;
+        updateResult_.message = "Update check failed. Check your connection and try again.";
     }
 }
 void MixerWindow::syncMeteringVisibility() {
@@ -1687,6 +1711,7 @@ bool MixerWindow::hitTitleBar(int x, int y, int width, int height) const {
 bool MixerWindow::drawDialogs() {
     bool changed = false;
     pollDiagnosticExport();
+    pollUpdateCheck();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24 * scale_, 24 * scale_});
     if (openChannels_) {
         ImGui::OpenPopup("Channels");
@@ -2380,9 +2405,33 @@ bool MixerWindow::drawDialogs() {
 
             c.line(contentX, 347, contentX + 504, 347, border, 1);
             c.text(contentX, 369, "Updates", 17, white);
-            bool updatesUnavailable = false;
-            drawCheck("Automatic updates", contentX, 399, "Check for updates automatically",
-                      "Not available in this build.", updatesUnavailable, false);
+            ImGui::BeginDisabled(updateCheck_.valid());
+            if (drawButton("Check for updates", contentX + 228, 359, 276, 42,
+                           updateCheck_.valid() ? "Checking..." : "Check For Updates",
+                           updateCheck_.valid() ? disabledControl : accentButton, onAccent))
+                startUpdateCheck();
+            ImGui::EndDisabled();
+            const bool updateAvailable = updateResult_.status == updates::UpdateStatus::Available;
+            c.wrappedText(contentX, 411,
+                          updateResult_.message.empty()
+                              ? "Download new builds from GitHub."
+                              : updateResult_.message,
+                          16, !updateCheck_.valid() && !updateResult_.message.empty() &&
+                              updateResult_.status == updates::UpdateStatus::Error ? red : gray,
+                          updateAvailable ? 310.f : 504.f, 46);
+            if (!updateResult_.message.empty() &&
+                ImGui::IsMouseHoveringRect(c.p(contentX, 411), c.p(contentX + 310, 457)))
+                ImGui::SetTooltip("%s", updateResult_.message.c_str());
+            if (updateAvailable && drawButton("Download update", contentX + 328, 411, 176, 42,
+                                             "Download Update", card, accentText)) {
+                std::string error;
+                if (updates::openUpdateDownload(updateResult_, error))
+                    updateResult_.message = "Download opened. Extract the ZIP, then run Install.cmd.";
+                else {
+                    updateResult_.status = updates::UpdateStatus::Error;
+                    updateResult_.message = error;
+                }
+            }
 
             c.line(contentX, 463, contentX + 504, 463, border, 1);
             c.text(contentX, 483, "Language", 17, white);
@@ -2478,7 +2527,9 @@ bool MixerWindow::drawDialogs() {
         } else if (settingsPage_ == 4) {
             c.badge(Info, 448, 163, purple);
             c.centeredText(448, 222, "Audio Monitor", 28, white);
-            c.centeredText(448, 258, "Version 0.1.0", 20, gray);
+            const auto build = updates::currentBuildInfo();
+            c.centeredText(448, 258, "Version " + build.version + " / " + build.channel +
+                           " / " + build.commit.substr(0, 7), 20, gray);
             c.centeredText(448, 293, "Low-latency Windows audio monitoring and mixing.", 20, gray);
             c.line(contentX, 320, contentX + 504, 320, border, 1);
             c.text(contentX, 338, "Audio diagnostics", 23, white, true);
@@ -2536,8 +2587,8 @@ bool MixerWindow::drawDialogs() {
             }
             if (!hotkeys_.apply(candidate, keybindError_)) {
                 settingsPage_ = 3;
-            } else if (settingsDraft_.startWithWindows != config_->startWithWindows &&
-                !startup::setEnabled(settingsDraft_.startWithWindows)) {
+            } else if (window_ && settingsDraft_.startWithWindows != config_->startWithWindows &&
+                       !startup::setEnabled(settingsDraft_.startWithWindows)) {
                 hotkeys_.apply(*config_, keybindError_);
                 ImGui::OpenPopup("Startup setting failed");
             } else {

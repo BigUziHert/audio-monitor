@@ -26,6 +26,7 @@ public:
     TrayIcon& operator=(const TrayIcon&) = delete;
 
     bool add(HWND owner, HICON icon, const wchar_t* tooltip);
+    bool available() const { return added_; }
     void remove();
     void setTooltip(const wchar_t* tooltip);
 
