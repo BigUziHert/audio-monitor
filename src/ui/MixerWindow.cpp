@@ -2404,51 +2404,21 @@ bool MixerWindow::drawDialogs() {
                       settingsDraft_.closeToTray);
 
             c.line(contentX, 347, contentX + 504, 347, border, 1);
-            c.text(contentX, 369, "Updates", 17, white);
-            ImGui::BeginDisabled(updateCheck_.valid());
-            if (drawButton("Check for updates", contentX + 228, 359, 276, 42,
-                           updateCheck_.valid() ? "Checking..." : "Check For Updates",
-                           updateCheck_.valid() ? disabledControl : accentButton, onAccent))
-                startUpdateCheck();
-            ImGui::EndDisabled();
-            const bool updateAvailable = updateResult_.status == updates::UpdateStatus::Available;
-            c.wrappedText(contentX, 411,
-                          updateResult_.message.empty()
-                              ? "Download new builds from GitHub."
-                              : updateResult_.message,
-                          16, !updateCheck_.valid() && !updateResult_.message.empty() &&
-                              updateResult_.status == updates::UpdateStatus::Error ? red : gray,
-                          updateAvailable ? 310.f : 504.f, 46);
-            if (!updateResult_.message.empty() &&
-                ImGui::IsMouseHoveringRect(c.p(contentX, 411), c.p(contentX + 310, 457)))
-                ImGui::SetTooltip("%s", updateResult_.message.c_str());
-            if (updateAvailable && drawButton("Download update", contentX + 328, 411, 176, 42,
-                                             "Download Update", card, accentText)) {
-                std::string error;
-                if (updates::openUpdateDownload(updateResult_, error))
-                    updateResult_.message = "Download opened. Extract the ZIP, then run Install.cmd.";
-                else {
-                    updateResult_.status = updates::UpdateStatus::Error;
-                    updateResult_.message = error;
-                }
-            }
+            c.text(contentX, 367, "Language", 17, white);
+            c.text(contentX + 316, 369, "System Default only", 20, gray);
+            c.rect(contentX, 394, 250, 42, card, 8);
+            c.text(contentX + 14, 404, "System Default", 17, gray);
 
-            c.line(contentX, 463, contentX + 504, 463, border, 1);
-            c.text(contentX, 483, "Language", 17, white);
-            c.text(contentX + 316, 485, "System Default only", 20, gray);
-            c.rect(contentX, 510, 250, 42, card, 8);
-            c.text(contentX + 14, 520, "System Default", 17, gray);
-
-            c.line(contentX, 574, contentX + 504, 574, border, 1);
-            c.text(contentX, 595, "Theme", 17, white);
-            c.text(contentX + 270, 597, "System follows Windows", 20, gray);
-            if (drawRadio("Dark theme", contentX + 10, 633, "Dark",
+            c.line(contentX, 458, contentX + 504, 458, border, 1);
+            c.text(contentX, 479, "Theme", 17, white);
+            c.text(contentX + 270, 481, "System follows Windows", 20, gray);
+            if (drawRadio("Dark theme", contentX + 10, 517, "Dark",
                           settingsDraft_.colorTheme == ColorTheme::Dark))
                 settingsDraft_.colorTheme = ColorTheme::Dark;
-            if (drawRadio("Light theme", contentX + 120, 633, "Light",
+            if (drawRadio("Light theme", contentX + 120, 517, "Light",
                           settingsDraft_.colorTheme == ColorTheme::Light))
                 settingsDraft_.colorTheme = ColorTheme::Light;
-            if (drawRadio("System theme", contentX + 230, 633, "System",
+            if (drawRadio("System theme", contentX + 230, 517, "System",
                           settingsDraft_.colorTheme == ColorTheme::System))
                 settingsDraft_.colorTheme = ColorTheme::System;
             if (config_->colorTheme != settingsDraft_.colorTheme) {
@@ -2525,19 +2495,48 @@ bool MixerWindow::drawDialogs() {
                 ImGui::SetTooltip("%s", keybindError_.c_str());
             if (openCapture) ImGui::OpenPopup("Set keybind");
         } else if (settingsPage_ == 4) {
-            c.badge(Info, 448, 163, purple);
-            c.centeredText(448, 222, "Audio Monitor", 28, white);
+            c.badge(Info, 448, 132, purple);
+            c.centeredText(448, 183, "Audio Monitor", 28, white);
             const auto build = updates::currentBuildInfo();
-            c.centeredText(448, 258, "Version " + build.version + " / " + build.channel +
+            c.centeredText(448, 217, "Version " + build.version + " / " + build.channel +
                            " / " + build.commit.substr(0, 7), 20, gray);
-            c.centeredText(448, 293, "Low-latency Windows audio monitoring and mixing.", 20, gray);
-            c.line(contentX, 320, contentX + 504, 320, border, 1);
-            c.text(contentX, 338, "Audio diagnostics", 23, white, true);
-            c.wrappedText(contentX, 373,
+            c.centeredText(448, 247, "Low-latency Windows audio monitoring and mixing.", 20, gray);
+            c.line(contentX, 274, contentX + 504, 274, border, 1);
+            c.text(contentX, 294, "Updates", 20, white, true);
+            ImGui::BeginDisabled(updateCheck_.valid());
+            if (drawButton("Check for updates", contentX + 228, 282, 276, 42,
+                           updateCheck_.valid() ? "Checking..." : "Check For Updates",
+                           updateCheck_.valid() ? disabledControl : accentButton, onAccent))
+                startUpdateCheck();
+            ImGui::EndDisabled();
+            const bool updateAvailable = updateResult_.status == updates::UpdateStatus::Available;
+            c.wrappedText(contentX, 334,
+                          updateResult_.message.empty()
+                              ? "Download new builds from GitHub."
+                              : updateResult_.message,
+                          16, !updateCheck_.valid() && !updateResult_.message.empty() &&
+                              updateResult_.status == updates::UpdateStatus::Error ? red : gray,
+                          updateAvailable ? 310.f : 504.f, 46);
+            if (!updateResult_.message.empty() &&
+                ImGui::IsMouseHoveringRect(c.p(contentX, 334), c.p(contentX + 504, 380)))
+                ImGui::SetTooltip("%s", updateResult_.message.c_str());
+            if (updateAvailable && drawButton("Download update", contentX + 328, 334, 176, 42,
+                                             "Download Update", card, accentText)) {
+                std::string error;
+                if (updates::openUpdateDownload(updateResult_, error))
+                    updateResult_.message = "Download opened. Extract the ZIP, then run Install.cmd.";
+                else {
+                    updateResult_.status = updates::UpdateStatus::Error;
+                    updateResult_.message = error;
+                }
+            }
+            c.line(contentX, 390, contentX + 504, 390, border, 1);
+            c.text(contentX, 407, "Audio diagnostics", 21, white, true);
+            c.wrappedText(contentX, 441,
                           "Tracks buffer delay, clock correction and dropouts over time, including in the tray.",
-                          20, gray, 504, 48);
+                          16, gray, 504, 36);
             ImGui::BeginDisabled(diagnosticExport_.valid());
-            if (drawButton("Export debug log", contentX, 433, 504, 48,
+            if (drawButton("Export debug log", contentX, 489, 504, 44,
                            diagnosticExport_.valid() ? "Exporting..." : "Export Debug Log",
                            diagnosticExport_.valid() ? disabledControl : accentButton, onAccent)) {
                 const auto directory = Config::appDataDir();
@@ -2549,16 +2548,16 @@ bool MixerWindow::drawDialogs() {
                 }
             }
             ImGui::EndDisabled();
-            c.wrappedText(contentX, 495,
+            c.wrappedText(contentX, 547,
                           diagnosticMessage_.empty()
                               ? "Saved locally. Includes device/app names and paths; review before sharing."
                               : diagnosticMessage_,
-                          20, diagnosticExportFailed_ ? red : gray, 504, 60);
+                          16, diagnosticExportFailed_ ? red : gray, 504, 40);
             if (!diagnosticMessage_.empty() && ImGui::IsWindowHovered() &&
-                ImGui::IsMouseHoveringRect(c.p(contentX, 495), c.p(contentX + 504, 555)))
+                ImGui::IsMouseHoveringRect(c.p(contentX, 547), c.p(contentX + 504, 587)))
                 ImGui::SetTooltip("%s", diagnosticMessage_.c_str());
             ImGui::BeginDisabled(diagnosticPath_.empty());
-            if (drawButton("Open debug log", contentX, 580, 208, 48, "Open Log", card,
+            if (drawButton("Open debug log", contentX, 600, 208, 44, "Open Log", card,
                            diagnosticPath_.empty() ? gray : white) && window_) {
                 const auto opened = ShellExecuteW(static_cast<HWND>(window_), L"open",
                                                   diagnosticPath_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -2568,7 +2567,7 @@ bool MixerWindow::drawDialogs() {
                 }
             }
             ImGui::EndDisabled();
-            if (drawButton("Exit application", contentX + 224, 580, 280, 48, "Exit Audio Monitor", card))
+            if (drawButton("Exit application", contentX + 224, 600, 280, 44, "Exit Audio Monitor", card))
                 exitRequested_ = true;
         }
 

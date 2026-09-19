@@ -591,11 +591,12 @@ int main() {
             expect(!mixer.hitTitleBar(1493, 53, 1600, 986), "Modal drag behavior overlaps maximize");
             ImGui::SetWindowPos(dialog, originalPosition);
             frame(1600, 986);
-            click(dialog->DC.CursorStartPos.x + 80, dialog->DC.CursorStartPos.y + 117); // General
+            click(dialog->DC.CursorStartPos.x + 80, dialog->DC.CursorStartPos.y + 349); // About
+            expect(ui::MixerWindowTestAccess::settingsPage(mixer) == 4, "About did not open");
             const int beforeUpdate = changedFrames;
             std::promise<updates::UpdateResult> pendingUpdate;
             ui::MixerWindowTestAccess::setUpdateFuture(mixer, pendingUpdate.get_future());
-            click(dialog->DC.CursorStartPos.x + 560, dialog->DC.CursorStartPos.y + 380);
+            click(dialog->DC.CursorStartPos.x + 560, dialog->DC.CursorStartPos.y + 303);
             expect(ui::MixerWindowTestAccess::updatePending(mixer),
                    "Clicking a pending update check launched another check");
             updates::UpdateResult available;
@@ -614,12 +615,10 @@ int main() {
                        ui::MixerWindowTestAccess::updateResult(mixer).downloadUrl.empty(),
                    "Failed update check retained a stale download");
             expect(changedFrames == beforeUpdate, "Update checking changed audio preferences");
-            click(dialog->DC.CursorStartPos.x + 80, dialog->DC.CursorStartPos.y + 349); // About
-            expect(ui::MixerWindowTestAccess::settingsPage(mixer) == 4, "About did not open");
             const int beforeExport = changedFrames;
             std::promise<DiagnosticExportResult> exportResult;
             ui::MixerWindowTestAccess::setExportFuture(mixer, exportResult.get_future());
-            click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 457);
+            click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 511);
             expect(ui::MixerWindowTestAccess::exportPending(mixer), "Pending export was replaced by another click");
             exportResult.set_value({L"test-debug-log.txt", {}});
             frame(1600, 986);
@@ -1361,7 +1360,7 @@ int main() {
             click(dialog->DC.CursorStartPos.x + 230,
                   dialog->DC.CursorStartPos.y + 290); // Stage another preference.
             click(dialog->DC.CursorStartPos.x + 316,
-                  dialog->DC.CursorStartPos.y + 633); // Light theme.
+                  dialog->DC.CursorStartPos.y + 517); // Light theme.
             expect(config.colorTheme == ColorTheme::Light &&
                        ui::themePalette().background != darkBackground &&
                        changedFrames > changedBeforeTheme,
@@ -1388,7 +1387,7 @@ int main() {
         click(670, 900); // Reopen General settings.
         if (auto *dialog = popup()) {
             click(dialog->DC.CursorStartPos.x + 426,
-                  dialog->DC.CursorStartPos.y + 633); // System theme.
+                  dialog->DC.CursorStartPos.y + 517); // System theme.
             expect(config.colorTheme == ColorTheme::System,
                    "System theme did not become live before saving");
             dialog = popup();

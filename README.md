@@ -136,7 +136,7 @@ Extract the ZIP and run `Install.cmd`. The installer uses
 your audio configuration. A fresh installation starts in the tray when you sign
 in to Windows. Existing startup preferences are preserved during updates.
 
-Open **Settings > General > Check For Updates**, then **Download Update** when
+Open **Settings > About > Check For Updates**, then **Download Update** when
 a newer build is available. Extract that download and run `Install.cmd` again.
 Checking runs in the background and does not interrupt audio. The app checks
 its own channel (`dev` or `main`); **Settings > About** shows the version,
