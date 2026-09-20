@@ -136,6 +136,20 @@ struct MixerWindowTestAccess {
         mixer.settingsPage_ = page;
         mixer.openSettings_ = true;
     }
+    static void showUpdate(MixerWindow& mixer, bool downloaded) {
+        openSettings(mixer, 4);
+        mixer.updateResult_.status = updates::UpdateStatus::Available;
+        if (downloaded) {
+            mixer.preparedUpdate_.directory = L"synthetic-update";
+            mixer.updateResult_.message = "Update ready. Restart to install; audio will pause briefly. Your mixer settings are kept.";
+        } else {
+            mixer.updateResult_.message = "Downloading the update. You can keep using Audio Monitor.";
+            mixer.downloadProgress_ = std::make_shared<updates::DownloadProgress>();
+            mixer.downloadProgress_->total = 100;
+            mixer.downloadProgress_->received = 63;
+            mixer.updateDownload_ = std::async(std::launch::deferred, [] { return updates::PreparedUpdate{}; });
+        }
+    }
 
     static void openAddSource(MixerWindow& mixer) {
         mixer.editSource_ = -1;
@@ -297,6 +311,8 @@ enum class Scene {
     GeneralSettings,
     KeybindSettings,
     About,
+    UpdateDownloading,
+    UpdateDownloaded,
     AddSource,
     ConfigureOutput
 };
@@ -333,6 +349,8 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
         case Scene::GeneralSettings: ui::MixerWindowTestAccess::openSettings(mixer, 1); break;
         case Scene::KeybindSettings: ui::MixerWindowTestAccess::openSettings(mixer, 3); break;
         case Scene::About: ui::MixerWindowTestAccess::openSettings(mixer, 4); break;
+        case Scene::UpdateDownloading: ui::MixerWindowTestAccess::showUpdate(mixer, false); break;
+        case Scene::UpdateDownloaded: ui::MixerWindowTestAccess::showUpdate(mixer, true); break;
         case Scene::AddSource: ui::MixerWindowTestAccess::openAddSource(mixer); break;
         case Scene::ConfigureOutput:
             ui::MixerWindowTestAccess::openConfigureOutput(mixer, config);
@@ -478,11 +496,15 @@ int main() {
         {L"settings-keybinds-dark-1440x890.bmp", ColorTheme::Dark, Scene::KeybindSettings, 1440, 890},
         {L"settings-keybinds-light-1440x890.bmp", ColorTheme::Light, Scene::KeybindSettings, 1440, 890},
         {L"settings-about-dark-1440x890.bmp", ColorTheme::Dark, Scene::About, 1440, 890},
+        {L"update-downloading-dark-1440x890.bmp", ColorTheme::Dark, Scene::UpdateDownloading, 1440, 890},
+        {L"update-ready-dark-1440x890.bmp", ColorTheme::Dark, Scene::UpdateDownloaded, 1440, 890},
         {L"add-source-dark-1440x890.bmp", ColorTheme::Dark, Scene::AddSource, 1440, 890},
         {L"add-source-light-1440x890.bmp", ColorTheme::Light, Scene::AddSource, 1440, 890},
         {L"configure-output-dark-1440x890.bmp", ColorTheme::Dark, Scene::ConfigureOutput, 1440, 890},
         {L"dashboard-light-960x600.bmp", ColorTheme::Light, Scene::Dashboard, 960, 600},
         {L"settings-about-light-960x600.bmp", ColorTheme::Light, Scene::About, 960, 600},
+        {L"update-downloading-light-960x600.bmp", ColorTheme::Light, Scene::UpdateDownloading, 960, 600},
+        {L"update-ready-light-960x600.bmp", ColorTheme::Light, Scene::UpdateDownloaded, 960, 600},
         {L"settings-keybinds-light-960x600.bmp", ColorTheme::Light, Scene::KeybindSettings, 960, 600},
     };
 

@@ -211,6 +211,17 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     switch (msg) {
         case WM_TIMER:
+            if (wp == ui::MixerWindow::kUpdateWorkTimer && app && app->ready && !app->quitting) {
+                // Update workers also complete while the mixer is in the tray
+                // or occluded. This timer exists only during a user operation.
+                app->mixer.pollUpdates();
+                if (app->mixer.exitRequested()) {
+                    saveConfigIfDirty(*app, true);
+                    app->quitting = true;
+                    DestroyWindow(hwnd);
+                }
+                return 0;
+            }
             if (wp == kTrayRetryTimer && app) {
                 if (!tryAddTrayIcon(*app) && ++app->trayRetryAttempts >= kTrayRetryLimit) {
                     KillTimer(hwnd, kTrayRetryTimer);

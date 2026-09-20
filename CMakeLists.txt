@@ -68,6 +68,9 @@ if(BUILD_TESTING)
   add_executable(updates-test tests/updates_test.cpp)
   target_link_libraries(updates-test PRIVATE audiomon_core)
   add_test(NAME updates COMMAND updates-test)
+  add_executable(update-download-test tests/update_download_test.cpp)
+  target_link_libraries(update-download-test PRIVATE audiomon_core)
+  add_test(NAME update-download COMMAND update-download-test)
   add_executable(startup-test tests/startup_test.cpp)
   target_link_libraries(startup-test PRIVATE audiomon_core)
   add_test(NAME startup COMMAND startup-test)
@@ -168,9 +171,16 @@ add_library(audiomon_core STATIC
   src/util/Startup.cpp
   src/util/SingleInstance.cpp
   src/util/Updates.cpp
+  src/util/UpdateDownload.cpp
+  src/util/UpdateInstaller.cpp
   src/util/Hotkeys.cpp
 )
 target_include_directories(audiomon_core PUBLIC src)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/packaging/Update.ps1" AUDIOMON_UPDATE_SCRIPT)
+configure_file(packaging/UpdateScript.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/UpdateScript.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/packaging/Update.ps1")
+target_include_directories(audiomon_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_definitions(audiomon_core PRIVATE
   AUDIOMON_VERSION="${PROJECT_VERSION}"
   AUDIOMON_BUILD_CHANNEL="${AUDIOMON_BUILD_CHANNEL}"
@@ -178,7 +188,7 @@ target_compile_definitions(audiomon_core PRIVATE
 )
 target_link_libraries(audiomon_core PUBLIC
   audiomon_flags
-  mmdevapi ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32 winhttp
+  mmdevapi ole32 oleaut32 uuid avrt advapi32 shell32 shlwapi user32 winhttp bcrypt
 )
 
 # --------------------------------------------------------------------- cli ---

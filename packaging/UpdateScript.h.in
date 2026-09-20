@@ -1,0 +1,5 @@
+#pragma once
+
+namespace audiomon::updates::detail {
+inline constexpr char kUpdateInstallerScript[] = R"AMUPDATE(@AUDIOMON_UPDATE_SCRIPT@)AMUPDATE";
+}

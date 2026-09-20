@@ -843,7 +843,16 @@ void MixerWindow::setVisible(bool visible) {
 }
 void MixerWindow::shutdown() {
     hotkeys_.clear();
+    if (window_) KillTimer(static_cast<HWND>(window_), kUpdateWorkTimer);
+    if (downloadProgress_) downloadProgress_->cancel = true;
     if (updateCheck_.valid()) updateCheck_.wait();
+    if (updateDownload_.valid()) {
+        try { preparedUpdate_ = updateDownload_.get(); } catch (...) {}
+    }
+    if (updateInstall_.valid()) {
+        try { updateHandoff_ = updateInstall_.get().empty(); } catch (...) {}
+    }
+    if (!updateHandoff_) updates::discardPreparedUpdate(preparedUpdate_);
     // Export owns an engine pointer, never ImGui or a window handle. Finish it
     // before application teardown destroys the engine or logging service.
     if (diagnosticExport_.valid()) diagnosticExport_.wait();
@@ -889,15 +898,25 @@ void MixerWindow::pollDiagnosticExport() {
         diagnosticMessage_ = "Could not export the debug log. Please try again.";
     }
 }
+bool MixerWindow::beginUpdatePolling() {
+    if (!window_ || SetTimer(static_cast<HWND>(window_), kUpdateWorkTimer, 250, nullptr)) return true;
+    updateFailed_ = true;
+    updateResult_.message = "Could not start the update operation. Please try again.";
+    return false;
+}
 void MixerWindow::startUpdateCheck() {
-    if (updateCheck_.valid()) return;
+    if (updateCheck_.valid() || updateDownload_.valid() || updateInstall_.valid() ||
+        !preparedUpdate_.directory.empty() || updateHandoff_) return;
+    updateFailed_ = false;
     updateResult_ = {};
     updateResult_.message = "Checking GitHub for updates...";
+    if (!beginUpdatePolling()) return;
     try {
         updateCheck_ = std::async(std::launch::async, [] { return updates::checkForUpdates(); });
     } catch (...) {
         updateResult_.status = updates::UpdateStatus::Error;
         updateResult_.message = "Could not start the update check. Please try again.";
+        updateFailed_ = true;
     }
 }
 void MixerWindow::pollUpdateCheck() {
@@ -906,11 +925,83 @@ void MixerWindow::pollUpdateCheck() {
         return;
     try {
         updateResult_ = updateCheck_.get();
+        updateFailed_ = updateResult_.status == updates::UpdateStatus::Error;
     } catch (...) {
         updateResult_ = {};
         updateResult_.status = updates::UpdateStatus::Error;
         updateResult_.message = "Update check failed. Check your connection and try again.";
+        updateFailed_ = true;
     }
+}
+void MixerWindow::startUpdateDownload() {
+    if (updateCheck_.valid() || updateDownload_.valid() || updateInstall_.valid() ||
+        !preparedUpdate_.directory.empty() || updateHandoff_ ||
+        updateResult_.status != updates::UpdateStatus::Available) return;
+    updateFailed_ = false;
+    updateResult_.message = "Downloading the update. You can keep using Audio Monitor.";
+    if (!beginUpdatePolling()) return;
+    try {
+        downloadProgress_ = std::make_shared<updates::DownloadProgress>();
+        updateDownload_ = std::async(std::launch::async,
+            [update = updateResult_, progress = downloadProgress_] {
+                return updates::downloadUpdate(update, *progress);
+            });
+    } catch (...) {
+        updateFailed_ = true;
+        updateResult_.message = "Could not start the download. Please try again.";
+    }
+}
+void MixerWindow::startUpdateInstall() {
+    if (updateCheck_.valid() || updateDownload_.valid() || updateInstall_.valid() ||
+        preparedUpdate_.directory.empty() || updateHandoff_) return;
+    // Flush the live mixer before giving a helper permission to replace it.
+    // Pending edits in other Settings pages still follow the normal Save flow.
+    if (engine_) engine_->updateConfigFromRuntime(*config_);
+    if (!config_->save()) {
+        updateFailed_ = true;
+        updateResult_.message = "Could not save your mixer settings. The update has not started; try again.";
+        return;
+    }
+    updateFailed_ = false;
+    updateResult_.message = "Preparing to restart Audio Monitor...";
+    if (!beginUpdatePolling()) return;
+    try {
+        updateInstall_ = std::async(std::launch::async, [update = preparedUpdate_] {
+            std::string error;
+            if (!updates::launchUpdateInstaller(update, error))
+                return error.empty() ? std::string("Could not start the installer. Please try again.") : error;
+            return std::string{};
+        });
+    } catch (...) {
+        updateFailed_ = true;
+        updateResult_.message = "Could not start the installer. Your download is ready to retry.";
+    }
+}
+void MixerWindow::pollUpdates() {
+    pollUpdateCheck();
+    if (updateDownload_.valid() &&
+        updateDownload_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try { preparedUpdate_ = updateDownload_.get(); }
+        catch (...) { preparedUpdate_ = {{}, "The download could not complete. Please try again."}; }
+        updateFailed_ = preparedUpdate_.directory.empty();
+        updateResult_.message = updateFailed_ ? preparedUpdate_.error
+            : "Update ready. Restart to install; audio will pause briefly. Your mixer settings are kept.";
+    }
+    if (updateInstall_.valid() &&
+        updateInstall_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        std::string error;
+        try { error = updateInstall_.get(); }
+        catch (...) { error = "Could not start the installer. Your download is ready to retry."; }
+        updateFailed_ = !error.empty();
+        if (updateFailed_) updateResult_.message = error;
+        else {
+            updateHandoff_ = true;
+            updateResult_.message = "Restarting to install the update...";
+            exitRequested_ = true;
+        }
+    }
+    if (window_ && !updateCheck_.valid() && !updateDownload_.valid() && !updateInstall_.valid())
+        KillTimer(static_cast<HWND>(window_), kUpdateWorkTimer);
 }
 void MixerWindow::syncMeteringVisibility() {
     // A null HWND is used by the headless UI harness; it injects meter samples
@@ -1711,7 +1802,7 @@ bool MixerWindow::hitTitleBar(int x, int y, int width, int height) const {
 bool MixerWindow::drawDialogs() {
     bool changed = false;
     pollDiagnosticExport();
-    pollUpdateCheck();
+    pollUpdates();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {24 * scale_, 24 * scale_});
     if (openChannels_) {
         ImGui::OpenPopup("Channels");
@@ -2506,40 +2597,55 @@ bool MixerWindow::drawDialogs() {
             c.centeredText(448, 247, "Low-latency Windows audio monitoring and mixing.", 20, gray);
             c.line(contentX, 274, contentX + 504, 274, border, 1);
             c.text(contentX, 294, "Updates", 20, white, true);
-            ImGui::BeginDisabled(updateCheck_.valid());
+            const bool downloading = updateDownload_.valid();
+            const bool installing = updateInstall_.valid() || updateHandoff_;
+            const bool downloaded = !preparedUpdate_.directory.empty();
+            const bool updateBusy = updateCheck_.valid() || downloading || installing;
+            ImGui::BeginDisabled(updateBusy || downloaded);
             if (drawButton("Check for updates", contentX + 228, 282, 276, 42,
                            updateCheck_.valid() ? "Checking..." : "Check For Updates",
-                           updateCheck_.valid() ? disabledControl : accentButton, onAccent))
+                           updateBusy || downloaded ? disabledControl : accentButton, onAccent))
                 startUpdateCheck();
             ImGui::EndDisabled();
             const bool updateAvailable = updateResult_.status == updates::UpdateStatus::Available;
             c.wrappedText(contentX, 334,
                           updateResult_.message.empty()
-                              ? "Download new builds from GitHub."
+                              ? "Download and install updates here. Your mixer settings are kept."
                               : updateResult_.message,
-                          16, !updateCheck_.valid() && !updateResult_.message.empty() &&
-                              updateResult_.status == updates::UpdateStatus::Error ? red : gray,
-                          updateAvailable ? 310.f : 504.f, 46);
+                          16, updateFailed_ ? red : gray, 504.f, 46);
             if (!updateResult_.message.empty() &&
                 ImGui::IsMouseHoveringRect(c.p(contentX, 334), c.p(contentX + 504, 380)))
                 ImGui::SetTooltip("%s", updateResult_.message.c_str());
-            if (updateAvailable && drawButton("Download update", contentX + 328, 334, 176, 42,
-                                             "Download Update", card, accentText)) {
-                std::string error;
-                if (updates::openUpdateDownload(updateResult_, error))
-                    updateResult_.message = "Download opened. Extract the ZIP, then run Install.cmd.";
-                else {
-                    updateResult_.status = updates::UpdateStatus::Error;
-                    updateResult_.message = error;
-                }
+            if (downloading && downloadProgress_) {
+                const auto received = downloadProgress_->received.load();
+                const auto total = downloadProgress_->total.load();
+                const float progress = total ? std::min(1.f, float(received) / float(total)) : 0.f;
+                c.rect(contentX, 394, 310, 8, disabledControl, 4);
+                if (progress > 0) c.rect(contentX, 394, 310 * progress, 8, accentButton, 4);
+                c.text(contentX, 411, progress >= 1.f ? "Verifying update..." :
+                       "Downloading: " + std::to_string(int(progress * 100)) + "%", 15, gray);
+                if (drawButton("Cancel update download", contentX + 328, 384, 176, 42,
+                               "Cancel Download", card, accentText))
+                    downloadProgress_->cancel = true;
+            } else if (downloaded) {
+                ImGui::BeginDisabled(installing);
+                if (drawButton("Restart to update", contentX + 260, 384, 244, 42,
+                               installing ? "Restarting..." : "Restart to Update",
+                               installing ? disabledControl : accentButton, onAccent))
+                    startUpdateInstall();
+                ImGui::EndDisabled();
+            } else if (updateAvailable && !updateBusy &&
+                       drawButton("Download update", contentX + 260, 384, 244, 42,
+                                  "Download Update", accentButton, onAccent)) {
+                startUpdateDownload();
             }
-            c.line(contentX, 390, contentX + 504, 390, border, 1);
-            c.text(contentX, 407, "Audio diagnostics", 21, white, true);
-            c.wrappedText(contentX, 441,
+            c.line(contentX, 449, contentX + 504, 449, border, 1);
+            c.text(contentX, 465, "Audio diagnostics", 21, white, true);
+            c.wrappedText(contentX, 497,
                           "Tracks buffer delay, clock correction and dropouts over time, including in the tray.",
                           16, gray, 504, 36);
             ImGui::BeginDisabled(diagnosticExport_.valid());
-            if (drawButton("Export debug log", contentX, 489, 504, 44,
+            if (drawButton("Export debug log", contentX, 537, 504, 38,
                            diagnosticExport_.valid() ? "Exporting..." : "Export Debug Log",
                            diagnosticExport_.valid() ? disabledControl : accentButton, onAccent)) {
                 const auto directory = Config::appDataDir();
@@ -2551,16 +2657,16 @@ bool MixerWindow::drawDialogs() {
                 }
             }
             ImGui::EndDisabled();
-            c.wrappedText(contentX, 547,
+            c.wrappedText(contentX, 582,
                           diagnosticMessage_.empty()
                               ? "Saved locally. Includes device/app names and paths; review before sharing."
                               : diagnosticMessage_,
-                          16, diagnosticExportFailed_ ? red : gray, 504, 40);
+                          15, diagnosticExportFailed_ ? red : gray, 504, 36);
             if (!diagnosticMessage_.empty() && ImGui::IsWindowHovered() &&
-                ImGui::IsMouseHoveringRect(c.p(contentX, 547), c.p(contentX + 504, 587)))
+                ImGui::IsMouseHoveringRect(c.p(contentX, 582), c.p(contentX + 504, 618)))
                 ImGui::SetTooltip("%s", diagnosticMessage_.c_str());
             ImGui::BeginDisabled(diagnosticPath_.empty());
-            if (drawButton("Open debug log", contentX, 600, 208, 44, "Open Log", card,
+            if (drawButton("Open debug log", contentX, 625, 208, 32, "Open Log", card,
                            diagnosticPath_.empty() ? gray : white) && window_) {
                 const auto opened = ShellExecuteW(static_cast<HWND>(window_), L"open",
                                                   diagnosticPath_.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -2570,7 +2676,7 @@ bool MixerWindow::drawDialogs() {
                 }
             }
             ImGui::EndDisabled();
-            if (drawButton("Exit application", contentX + 224, 600, 280, 44, "Exit Audio Monitor", card))
+            if (drawButton("Exit application", contentX + 224, 625, 280, 32, "Exit Audio Monitor", card))
                 exitRequested_ = true;
         }
 

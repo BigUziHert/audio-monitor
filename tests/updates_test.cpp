@@ -25,6 +25,8 @@ JsonValue releaseFixture(const std::string& channel = "dev") {
     asset.set("name", JsonValue("audio-monitor-win64.zip"));
     asset.set("state", JsonValue("uploaded"));
     asset.set("size", JsonValue(100000));
+    asset.set("id", JsonValue(123456));
+    asset.set("digest", JsonValue("sha256:" + std::string(64, 'c')));
     asset.set("browser_download_url", JsonValue(
         "https://github.com/BigUziHert/audio-monitor/releases/download/" +
         channel + "/audio-monitor-win64.zip"));
@@ -77,6 +79,9 @@ int main() {
     check(result.downloadUrl ==
               "https://github.com/BigUziHert/audio-monitor/releases/download/dev/audio-monitor-win64.zip",
           "download comes from the expected repository and channel");
+    check(result.channel == "dev" && result.assetId == 123456 && result.downloadSize == 100000 &&
+              result.sha256 == std::string(64, 'c'),
+          "verified download pins the asset id, size, channel and SHA-256");
     check(github.requests.size() == 2 && github.requests.front() ==
               "/repos/BigUziHert/audio-monitor/releases/tags/dev" && github.requests.back() ==
               "/repos/BigUziHert/audio-monitor/compare/" + kOldCommit + "..." + kNewCommit +
@@ -155,6 +160,35 @@ int main() {
     changeAsset(release, "size", JsonValue(0));
     github.release.body = release.dump();
     check(github.check().status == UpdateStatus::Error, "empty download is never offered");
+    for (const auto& digest : {"", "sha256:bad", "sha512:wrong", "sha256:"}) {
+        release = releaseFixture();
+        changeAsset(release, "digest", JsonValue(digest));
+        github.release.body = release.dump();
+        check(github.check().status == UpdateStatus::Error, "update cannot be downloaded without a SHA-256 digest");
+        check(github.check({"0.1.0", "dev", kNewCommit}).status == UpdateStatus::Current,
+              "current build remains current when an old release has no digest");
+    }
+    release = releaseFixture();
+    changeAsset(release, "digest", JsonValue("sha256:" + std::string(64, 'G')));
+    github.release.body = release.dump();
+    check(github.check().status == UpdateStatus::Error, "digest must contain hexadecimal characters");
+    release = releaseFixture();
+    changeAsset(release, "digest", JsonValue("sha256:" + std::string(64, 'A')));
+    github.release.body = release.dump();
+    check(github.check().sha256 == std::string(64, 'a'), "uppercase SHA-256 is normalized");
+    for (const auto invalid : {JsonValue(0), JsonValue(-1), JsonValue(1.5), JsonValue("123"),
+                                JsonValue(9007199254740992.0)}) {
+        release = releaseFixture();
+        changeAsset(release, "id", invalid);
+        github.release.body = release.dump();
+        check(github.check().status == UpdateStatus::Error, "asset id must be an exact positive integer");
+    }
+    for (const auto invalid : {JsonValue(1.5), JsonValue(static_cast<double>(kMaximumUpdateBytes + 1))}) {
+        release = releaseFixture();
+        changeAsset(release, "size", invalid);
+        github.release.body = release.dump();
+        check(github.check().status == UpdateStatus::Error, "asset size must be bounded whole bytes");
+    }
     release = releaseFixture();
     release.set("assets", JsonValue::array());
     github.release.body = release.dump();
@@ -163,7 +197,8 @@ int main() {
     github.release.body = release.dump();
     check(github.check().status == UpdateStatus::Error, "reject malformed asset list");
 
-    for (const auto& body : {"", "not json", "[]", "null", "{\"draft\":false"}) {
+    for (const auto& body : {"", "not json", "[]", "null", "{\"draft\":false", "{\"id\":NaN}",
+                             "{\"id\":Infinity}", "{\"id\":1e999}"}) {
         github.release.body = body;
         check(github.check().status == UpdateStatus::Error, "malformed response is an error");
     }
@@ -186,14 +221,6 @@ int main() {
         throw std::runtime_error("transport failure");
     });
     check(result.status == UpdateStatus::Error, "worker receives a result rather than a transport exception");
-
-    result.status = UpdateStatus::Available;
-    result.downloadUrl = "file:///C:/Windows/System32/cmd.exe";
-    std::string error;
-    check(!openUpdateDownload(result, error) && !error.empty(), "browser opener independently rejects unsafe URL");
-    result.status = UpdateStatus::Current;
-    result.downloadUrl = "https://github.com/BigUziHert/audio-monitor/releases/download/dev/audio-monitor-win64.zip";
-    check(!openUpdateDownload(result, error), "browser opener requires an available update");
 
     std::printf("updates: %s (%d failures)\n", failed ? "FAILED" : "passed", failed);
     return failed ? 1 : 0;

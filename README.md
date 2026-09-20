@@ -137,10 +137,14 @@ your audio configuration. A fresh installation starts in the tray when you sign
 in to Windows. Existing startup preferences are preserved during updates.
 
 Open **Settings > About > Check For Updates**, then **Download Update** when
-a newer build is available. Extract that download and run `Install.cmd` again.
-Checking runs in the background and does not interrupt audio. The app checks
-its own channel (`dev` or `main`); **Settings > About** shows the version,
-channel, and source commit. It does not install updates automatically.
+a newer build is available. The app downloads and verifies the update in the
+background with a progress bar. When it is ready, choose **Restart to Update**;
+Audio Monitor saves your mixer settings, installs the update, and reopens.
+Audio pauses briefly during the restart. There is no browser download or ZIP
+extraction to do, and closing the app normally does not install an update.
+The app checks its own channel (`dev` or `main`); **Settings > About** shows the
+version, channel, and source commit. Downloads and installation each require
+your explicit action. The initial installation still uses `Install.cmd`.
 
 Every successful push to `devchatgpt` publishes the `dev` download after Windows
 tests, installer tests, and the Linux cross-build pass. A tested commit promoted

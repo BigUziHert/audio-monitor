@@ -6,8 +6,10 @@
 #include "util/DiagnosticExport.h"
 #include "util/Hotkeys.h"
 #include "util/Updates.h"
+#include "util/UpdateDownload.h"
 #include <array>
 #include <future>
+#include <memory>
 
 namespace audiomon::ui {
 class SpatialNavigation;
@@ -16,6 +18,8 @@ class MixerWindow {
     void init(AudioEngine *engine, Config *config, void *window);
     void setVisible(bool visible);
     void shutdown();
+    static constexpr uintptr_t kUpdateWorkTimer = 2;
+    void pollUpdates();
     bool draw(float dt, int width, int height);
     bool hitTitleBar(int x, int y, int width, int height) const;
     bool handleHotkey(int id, intptr_t chord);
@@ -47,7 +51,10 @@ class MixerWindow {
     void startDiagnosticExport(const std::wstring &directory);
     void pollDiagnosticExport();
     void startUpdateCheck();
+    bool beginUpdatePolling();
     void pollUpdateCheck();
+    void startUpdateDownload();
+    void startUpdateInstall();
     bool drawSource(size_t index, float width, SpatialNavigation &navigation);
     bool drawDialogs();
     AudioEngine *engine_ = nullptr;
@@ -103,5 +110,11 @@ class MixerWindow {
     bool diagnosticExportFailed_ = false;
     std::future<updates::UpdateResult> updateCheck_;
     updates::UpdateResult updateResult_;
+    std::future<updates::PreparedUpdate> updateDownload_;
+    std::future<std::string> updateInstall_;
+    std::shared_ptr<updates::DownloadProgress> downloadProgress_;
+    updates::PreparedUpdate preparedUpdate_;
+    bool updateFailed_ = false;
+    bool updateHandoff_ = false;
 };
 } // namespace audiomon::ui

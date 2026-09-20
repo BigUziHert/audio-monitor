@@ -136,6 +136,25 @@ struct MixerWindowTestAccess {
     static const updates::UpdateResult &updateResult(const MixerWindow &mixer) {
         return mixer.updateResult_;
     }
+    static void setDownloadFuture(MixerWindow &mixer, std::future<updates::PreparedUpdate> future) {
+        mixer.updateDownload_ = std::move(future);
+        mixer.downloadProgress_ = std::make_shared<updates::DownloadProgress>();
+        mixer.downloadProgress_->total = 100;
+        mixer.downloadProgress_->received = 50;
+    }
+    static bool downloadPending(const MixerWindow &mixer) { return mixer.updateDownload_.valid(); }
+    static bool updateDownloaded(const MixerWindow &mixer) { return !mixer.preparedUpdate_.directory.empty(); }
+    static bool updateFailed(const MixerWindow &mixer) { return mixer.updateFailed_; }
+    static void setInstallFuture(MixerWindow &mixer, std::future<std::string> future) {
+        mixer.updateInstall_ = std::move(future);
+    }
+    static void resetUpdate(MixerWindow &mixer) {
+        mixer.preparedUpdate_ = {};
+        mixer.updateHandoff_ = false;
+        mixer.exitRequested_ = false;
+        mixer.updateResult_ = {};
+        mixer.updateFailed_ = false;
+    }
     static void startExport(MixerWindow &mixer, const std::wstring &directory) {
         mixer.startDiagnosticExport(directory);
     }
@@ -615,10 +634,47 @@ int main() {
                        ui::MixerWindowTestAccess::updateResult(mixer).downloadUrl.empty(),
                    "Failed update check retained a stale download");
             expect(changedFrames == beforeUpdate, "Update checking changed audio preferences");
+            std::promise<updates::PreparedUpdate> pendingDownload;
+            ui::MixerWindowTestAccess::setDownloadFuture(mixer, pendingDownload.get_future());
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 560, dialog->DC.CursorStartPos.y + 303);
+            expect(ui::MixerWindowTestAccess::downloadPending(mixer) &&
+                       !ui::MixerWindowTestAccess::updatePending(mixer),
+                   "Checking during download replaced the active operation");
+            pendingDownload.set_value({{}, "Test: checksum mismatch"});
+            mixer.pollUpdates();
+            expect(ui::MixerWindowTestAccess::updateFailed(mixer) && !mixer.exitRequested() &&
+                       !ui::MixerWindowTestAccess::updateDownloaded(mixer),
+                   "Failed download was installable or requested app exit");
+            std::promise<updates::PreparedUpdate> readyDownload;
+            ui::MixerWindowTestAccess::setDownloadFuture(mixer, readyDownload.get_future());
+            readyDownload.set_value({L"test-prepared-update", {}});
+            mixer.pollUpdates();
+            expect(ui::MixerWindowTestAccess::updateDownloaded(mixer) && !mixer.exitRequested(),
+                   "Finished download installed without an explicit restart");
+            frame(1600, 986);
+            click(dialog->DC.CursorStartPos.x + 560, dialog->DC.CursorStartPos.y + 303);
+            expect(!ui::MixerWindowTestAccess::updatePending(mixer) &&
+                       ui::MixerWindowTestAccess::updateDownloaded(mixer),
+                   "Checking discarded the prepared update");
+            std::promise<std::string> failedInstall;
+            ui::MixerWindowTestAccess::setInstallFuture(mixer, failedInstall.get_future());
+            failedInstall.set_value("Test: helper failed to start");
+            mixer.pollUpdates();
+            expect(!mixer.exitRequested() && ui::MixerWindowTestAccess::updateDownloaded(mixer) &&
+                       ui::MixerWindowTestAccess::updateFailed(mixer),
+                   "Installer startup failure quit the app or lost the prepared update");
+            std::promise<std::string> readyInstall;
+            ui::MixerWindowTestAccess::setInstallFuture(mixer, readyInstall.get_future());
+            readyInstall.set_value({});
+            mixer.pollUpdates();
+            expect(mixer.exitRequested(), "Ready installer did not request normal app shutdown");
+            ui::MixerWindowTestAccess::resetUpdate(mixer);
+            expect(changedFrames == beforeUpdate, "Download/install polling changed audio preferences");
             const int beforeExport = changedFrames;
             std::promise<DiagnosticExportResult> exportResult;
             ui::MixerWindowTestAccess::setExportFuture(mixer, exportResult.get_future());
-            click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 511);
+            click(dialog->DC.CursorStartPos.x + 448, dialog->DC.CursorStartPos.y + 561);
             expect(ui::MixerWindowTestAccess::exportPending(mixer), "Pending export was replaced by another click");
             exportResult.set_value({L"test-debug-log.txt", {}});
             frame(1600, 986);

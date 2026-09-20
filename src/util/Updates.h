@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <cstdint>
 #include <string>
 
 namespace audiomon::updates {
@@ -19,7 +20,13 @@ struct UpdateResult {
     std::string releaseName;
     std::string commit;
     std::string downloadUrl;
+    std::string channel;
+    uint64_t assetId = 0;
+    uint64_t downloadSize = 0;
+    std::string sha256;
 };
+
+inline constexpr uint64_t kMaximumUpdateBytes = 64ull * 1024 * 1024;
 
 BuildInfo currentBuildInfo();
 
@@ -27,10 +34,7 @@ BuildInfo currentBuildInfo();
 // thread. Checks only the channel embedded in this executable; no background
 // downloads, credentials, installation, or executable replacement.
 UpdateResult checkForUpdates();
-
-// Opens a validated official ZIP download in the user's default browser. Call
-// only after the user explicitly presses the download button.
-bool openUpdateDownload(const UpdateResult& update, std::string& error);
+UpdateResult checkForUpdates(const BuildInfo& build);
 
 // Injectable transport keeps release/channel/commit handling testable offline.
 // Paths are relative to https://api.github.com, not arbitrary URLs.

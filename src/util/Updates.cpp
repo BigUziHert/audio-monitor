@@ -4,12 +4,13 @@
 #include "util/Text.h"
 
 #include <windows.h>
-#include <shellapi.h>
 #include <winhttp.h>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <utility>
@@ -32,6 +33,11 @@ constexpr char kApiRoot[] = "/repos/BigUziHert/audio-monitor/";
 constexpr char kDownloadRoot[] = "https://github.com/BigUziHert/audio-monitor/releases/download/";
 constexpr char kAssetName[] = "audio-monitor-win64.zip";
 
+bool finiteNumber(double value) {
+    // Builds use fast floating-point flags, so isfinite can be optimized away.
+    return (std::bit_cast<uint64_t>(value) & 0x7ff0000000000000ull) != 0x7ff0000000000000ull;
+}
+
 bool validChannel(const std::string& channel) {
     return channel == "dev" || channel == "main";
 }
@@ -45,10 +51,6 @@ bool validCommit(const std::string& commit) {
 
 std::string downloadUrl(const std::string& channel) {
     return std::string(kDownloadRoot) + channel + "/" + kAssetName;
-}
-
-bool validDownloadUrl(const std::string& url) {
-    return url == downloadUrl("dev") || url == downloadUrl("main");
 }
 
 std::string stringField(const JsonValue& object, const char* name) {
@@ -205,6 +207,7 @@ UpdateResult checkImpl(const BuildInfo& build, const UpdateHttpGet& get) {
     if (!assets || !assets->isArray())
         return failure("GitHub returned invalid release downloads.");
     bool hasDownload = false;
+    const JsonValue* selectedAsset = nullptr;
     for (const auto& asset : assets->items()) {
         if (stringField(asset, "name") != kAssetName)
             continue;
@@ -215,6 +218,7 @@ UpdateResult checkImpl(const BuildInfo& build, const UpdateHttpGet& get) {
         if (!size || size->type() != JsonValue::Type::Number || size->asNumber(0) <= 0)
             return failure("The release download is empty or incomplete.");
         hasDownload = true;
+        selectedAsset = &asset;
         break;
     }
     if (!hasDownload) {
@@ -234,16 +238,44 @@ UpdateResult checkImpl(const BuildInfo& build, const UpdateHttpGet& get) {
         result.releaseName.resize(256);
     result.commit = releasedCommit;
     result.downloadUrl = downloadUrl(build.channel);
+    result.channel = build.channel;
+    const auto* assetId = selectedAsset->find("id");
+    const auto* assetSize = selectedAsset->find("size");
+    const double id = assetId && assetId->type() == JsonValue::Type::Number
+        ? assetId->asNumber(0) : 0;
+    const double size = assetSize->asNumber(0);
+    const std::string digest = stringField(*selectedAsset, "digest");
+    const bool verifiedMetadata = finiteNumber(id) && id > 0 && id <= 9007199254740991.0 &&
+        std::floor(id) == id && finiteNumber(size) && size > 0 &&
+        size <= static_cast<double>(kMaximumUpdateBytes) && std::floor(size) == size &&
+        digest.size() == 71 && digest.rfind("sha256:", 0) == 0 &&
+        std::all_of(digest.begin() + 7, digest.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F');
+        });
+    if (verifiedMetadata) {
+        result.assetId = static_cast<uint64_t>(id);
+        result.downloadSize = static_cast<uint64_t>(size);
+        result.sha256 = digest.substr(7);
+        std::transform(result.sha256.begin(), result.sha256.end(), result.sha256.begin(),
+            [](unsigned char c) { return c >= 'A' && c <= 'F' ? char(c - 'A' + 'a') : char(c); });
+    }
+    const auto available = [&](std::string message) {
+        if (!verifiedMetadata)
+            return failure("The published update has no valid size or SHA-256 verification information. Try again after publishing completes.");
+        auto update = result;
+        update.status = UpdateStatus::Available;
+        update.message = std::move(message);
+        return update;
+    };
     if (build.commit == releasedCommit) {
         result.status = UpdateStatus::Current;
         result.message = "You have the latest published " + build.channel + " build.";
         return result;
     }
     if (!validCommit(build.commit)) {
-        result.status = UpdateStatus::Available;
-        result.message = "Published " + build.channel +
-                         " build available; no comparable local commit information.";
-        return result;
+        return available("Published " + build.channel +
+                         " build available; no comparable local commit information.");
     }
 
     // Use ancestry, not the app's version number: several builds can legitimately
@@ -252,10 +284,8 @@ UpdateResult checkImpl(const BuildInfo& build, const UpdateHttpGet& get) {
     const auto comparison = get(std::string(kApiRoot) + "compare/" + build.commit +
                                 "..." + releasedCommit + "?per_page=1&page=2");
     if (comparison.error.empty() && comparison.status == 404) {
-        result.status = UpdateStatus::Available;
-        result.message = "Published " + build.channel +
-                         " build available; GitHub cannot compare this local commit.";
-        return result;
+        return available("Published " + build.channel +
+                         " build available; GitHub cannot compare this local commit.");
     }
     if (!comparison.error.empty() || comparison.status != 200)
         return failure(httpError(comparison));
@@ -264,17 +294,15 @@ UpdateResult checkImpl(const BuildInfo& build, const UpdateHttpGet& get) {
         return failure("GitHub returned invalid build comparison information. Try again later.");
     const std::string status = stringField(compared, "status");
     if (status == "ahead") {
-        result.status = UpdateStatus::Available;
-        result.message = "A newer " + build.channel + " build is ready to download.";
+        return available("A newer " + build.channel + " build is ready to download.");
     } else if (status == "identical" || status == "behind") {
         result.status = UpdateStatus::Current;
         result.message = status == "identical"
             ? "You have the latest published " + build.channel + " build."
             : "Your build is newer than the latest published " + build.channel + " download.";
     } else if (status == "diverged") {
-        result.status = UpdateStatus::Available;
-        result.message = "A different " + build.channel +
-                         " build is available; your build has separate changes.";
+        return available("A different " + build.channel +
+                         " build is available; your build has separate changes.");
     } else {
         return failure("GitHub returned an unknown build comparison. Try again later.");
     }
@@ -288,7 +316,11 @@ BuildInfo currentBuildInfo() {
 }
 
 UpdateResult checkForUpdates() {
-    return checkForUpdates(currentBuildInfo(), getFromGitHub);
+    return checkForUpdates(currentBuildInfo());
+}
+
+UpdateResult checkForUpdates(const BuildInfo& build) {
+    return checkForUpdates(build, getFromGitHub);
 }
 
 UpdateResult checkForUpdates(const BuildInfo& build, const UpdateHttpGet& get) {
@@ -299,23 +331,6 @@ UpdateResult checkForUpdates(const BuildInfo& build, const UpdateHttpGet& get) {
     } catch (...) {
         return failure("The update check could not complete. Try again later.");
     }
-}
-
-bool openUpdateDownload(const UpdateResult& update, std::string& error) {
-    error.clear();
-    if (update.status != UpdateStatus::Available || !validDownloadUrl(update.downloadUrl)) {
-        error = "No verified update download is available. Check for updates again.";
-        return false;
-    }
-    const auto url = toWide(update.downloadUrl);
-    const auto opened = reinterpret_cast<std::intptr_t>(
-        ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
-    if (opened <= 32) {
-        error = "Could not open the download in your browser (Windows error " +
-                std::to_string(opened) + ").";
-        return false;
-    }
-    return true;
 }
 
 } // namespace audiomon::updates

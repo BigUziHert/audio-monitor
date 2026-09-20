@@ -32,6 +32,9 @@ jobs:
       - name: Test installer
         run: ./tests/installer_test.ps1
         shell: pwsh
+      - name: Test in-app update helper
+        run: ./tests/update_installer_test.ps1
+        shell: powershell
       - name: Package installable download
         run: ./scripts/package.ps1 -BuildDir build -Config Release
         shell: pwsh
