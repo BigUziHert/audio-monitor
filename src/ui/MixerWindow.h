@@ -81,6 +81,7 @@ class MixerWindow {
     int settingsPage_ = 1;
     bool resetDevicesOnSave_ = false;
     Config settingsDraft_;
+    bool startupAtSettingsOpen_ = false;
     Hotkeys hotkeys_;
     int keybindTarget_ = -1;
     Keybind capturedKeybind_;

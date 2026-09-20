@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -158,6 +159,150 @@ static void testResamplerInterpolates() {
     // 440 Hz at 48 kHz is heavily oversampled, so a correct 4-point kernel is
     // far better than this; a wrong coefficient blows straight past it.
     CHECK(maxErr < 1e-4, "interpolation kernel is inaccurate: max error %g", maxErr);
+}
+
+static double resampledToneGain(uint32_t inputRate, uint32_t outputRate,
+                                double frequency, double correction = 1.0) {
+    const double nominalRatio = double(inputRate) / outputRate;
+    const double ratio = nominalRatio * correction;
+    const uint32_t settle = outputRate / 50;
+    const uint32_t measured = outputRate / 5;
+    const uint32_t frames = settle + measured;
+    const uint32_t inputFrames = static_cast<uint32_t>(std::ceil(frames * ratio)) + 4;
+    StereoRing ring;
+    ring.init(inputFrames);
+    for (uint32_t i = 0; i < inputFrames; ++i) {
+        const float sample = static_cast<float>(std::sin(
+            2.0 * std::numbers::pi * frequency * i / inputRate));
+        ring.writeFrame(i, sample, 0.0f);
+    }
+    ring.endWrite(inputFrames);
+    DriftResampler resampler;
+    resampler.configure(nominalRatio);
+    std::vector<float> output(frames * 2);
+    CHECK(resampler.produce(ring, output.data(), frames, ratio) == frames,
+          "tone fixture unexpectedly starved at %u -> %u Hz", inputRate, outputRate);
+    double energy = 0.0;
+    for (uint32_t i = settle; i < frames; ++i) {
+        energy += double(output[i * 2]) * output[i * 2];
+        CHECK(output[i * 2 + 1] == 0.0f, "resampling leaked into the silent right channel");
+    }
+    return std::sqrt(2.0 * energy / measured);
+}
+
+static void testResamplerRejectsAliases() {
+    std::printf("downsampling anti-alias rejection and passband\n");
+    for (const auto rates : {std::array<uint32_t, 2>{96000, 48000},
+                            std::array<uint32_t, 2>{192000, 48000},
+                            std::array<uint32_t, 2>{48000, 44100}}) {
+        for (const double frequency : {1000.0, 10000.0}) {
+            const double gain = resampledToneGain(rates[0], rates[1], frequency);
+            CHECK(gain > 0.95 && gain < 1.01,
+                  "%u -> %u Hz lost passband %.0f Hz: gain %.6f",
+                  rates[0], rates[1], frequency, gain);
+        }
+        const double stopband = rates[0] == 48000 ? 23000.0 : 40000.0;
+        const double alias = resampledToneGain(rates[0], rates[1], stopband);
+        std::printf("   %u -> %u Hz: %.0f Hz rejection %.1f dB\n",
+                    rates[0], rates[1], stopband, 20.0 * std::log10(std::max(alias, 1e-12)));
+        CHECK(alias < 0.001,
+              "%u -> %u Hz aliases %.0f Hz at amplitude %.6f (want below -60 dB)",
+              rates[0], rates[1], stopband, alias);
+    }
+    for (const uint32_t inputRate : {96000u, 192000u}) {
+        const double highPassband = resampledToneGain(inputRate, 48000, 18000.0);
+        CHECK(highPassband > 0.97 && highPassband < 1.01,
+              "%u -> 48000 Hz lost 18 kHz passband: gain %.6f", inputRate, highPassband);
+        for (const double correction : {0.995, 1.005}) {
+            const double alias = resampledToneGain(inputRate, 48000, 25000.0, correction);
+            CHECK(alias < 0.01,
+                  "%u -> 48000 Hz lost near-Nyquist rejection at drift %.4f: %.6f",
+                  inputRate, correction, alias);
+        }
+    }
+}
+
+static void testFilteredResamplerContinuity() {
+    std::printf("filtered resampler split-block, starvation and reset continuity\n");
+    constexpr uint32_t inputFrames = 12000;
+    constexpr double ratio = 96000.0 / 44100.0;
+    const auto sample = [](uint32_t i) {
+        return static_cast<float>(0.5 * std::sin(2.0 * std::numbers::pi * 1000.0 * i / 96000.0) +
+                                  0.25 * std::sin(2.0 * std::numbers::pi * 40000.0 * i / 96000.0));
+    };
+    StereoRing whole;
+    whole.init(inputFrames);
+    for (uint32_t i = 0; i < inputFrames; ++i) whole.writeFrame(i, sample(i), -sample(i));
+    whole.endWrite(inputFrames);
+    DriftResampler reference;
+    reference.configure(ratio);
+    std::vector<float> expected(inputFrames * 2);
+    const uint32_t expectedFrames = reference.produce(whole, expected.data(), inputFrames, ratio);
+    expected.resize(expectedFrames * 2);
+
+    StereoRing fragments;
+    fragments.init(256);
+    DriftResampler split;
+    split.configure(ratio);
+    std::vector<float> actual;
+    actual.reserve(expected.size());
+    std::array<float, 74> block{};
+    uint32_t written = 0;
+    uint32_t shortReads = 0;
+    while (written < inputFrames) {
+        // The first fragment cannot prime the cubic history. Later fragments
+        // repeatedly starve mid-phase and wrap the input ring's storage.
+        const uint32_t chunk = std::min(inputFrames - written,
+                                       written == 0 ? 3u : 7u + written % 193u);
+        CHECK(fragments.beginWrite() >= chunk, "fragment fixture overflowed");
+        for (uint32_t i = 0; i < chunk; ++i)
+            fragments.writeFrame(i, sample(written + i), -sample(written + i));
+        fragments.endWrite(chunk);
+        written += chunk;
+        uint32_t made = 0;
+        do {
+            made = split.produce(fragments, block.data(), 37, ratio);
+            actual.insert(actual.end(), block.begin(), block.begin() + made * 2);
+        } while (made == 37);
+        ++shortReads;
+        CHECK(split.produce(fragments, block.data(), 37, ratio) == 0,
+              "empty callback changed the filtered resampler timeline");
+    }
+    CHECK(shortReads > 50 && actual == expected,
+          "split/starved filtering differs from continuous filtering (%zu vs %zu samples)",
+          actual.size(), expected.size());
+    CHECK(fragments.depth() == whole.depth(), "split resampling consumed a different input count");
+
+    split.reset();
+    fragments.dropAllFromConsumer();
+    for (uint32_t i = 0; i < 256; ++i) fragments.writeFrame(i, 0.0f, 0.0f);
+    fragments.endWrite(256);
+    const uint32_t made = split.produce(fragments, block.data(), 37, ratio);
+    CHECK(made == 37 && std::all_of(block.begin(), block.end(), [](float v) { return v == 0.0f; }),
+          "timeline reset retained ringing from the previous filtered stream");
+
+    split.configure(1.0);
+    fragments.dropAllFromConsumer();
+    for (uint32_t i = 0; i < 256; ++i) fragments.writeFrame(i, float(i), -float(i));
+    fragments.endWrite(256);
+    CHECK(split.produce(fragments, block.data(), 37, 1.0) == 37,
+          "returning to unity starved unexpectedly");
+    for (uint32_t i = 0; i < 37; ++i)
+        CHECK(block[i * 2] == float(i + 1) && block[i * 2 + 1] == -float(i + 1),
+              "format change to unity retained filtering at frame %u", i);
+
+    split.configure(ratio);
+    fragments.dropAllFromConsumer();
+    fragments.writeFrame(0, std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::infinity());
+    for (uint32_t i = 1; i < 256; ++i) fragments.writeFrame(i, 0.5f, 0.5f);
+    fragments.endWrite(256);
+    CHECK(split.produce(fragments, block.data(), 37, ratio) == 37,
+          "non-finite input fixture starved unexpectedly");
+    CHECK(std::all_of(block.begin(), block.end(), [](float value) {
+              return (std::bit_cast<uint32_t>(value) & 0x7f800000u) != 0x7f800000u;
+          }) && block.back() > 0.1f,
+          "one non-finite input permanently poisoned the anti-alias filter");
 }
 
 // The important one: a producer clocked fast relative to the consumer must NOT
@@ -760,6 +905,8 @@ int main() {
     testRing();
     testResamplerUnityIsExact();
     testResamplerInterpolates();
+    testResamplerRejectsAliases();
+    testFilteredResamplerContinuity();
     testDriftConvergence(+100.0, "producer fast");
     testDriftConvergence(-100.0, "producer slow");
     testDriftConvergence(+400.0, "extreme");

@@ -133,6 +133,7 @@ void OutputBus::applyPresence(float* samples, uint32_t frames) noexcept {
 void OutputBus::onRenderFormat(uint32_t sampleRate, uint32_t blockFrames) noexcept {
     renderRate_ = sampleRate ? sampleRate : kSourceSampleRate;
     baseRatio_ = double(kSourceSampleRate) / double(renderRate_);
+    resampler_.configure(baseRatio_);
 
     // blockFrames is the largest buffer RenderStream can ask us to fill.  For
     // ordinary 5-10 ms periods, a 20 ms base plus 5 ms phase reserve is enough

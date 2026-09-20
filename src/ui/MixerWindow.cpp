@@ -2244,6 +2244,9 @@ bool MixerWindow::drawDialogs() {
     }
     if (openSettings_) {
         settingsDraft_ = *config_;
+        // Windows Startup Apps can change this while the mixer stays open.
+        if (window_) settingsDraft_.startWithWindows = startup::isEnabled();
+        startupAtSettingsOpen_ = settingsDraft_.startWithWindows;
         resetDevicesOnSave_ = false;
         keybindTarget_ = -1;
         captureCancelRequested_ = false;
@@ -2586,8 +2589,8 @@ bool MixerWindow::drawDialogs() {
             }
             if (!hotkeys_.apply(candidate, keybindError_)) {
                 settingsPage_ = 3;
-            } else if (window_ && settingsDraft_.startWithWindows != config_->startWithWindows &&
-                       !startup::setEnabled(settingsDraft_.startWithWindows)) {
+            } else if (window_ && !startup::applyPreference(startupAtSettingsOpen_,
+                           settingsDraft_.startWithWindows, settingsDraft_.startWithWindows)) {
                 hotkeys_.apply(*config_, keybindError_);
                 ImGui::OpenPopup("Startup setting failed");
             } else {

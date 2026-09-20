@@ -403,6 +403,7 @@ void AudioEngine::renderMix(float* dst, uint32_t frames) noexcept {
                 ch.targetDepth  = double(srcRate) * double(bufMs) / 1000.0;
                 const double dt = rate ? double(frames) / double(rate) : 0.01;
                 ch.rate.configure(double(srcRate), ch.targetDepth, dt);
+                ch.resampler.configure(ch.baseRatio);
                 ch.priming = true;
             } else if (!stoppingFade && srcRate && bufMs != ch.lastBufferMs) {
                 // Same clock, new setpoint: the user moved the buffer slider.

@@ -42,7 +42,12 @@ bool TrayIcon::add(HWND owner, HICON icon, const wchar_t* tooltip) {
     // VERSION_4 gives richer callback packing and correct tooltip behaviour on
     // modern shells.
     data_.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &data_);
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &data_)) {
+        // The window handles VERSION_4 callbacks. A legacy icon would appear
+        // available but ignore its clicks, so use the existing retry fallback.
+        Shell_NotifyIconW(NIM_DELETE, &data_);
+        return false;
+    }
     added_ = true;
     return true;
 }

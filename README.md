@@ -328,6 +328,10 @@ Startup Apps. A manual launch repairs an existing registration after an update
 moves the executable. Saving a changed startup preference registers the current
 copy. If Explorer is not ready for the tray icon, the app retries and keeps the
 window accessible instead of silently hiding without an icon.
+Settings reads the current Windows startup state each time it opens. Saving
+unrelated preferences preserves changes made in Windows Startup Apps, and an
+update preserves an explicitly removed startup entry. Repeated `--tray` launches
+stay hidden; a manual second launch waits for the existing mixer to be ready.
 
 ## Design notes
 
@@ -357,6 +361,12 @@ and `Ki = 1/(4·fs·Tp²)` then yields ζ = 1 — critically damped, no overshoo
 creeps rather than steps regardless of controller state, and the depth
 measurement is low-passed at 0.5 s because instantaneous depth jumps by a whole
 packet every period.
+
+When a device's nominal rate exceeds the destination rate (for example 96 or
+192 kHz capture into the 48 kHz mix), a low-pass filter removes frequencies
+above the destination's usable bandwidth before resampling. Its coefficients
+stay fixed during clock correction. Ordinary same-rate drift correction keeps
+the existing interpolation path.
 
 This part is covered by tests that run without any audio hardware
 (`scripts/run_tests.sh`), plus the Windows `source-drift` and `output-bus`

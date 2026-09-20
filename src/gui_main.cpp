@@ -12,6 +12,7 @@
 #include "ui/Theme.h"
 #include "ui/TrayIcon.h"
 #include "util/Log.h"
+#include "util/SingleInstance.h"
 #include "util/Startup.h"
 
 #include <windows.h>
@@ -57,6 +58,7 @@ struct App {
     bool             engineRunning = false;
     bool             occluded = false;
     bool             quitting = false;
+    bool             ready = false;
     bool             configDirty = false;
     bool             saveFailureLogged = false;
     unsigned         consecutiveBeginFailures = 0;
@@ -191,7 +193,14 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!requestTrayIcon(*app) && !app->visible) showWindow(*app);
         return 0;
     }
-    if (g_showMessage && msg == g_showMessage && app) { showWindow(*app); return 0; }
+    if (g_showMessage && msg == g_showMessage && app) {
+        if (!app->ready || app->quitting) return 0;
+        // Acknowledge before renderer creation, which may take a while. This
+        // also tells a concurrent launcher that initialization has finished.
+        ReplyMessage(1);
+        showWindow(*app);
+        return 1;
+    }
     if (g_exitForUpdateMessage && msg == g_exitForUpdateMessage && app) {
         LOG_INFO("application: exiting for an update");
         saveConfigIfDirty(*app, true);
@@ -323,7 +332,11 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Delete the icon while the owning HWND is still alive; a
             // NIM_DELETE against a dead window leaves a ghost icon in the
             // notification area until the user hovers over it.
-            if (app) app->tray.remove();
+            if (app) {
+                app->quitting = true;
+                app->ready = false;
+                app->tray.remove();
+            }
             KillTimer(hwnd, kTrayRetryTimer);
             PostQuitMessage(0);
             return 0;
@@ -351,12 +364,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     g_exitForUpdateMessage = RegisterWindowMessageW(L"AudioMonitor.ExitForUpdate");
     const bool trayLaunch = commandLineHas(L"--tray");
 
-    // Single instance: a second launch just raises the first one's window.
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, kMutexName);
-    if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        AllowSetForegroundWindow(ASFW_ANY);
-        PostMessageW(HWND_BROADCAST, g_showMessage, 0, 0);
-        return 0;
+    // Retain ownership through App destruction, even after its window closes.
+    SingleInstance instance;
+    const auto launch = instance.enter(kMutexName, kWindowClass, g_showMessage, trayLaunch);
+    if (launch == SingleInstance::Result::Existing) return 0;
+    if (launch == SingleInstance::Result::Error) {
+        const auto message = instance.error() == ERROR_TIMEOUT
+            ? std::wstring(L"Audio Monitor is still starting or shutting down. Please try opening it again in a moment.")
+            : L"Audio Monitor could not check whether another copy is running (Windows error " +
+              std::to_wstring(instance.error()) + L").";
+        MessageBoxW(nullptr, message.c_str(), kWindowTitle, MB_OK | MB_ICONERROR);
+        return 1;
     }
 
     // MTA, deliberately, and it matters.
@@ -435,6 +453,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         }
     }
 
+    app.ready = true;
     if (!startHidden) showWindow(app);
 
     app.lastFrame = std::chrono::steady_clock::now();
@@ -533,7 +552,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     app.tray.remove();
     log::shutdown();
 
-    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
     CoUninitialize();
     return 0;
 }
