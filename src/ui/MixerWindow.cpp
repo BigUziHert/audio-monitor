@@ -809,17 +809,25 @@ void MixerWindow::setVisible(bool visible) {
     if (visible_ == visible)
         return;
     visible_ = visible;
-    resetDropoutTracking();
     if (!visible_) {
         keybindTarget_ = -1;
         captureCancelRequested_ = true;
     }
     meteringStartAttempted_ = false;
-    // A hidden dashboard has no frame clock. Discard its old display history
-    // on re-entry, while ordinary Start/Stop clicks keep that history intact.
+    resetVisualization();
+    // Keep monitored audio alive in the tray. With forwarding stopped there
+    // are no visible meters, so release capture until the dashboard returns.
+    if (!visible_ && engine_ && !engine_->monitoring())
+        engine_->stop();
+}
+void MixerWindow::resetVisualization() {
+    // Hidden and occluded dashboards have no frame clock. Discard old display
+    // history on re-entry, while ordinary Start/Stop clicks keep it intact.
     meters_ = {};
     outputMeter_ = {};
     spectrum_ = Spectrum{};
+    clippingTimer_ = 0;
+    resetDropoutTracking();
     statusRefreshTimer_ = 0;
     spectrumRefreshTimer_ = 0;
     lastStatusMonitoring_ = false;
@@ -836,10 +844,6 @@ void MixerWindow::setVisible(bool visible) {
         }
         engine_->visualSamples().dropAllFromConsumer();
     }
-    // Keep monitored audio alive in the tray. With forwarding stopped there
-    // are no visible meters, so release capture until the dashboard returns.
-    if (!visible_ && engine_ && !engine_->monitoring())
-        engine_->stop();
 }
 void MixerWindow::shutdown() {
     hotkeys_.clear();

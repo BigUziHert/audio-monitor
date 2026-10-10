@@ -17,6 +17,8 @@ class MixerWindow {
   public:
     void init(AudioEngine *engine, Config *config, void *window);
     void setVisible(bool visible);
+    // UI-thread re-entry after skipped frames; leaves the audio session alone.
+    void resetVisualization();
     void shutdown();
     static constexpr uintptr_t kUpdateWorkTimer = 2;
     void pollUpdates();

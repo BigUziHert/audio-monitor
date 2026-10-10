@@ -106,6 +106,20 @@ struct MixerWindowTestAccess {
     static float sourceMeterLevelDb(const MixerWindow &mixer, size_t source) {
         return mixer.meters_.at(source).levelDb();
     }
+    static bool visualizationSilent(const MixerWindow &mixer) {
+        const auto meterSilent = [](const MeterBallistics &meter) {
+            return meter.levelDb() == kMeterFloorDb && meter.holdDb() == kMeterFloorDb &&
+                   !meter.clipped();
+        };
+        return std::all_of(mixer.meters_.begin(), mixer.meters_.end(), meterSilent) &&
+               meterSilent(mixer.outputMeter_) && mixer.clippingTimer_ == 0.f &&
+               std::all_of(mixer.spectrum_.levels.begin(), mixer.spectrum_.levels.end(),
+                           [](float level) { return level == kMeterFloorDb; });
+    }
+    static bool spectrumHasActivity(const MixerWindow &mixer) {
+        return std::any_of(mixer.spectrum_.levels.begin(), mixer.spectrum_.levels.end(),
+                           [](float level) { return level > kMeterFloorDb; });
+    }
     static void resetSourceMeters(MixerWindow &mixer) { mixer.meters_ = {}; }
     static uint64_t statusEvaluationCount(const MixerWindow &mixer) {
         return mixer.statusEvaluationCount_;
@@ -302,6 +316,75 @@ int main() {
                "Status work was not capped near 5 Hz");
         expect(spectrumUpdates >= 58 && spectrumUpdates <= 61,
                "Spectrum work was not capped near 30 Hz");
+
+        // DXGI occlusion skips draws while capture continues. Audio may stop
+        // before recovery, leaving both queued samples and max-since-read peaks
+        // from the covered interval. Visibility never changes in this path.
+        for (bool monitoring : {false, true}) {
+            AudioEngineTestAccess::setMonitoringState(engine, monitoring);
+            mixer.resetVisualization();
+            auto &visual = engine.visualSamples();
+            auto publishSamples = [&](uint32_t count, bool active) {
+                expect(visual.beginWrite() >= count, "Occlusion fixture exhausted its visual queue");
+                for (uint32_t sample = 0; sample < count; ++sample) {
+                    const float value = active ? .8f * std::sin(6.283185307f *
+                        1000.f * float(sample) / float(OutputBus::kSourceSampleRate)) : 0.f;
+                    visual.writeFrame(sample, value, value);
+                }
+                visual.endWrite(count);
+            };
+            // Establish real display ballistics, clip holds, and FFT history.
+            engine.channelPeak(0).l.publish(1.1f);
+            engine.outputPeak().r.publish(1.1f);
+            publishSamples(static_cast<uint32_t>(Spectrum::kSize), true);
+            frame(1600, 986);
+            expect(ui::MixerWindowTestAccess::sourceMeterLevelDb(mixer, 0) > kMeterFloorDb,
+                   "Occlusion fixture did not establish source meter history");
+            expect(!monitoring || ui::MixerWindowTestAccess::spectrumHasActivity(mixer),
+                   "Occlusion fixture did not establish spectrum history");
+            ui::MixerWindowTestAccess::refreshDropoutStatus(mixer, StreamState::Running, 10, 10);
+            ui::MixerWindowTestAccess::refreshDropoutStatus(mixer, StreamState::Running, 11, 10);
+
+            // No draw calls: activity accumulates, then silence arrives before
+            // occlusion ends. Publishing zero cannot clear pending maxima.
+            publishSamples(static_cast<uint32_t>(Spectrum::kSize), true);
+            publishSamples(480, false);
+            for (int source = 0; source < kMaxSources; ++source) {
+                engine.channelPeak(source).l.publish(.8f);
+                engine.channelPeak(source).r.publish(1.1f);
+                engine.channelPeak(source).l.publish(0.f);
+                engine.channelPeak(source).r.publish(0.f);
+            }
+            for (int output = 0; output < kMaxOutputs; ++output) {
+                engine.outputPeak(output).l.publish(1.1f);
+                engine.outputPeak(output).r.publish(.8f);
+                engine.outputPeak(output).l.publish(0.f);
+                engine.outputPeak(output).r.publish(0.f);
+            }
+            mixer.resetVisualization();
+            expect(engine.running() && engine.monitoring() == monitoring,
+                   "Occlusion recovery changed the capture or monitoring state");
+            expect(visual.depth() == 0, "Occlusion recovery retained stale visualization samples");
+            expect(ui::MixerWindowTestAccess::visualizationSilent(mixer) &&
+                       ui::MixerWindowTestAccess::dropoutTrackingReset(mixer),
+                   "Occlusion recovery retained meter, spectrum, or warning history");
+            // Small fresh batches also expose an FFT implementation that clears
+            // displayed bands but retains samples inside its analysis window.
+            for (int resumedFrame = 0; resumedFrame < 6; ++resumedFrame) {
+                publishSamples(480, false);
+                frame(1600, 986);
+                expect(ui::MixerWindowTestAccess::visualizationSilent(mixer),
+                       "Resumed dashboard displayed audio from before occlusion recovery");
+            }
+            for (int source = 0; source < kMaxSources; ++source)
+                expect(engine.channelPeak(source).l.take() == 0.f &&
+                           engine.channelPeak(source).r.take() == 0.f,
+                       "Occlusion recovery retained a pending source peak");
+            for (int output = 0; output < kMaxOutputs; ++output)
+                expect(engine.outputPeak(output).l.take() == 0.f &&
+                           engine.outputPeak(output).r.take() == 0.f,
+                       "Occlusion recovery retained a pending output peak");
+        }
 
         // Exercise the actual Start/Stop Monitoring button, including its
         // release frame: a reset there visibly freezes or blanks the meter.

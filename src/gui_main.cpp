@@ -95,6 +95,7 @@ void showWindow(App& app) {
         return;
     }
     app.visible = true;
+    if (app.occluded) app.mixer.resetVisualization();
     app.occluded = false;
     app.mixer.setVisible(true);
     if (!wasIconic) ShowWindow(app.hwnd, SW_SHOW);
@@ -500,6 +501,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                         std::chrono::milliseconds(kOccludedPollMilliseconds);
                     continue;
                 }
+                app.mixer.resetVisualization();
                 app.occluded = false;
                 app.lastFrame = std::chrono::steady_clock::now();
                 app.framePacer.reset(app.lastFrame);
