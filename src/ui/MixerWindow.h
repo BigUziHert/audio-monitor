@@ -99,6 +99,8 @@ class MixerWindow {
     bool capturedKeybindChanged_ = false;
     std::string keybindError_;
     std::string captureError_;
+    bool keybindPickerOpen_ = false;
+    char keybindSearch_[128]{};
     int editSource_ = -1;
     size_t selectedOutput_ = 0;
     int editOutput_ = 0; // -1 while adding a destination

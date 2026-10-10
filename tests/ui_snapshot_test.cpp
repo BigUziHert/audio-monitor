@@ -136,6 +136,10 @@ struct MixerWindowTestAccess {
         mixer.settingsPage_ = page;
         mixer.openSettings_ = true;
     }
+    static void openKeybindPicker(MixerWindow& mixer) {
+        mixer.keybindPickerOpen_ = true;
+        mixer.keybindSearch_[0] = '\0';
+    }
     static void showUpdate(MixerWindow& mixer, bool downloaded) {
         openSettings(mixer, 4);
         mixer.updateResult_.status = updates::UpdateStatus::Available;
@@ -310,6 +314,8 @@ enum class Scene {
     AudioSettings,
     GeneralSettings,
     KeybindSettings,
+    KeybindSettingsEmpty,
+    KeybindDevicePicker,
     About,
     UpdateDownloading,
     UpdateDownloaded,
@@ -337,6 +343,17 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
 
     AudioEngine engine;
     Config config = syntheticConfig(shot.theme);
+    if (shot.scene == Scene::KeybindSettings || shot.scene == Scene::KeybindDevicePicker) {
+        config.monitoringKeybind = {MOD_CONTROL | MOD_SHIFT, 'M'};
+        config.sources[2].keybindEnabled = true;
+        config.sources[2].muteKeybind = {MOD_CONTROL | MOD_SHIFT, 'U'};
+        if (shot.scene == Scene::KeybindDevicePicker) {
+            config.sources = {config.sources[0], config.sources[2]};
+            config.additionalOutputs.clear();
+        } else {
+            config.sources[0].keybindEnabled = true;
+        }
+    }
     AudioEngineTestAccess::prepareIdleSession(engine, config);
     ui::MixerWindow mixer;
     ui::MixerWindowTestAccess::bindSynthetic(mixer, engine, config);
@@ -347,7 +364,11 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
         case Scene::FocusedPercentage: break;
         case Scene::AudioSettings: ui::MixerWindowTestAccess::openSettings(mixer, 0); break;
         case Scene::GeneralSettings: ui::MixerWindowTestAccess::openSettings(mixer, 1); break;
-        case Scene::KeybindSettings: ui::MixerWindowTestAccess::openSettings(mixer, 3); break;
+        case Scene::KeybindSettings:
+        case Scene::KeybindSettingsEmpty:
+        case Scene::KeybindDevicePicker:
+            ui::MixerWindowTestAccess::openSettings(mixer, 3);
+            break;
         case Scene::About: ui::MixerWindowTestAccess::openSettings(mixer, 4); break;
         case Scene::UpdateDownloading: ui::MixerWindowTestAccess::showUpdate(mixer, false); break;
         case Scene::UpdateDownloaded: ui::MixerWindowTestAccess::showUpdate(mixer, true); break;
@@ -416,6 +437,15 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
                               ImGui::GetCurrentContext()->NavId == expected &&
                               ImGui::GetCurrentContext()->NavCursorVisible;
         }
+    } else if (rendered && shot.scene == Scene::KeybindDevicePicker) {
+        ui::MixerWindowTestAccess::openKeybindPicker(mixer);
+        rendered = drawFrame();
+        for (auto* candidate : ImGui::GetCurrentContext()->Windows)
+            if (candidate->Active && std::strstr(candidate->Name, "/Keybind list_")) {
+                ImGui::SetScrollY(candidate, candidate->ScrollMax.y);
+                break;
+            }
+        if (rendered) rendered = drawFrame();
     } else if (rendered) {
         rendered = drawFrame();
     }
@@ -495,6 +525,12 @@ int main() {
         {L"settings-general-dark-1440x890.bmp", ColorTheme::Dark, Scene::GeneralSettings, 1440, 890},
         {L"settings-keybinds-dark-1440x890.bmp", ColorTheme::Dark, Scene::KeybindSettings, 1440, 890},
         {L"settings-keybinds-light-1440x890.bmp", ColorTheme::Light, Scene::KeybindSettings, 1440, 890},
+        {L"settings-keybinds-empty-dark-1440x890.bmp", ColorTheme::Dark,
+         Scene::KeybindSettingsEmpty, 1440, 890},
+        {L"settings-keybinds-picker-dark-1440x890.bmp", ColorTheme::Dark,
+         Scene::KeybindDevicePicker, 1440, 890},
+        {L"settings-keybinds-picker-light-1440x890.bmp", ColorTheme::Light,
+         Scene::KeybindDevicePicker, 1440, 890},
         {L"settings-about-dark-1440x890.bmp", ColorTheme::Dark, Scene::About, 1440, 890},
         {L"update-downloading-dark-1440x890.bmp", ColorTheme::Dark, Scene::UpdateDownloading, 1440, 890},
         {L"update-ready-dark-1440x890.bmp", ColorTheme::Dark, Scene::UpdateDownloaded, 1440, 890},
@@ -506,6 +542,8 @@ int main() {
         {L"update-downloading-light-960x600.bmp", ColorTheme::Light, Scene::UpdateDownloading, 960, 600},
         {L"update-ready-light-960x600.bmp", ColorTheme::Light, Scene::UpdateDownloaded, 960, 600},
         {L"settings-keybinds-light-960x600.bmp", ColorTheme::Light, Scene::KeybindSettings, 960, 600},
+        {L"settings-keybinds-picker-light-960x600.bmp", ColorTheme::Light,
+         Scene::KeybindDevicePicker, 960, 600},
     };
 
     int failures = 0;

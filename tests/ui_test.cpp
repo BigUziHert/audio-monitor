@@ -77,6 +77,7 @@ struct MixerWindowTestAccess {
         return mixer.capturedKeybind_;
     }
     static int keybindTarget(const MixerWindow &mixer) { return mixer.keybindTarget_; }
+    static bool keybindPickerOpen(const MixerWindow &mixer) { return mixer.keybindPickerOpen_; }
     static void captureKeybind(MixerWindow &mixer, uint32_t key, uint32_t modifiers,
                                bool repeated = false) {
         mixer.captureKeybind(key, modifiers, repeated);
@@ -205,9 +206,10 @@ int main() {
         };
         expect(config.monitoringKeybind == Keybind{} &&
                    config.output.muteKeybind == Keybind{} &&
+                   !config.output.keybindEnabled &&
                    std::all_of(config.sources.begin(), config.sources.end(),
                                [](const ChannelConfig &source) {
-                                   return source.muteKeybind == Keybind{};
+                                   return source.muteKeybind == Keybind{} && !source.keybindEnabled;
                                }),
                "Initial monitoring or device keybind was not blank");
         auto popup = []() -> ImGuiWindow * {
@@ -1021,7 +1023,7 @@ int main() {
                    a.processPath == b.processPath && a.deviceId == b.deviceId &&
                    a.deviceNameMatch == b.deviceNameMatch && a.icon == b.icon &&
                    a.gain == b.gain && a.volume == b.volume && a.muted == b.muted &&
-                   a.muteKeybind == b.muteKeybind;
+                   a.muteKeybind == b.muteKeybind && a.keybindEnabled == b.keybindEnabled;
         };
 
         click(1480, 618); // Add Output.
@@ -1644,12 +1646,20 @@ int main() {
         // Capture shortcuts through the real modal and keep them staged until
         // Settings is saved. No global keys or audio devices are opened.
         config.monitoringKeybind = {};
-        for (auto &source : config.sources) source.muteKeybind = {};
-        for (size_t i = 0; i < config.outputCount(); ++i) config.outputAt(i).muteKeybind = {};
+        for (auto &source : config.sources) {
+            source.muteKeybind = {};
+            source.keybindEnabled = false;
+        }
+        for (size_t i = 0; i < config.outputCount(); ++i) {
+            config.outputAt(i).muteKeybind = {};
+            config.outputAt(i).keybindEnabled = false;
+        }
+        config.sources[0].label = "Shortcut find-only-first";
         auto openKeybindSettings = [&] {
             click(670, 900);
             if (auto *settings = popup())
                 click(settings->DC.CursorStartPos.x + 80, settings->DC.CursorStartPos.y + 291);
+            frame(1600, 986); // The Keybinds category has a wider layout.
             expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
                        ui::MixerWindowTestAccess::settingsPage(mixer) == 3,
                    "Could not open Keybinds settings");
@@ -1659,22 +1669,99 @@ int main() {
                 if (window->Active && std::strstr(window->Name, "/Keybind list_")) return window;
             return nullptr;
         };
-        auto clickKeybindRow = [&](int target, bool clear = false) {
+        auto activateKeybindItem = [&](ImGuiWindow *window, ImGuiID id) {
+            expect(window && id, "Keybind control is missing");
+            if (!window || !id) return;
+            ImGui::SetNavWindow(window);
+            ImGui::SetNavID(id, ImGuiNavLayer_Main, window->NavRootFocusScopeId, ImRect());
+            ImGui::ActivateItemByID(id);
+            frame(1600, 986);
+            frame(1600, 986);
+        };
+        auto keybindDevice = [&](int target) -> ChannelConfig & {
+            auto &draft = ui::MixerWindowTestAccess::settingsDraft(mixer);
+            return target <= kMaxSources ? draft.sources.at(target - 1)
+                                         : draft.outputAt(target - 1 - kMaxSources);
+        };
+        auto hasKeybindCard = [](const ChannelConfig &device) {
+            return device.keybindEnabled || !(device.muteKeybind == Keybind{});
+        };
+        auto visibleKeybindTargets = [&] {
+            std::vector<int> targets;
+            const auto &draft = ui::MixerWindowTestAccess::settingsDraft(mixer);
+            for (size_t i = 0; i < draft.sources.size(); ++i)
+                if (hasKeybindCard(draft.sources[i])) targets.push_back(1 + static_cast<int>(i));
+            for (size_t i = 0; i < draft.outputCount(); ++i)
+                if (hasKeybindCard(draft.outputAt(i)))
+                    targets.push_back(1 + kMaxSources + static_cast<int>(i));
+            return targets;
+        };
+        auto activateKeybindRow = [&](int target, const char *label) {
+            auto *settings = ImGui::FindWindowByName("Settings");
+            if (target == 0) {
+                expect(settings != nullptr, "Settings missing for monitoring shortcut");
+                if (!settings) return;
+                const ImGuiID scope = ImHashData(&target, sizeof(target), settings->GetID("settings-dialog"));
+                activateKeybindItem(settings, ImHashStr(label, 0, scope));
+                return;
+            }
             auto *list = keybindList();
             expect(list != nullptr, "Keybind list is missing");
             if (!list) return;
-            const int ordinal = target <= kMaxSources ? target :
-                static_cast<int>(ui::MixerWindowTestAccess::settingsDraft(mixer).sources.size()) +
-                    target - kMaxSources;
-            const float rowStep = 96.f + ImGui::GetStyle().ItemSpacing.y;
-            ImGui::SetScrollY(list, std::max(0.f, ordinal * rowStep - 100.f));
+            const auto targets = visibleKeybindTargets();
+            const auto found = std::find(targets.begin(), targets.end(), target);
+            expect(found != targets.end(), "Requested shortcut card has not been added");
+            if (found == targets.end()) return;
+            const float ordinal = static_cast<float>(found - targets.begin());
+            ImGui::SetScrollY(list, std::max(0.f, ordinal * 140.f - 60.f));
             frame(1600, 986);
-            click(list->DC.CursorStartPos.x + (clear ? list->WorkRect.GetWidth() - 38.f : 30.f),
-                  list->DC.CursorStartPos.y + ordinal * rowStep + 56.f);
+            activateKeybindItem(list, ImHashStr(label, 0, list->GetID(target)));
+        };
+        auto clickKeybindRow = [&](int target, bool clear = false) {
+            activateKeybindRow(target, clear ? "Clear keybind" : "Set keybind");
             if (!clear)
                 expect(popup() && std::strcmp(popup()->Name, "Set keybind") == 0 &&
                            ui::MixerWindowTestAccess::keybindTarget(mixer) == target,
                        "A shortcut field opened the wrong capture target");
+        };
+        auto openKeybindPicker = [&] {
+            if (ui::MixerWindowTestAccess::keybindPickerOpen(mixer)) return;
+            auto *list = keybindList();
+            expect(list != nullptr, "Keybind list is missing for Add Device");
+            if (!list) return;
+            ImGui::SetScrollY(list, list->ScrollMax.y);
+            frame(1600, 986);
+            activateKeybindItem(list, list->GetID("Add keybind device"));
+            expect(ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+                   "Add Device did not open the shortcut device picker");
+        };
+        auto chooseKeybindDevice = [&](int target) {
+            auto *list = keybindList();
+            expect(list && ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+                   "Shortcut device picker is not open");
+            if (!list) return;
+            // Device rows have stable target IDs even when the list is filtered.
+            const ImGuiID scope = ImHashData(&target, sizeof(target), list->GetID("device-picker"));
+            activateKeybindItem(list, ImHashStr("Add device shortcut", 0, scope));
+        };
+        auto clickKeybindPickerRow = [&](int visibleOrdinal) {
+            auto *list = keybindList();
+            expect(list && ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+                   "Shortcut device picker is not open for mouse selection");
+            if (!list) return;
+            const size_t cards = visibleKeybindTargets().size();
+            const float pickerY = (cards ? float(cards) * 140.f : 84.f) + 56.f;
+            const float rowCenter = pickerY + 90.f + float(visibleOrdinal) * 64.f + 31.f;
+            ImGui::SetScrollY(list, std::max(0.f, rowCenter - list->InnerRect.GetHeight() * .5f));
+            frame(1600, 986);
+            click(list->DC.CursorStartPos.x + 100.f, list->DC.CursorStartPos.y + rowCenter);
+        };
+        auto addKeybindDevice = [&](int target) {
+            openKeybindPicker();
+            chooseKeybindDevice(target);
+            expect(keybindDevice(target).keybindEnabled &&
+                       keybindDevice(target).muteKeybind == Keybind{},
+                   "Selecting a device did not add one unassigned shortcut card");
         };
         auto closeCapture = [&](bool accept) {
             auto *capture = popup();
@@ -1691,12 +1778,32 @@ int main() {
                    "Capture did not return to Settings");
         };
         auto closeKeybindSettings = [&](bool save) {
-            if (auto *settings = popup())
-                click(settings->DC.CursorStartPos.x + (save ? 633.f : 453.f),
-                      settings->DC.CursorStartPos.y + 716);
+            if (auto *settings = ImGui::FindWindowByName("Settings"))
+                activateKeybindItem(settings, ImHashStr(save ? "Save settings" : "Cancel settings", 0,
+                                                       settings->GetID("settings-dialog")));
         };
         const Keybind monitoringShortcut{MOD_CONTROL | MOD_ALT, 'M'};
         openKeybindSettings();
+        expect(visibleKeybindTargets().empty(), "Unselected devices were automatically shown as shortcut cards");
+        openKeybindPicker();
+        if (auto *list = keybindList()) {
+            activateKeybindItem(list, ImHashStr("##Search keybind devices", 0,
+                                               list->GetID("device-picker")));
+            io.AddInputCharactersUTF8("FiNd-OnLy-FiRsT");
+            frame(1600, 986);
+            frame(1600, 986);
+        }
+        chooseKeybindDevice(2);
+        expect(!keybindDevice(2).keybindEnabled &&
+                   ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+               "Search left an unmatched device selectable");
+        clickKeybindPickerRow(0);
+        expect(keybindDevice(1).keybindEnabled &&
+                   !ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+               "Case-insensitive device search did not select its matching device");
+        activateKeybindRow(1, "Remove keybind device");
+        expect(visibleKeybindTargets().empty(),
+               "Removing the only shortcut card did not return to the empty state");
         clickKeybindRow(0);
         ui::MixerWindowTestAccess::captureKeybind(mixer, VK_LCONTROL, MOD_CONTROL);
         ui::MixerWindowTestAccess::captureKeybind(mixer, 'M', MOD_CONTROL | MOD_ALT, true);
@@ -1740,9 +1847,12 @@ int main() {
         expect(ui::MixerWindowTestAccess::settingsDraft(mixer).monitoringKeybind == monitoringShortcut &&
                    config.monitoringKeybind == Keybind{},
                "Accepting a capture did not remain staged in Settings");
+        addKeybindDevice(1);
+        expect(!config.sources[0].keybindEnabled,
+               "Adding a shortcut device changed live settings before Save");
         closeKeybindSettings(false);
-        expect(!popup() && config.monitoringKeybind == Keybind{},
-               "Cancel Settings saved a staged shortcut");
+        expect(!popup() && config.monitoringKeybind == Keybind{} && !config.sources[0].keybindEnabled,
+               "Cancel Settings saved a staged shortcut or added device");
 
         // Independent source/output bindings must not overwrite runtime mute
         // changes or refreshed endpoint IDs made while Settings remains open.
@@ -1761,6 +1871,26 @@ int main() {
             closeCapture(true);
         };
         assignShortcut(0, monitoringShortcut);
+        addKeybindDevice(1);
+        openKeybindPicker();
+        chooseKeybindDevice(1);
+        expect(ui::MixerWindowTestAccess::keybindPickerOpen(mixer) &&
+                   visibleKeybindTargets() == std::vector<int>{1},
+               "An already-added device was selectable or duplicated its shortcut card");
+        addKeybindDevice(2);
+        addKeybindDevice(1 + kMaxSources);
+        addKeybindDevice(2 + kMaxSources);
+        activateKeybindRow(2 + kMaxSources, "Remove keybind device");
+        expect(keybindList() && keybindList()->Scroll.y > 0.f &&
+                   !keybindDevice(2 + kMaxSources).keybindEnabled &&
+                   visibleKeybindTargets().size() == 3,
+               "Removing a fourth shortcut card failed after scrolling");
+        openKeybindPicker();
+        clickKeybindPickerRow(static_cast<int>(config.sources.size()) + 1);
+        expect(keybindDevice(2 + kMaxSources).keybindEnabled &&
+                   visibleKeybindTargets().size() == 4 &&
+                   !ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+               "Mouse selection could not re-add an output from the scrolled device picker");
         assignShortcut(1, firstSourceShortcut);
         assignShortcut(2, secondSourceShortcut);
         assignShortcut(1 + kMaxSources, firstOutputShortcut);
@@ -1775,7 +1905,9 @@ int main() {
                    config.sources[0].muteKeybind == firstSourceShortcut &&
                    config.sources[1].muteKeybind == secondSourceShortcut &&
                    config.outputAt(0).muteKeybind == firstOutputShortcut &&
-                   config.outputAt(1).muteKeybind == secondOutputShortcut,
+                   config.outputAt(1).muteKeybind == secondOutputShortcut &&
+                   config.sources[0].keybindEnabled && config.sources[1].keybindEnabled &&
+                   config.outputAt(0).keybindEnabled && config.outputAt(1).keybindEnabled,
                "Save did not retain independent monitoring, source and output shortcuts");
         expect(config.sources[0].muted && !config.sources[1].muted &&
                    config.outputAt(0).muted && !config.outputAt(1).muted &&
@@ -1806,6 +1938,59 @@ int main() {
                    config.monitoringKeybind == Keybind{} && config.bufferMillis == bufferBeforeDuplicate,
                "A duplicate shortcut partially committed the settings draft");
         closeKeybindSettings(false);
+
+        // Older configurations can contain a binding without the opt-in flag.
+        // Clearing those bindings must keep the card available for reassignment.
+        config.sources[0].keybindEnabled = false;
+        openKeybindSettings();
+        const auto legacyTargets = visibleKeybindTargets();
+        expect(std::find(legacyTargets.begin(), legacyTargets.end(), 1) != legacyTargets.end(),
+               "A legacy device binding was hidden from the shortcut list");
+        clickKeybindRow(1, true);
+        expect(keybindDevice(1).keybindEnabled && keybindDevice(1).muteKeybind == Keybind{},
+               "Clearing a legacy binding removed its shortcut card");
+        closeKeybindSettings(false);
+        expect(config.sources[0].muteKeybind == firstSourceShortcut && !config.sources[0].keybindEnabled,
+               "Cancel committed a cleared legacy device binding");
+
+        openKeybindSettings();
+        clickKeybindRow(2, true);
+        expect(keybindDevice(2).keybindEnabled && keybindDevice(2).muteKeybind == Keybind{} &&
+                   config.sources[1].muteKeybind == secondSourceShortcut,
+               "Clear removed a selected card or changed the live device binding");
+        closeKeybindSettings(true);
+        expect(config.sources[1].keybindEnabled && config.sources[1].muteKeybind == Keybind{},
+               "Save lost an added device with an unassigned shortcut");
+        openKeybindSettings();
+        const auto clearedTargets = visibleKeybindTargets();
+        expect(std::find(clearedTargets.begin(), clearedTargets.end(), 2) != clearedTargets.end(),
+               "Reopening Settings hid an added device whose shortcut was cleared");
+        activateKeybindRow(2, "Remove keybind device");
+        expect(!keybindDevice(2).keybindEnabled && keybindDevice(2).muteKeybind == Keybind{},
+               "Removing an unassigned shortcut card kept its opt-in state");
+        closeKeybindSettings(false);
+        expect(config.sources[1].keybindEnabled,
+               "Cancel committed a removed shortcut device");
+
+        const size_t sourcesBeforeShortcutRemoval = config.sources.size();
+        const size_t outputsBeforeShortcutRemoval = config.outputCount();
+        const auto outputIdBeforeShortcutRemoval = config.outputAt(1).deviceId;
+        openKeybindSettings();
+        activateKeybindRow(2, "Remove keybind device");
+        activateKeybindRow(2 + kMaxSources, "Remove keybind device");
+        expect(!keybindDevice(2 + kMaxSources).keybindEnabled &&
+                   keybindDevice(2 + kMaxSources).muteKeybind == Keybind{} &&
+                   config.outputAt(1).muteKeybind == secondOutputShortcut,
+               "Removing an assigned output did not stage both its card and shortcut removal");
+        closeKeybindSettings(true);
+        expect(!config.sources[1].keybindEnabled && !config.outputAt(1).keybindEnabled &&
+                   config.sources[1].muteKeybind == Keybind{} &&
+                   config.outputAt(1).muteKeybind == Keybind{} &&
+                   config.sources.size() == sourcesBeforeShortcutRemoval &&
+                   config.outputCount() == outputsBeforeShortcutRemoval &&
+                   config.outputAt(1).deviceId == outputIdBeforeShortcutRemoval &&
+                   config.sources[0].muteKeybind == firstSourceShortcut,
+               "Removing shortcut cards altered audio routes or retained removed bindings");
 
         // Exercise the same action dispatcher used by WM_HOTKEY, with a
         // deterministic running engine instead of reserving global OS keys.

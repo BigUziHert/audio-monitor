@@ -120,17 +120,42 @@ int main() {
           "version 7 writes the default dark theme string");
     const Config defaultKeybindConfig = Config::defaults();
     check(Config{}.monitoringKeybind.empty() && ChannelConfig{}.muteKeybind.empty() &&
+              !ChannelConfig{}.keybindEnabled &&
               defaultKeybindConfig.monitoringKeybind == Keybind{} &&
               std::all_of(defaultKeybindConfig.sources.begin(), defaultKeybindConfig.sources.end(),
-                          [](const ChannelConfig& source) { return source.muteKeybind == Keybind{}; }),
-          "new monitoring and channel keybinds are unassigned by default");
+                          [](const ChannelConfig& source) {
+                              return source.muteKeybind == Keybind{} && !source.keybindEnabled;
+                          }),
+          "new keybinds are unassigned and devices are not selected by default");
     check(c.monitoringKeybind == Keybind{} && c.output.muteKeybind == Keybind{} &&
               c.sources[0].muteKeybind == Keybind{},
           "legacy settings never acquire default keybinds");
     const auto blankKeybinds = Config::fromJson(defaultJson);
     check(blankKeybinds.monitoringKeybind == Keybind{} &&
-              blankKeybinds.sources[0].muteKeybind == Keybind{},
+              blankKeybinds.sources[0].muteKeybind == Keybind{} &&
+              !blankKeybinds.sources[0].keybindEnabled && !c.sources[0].keybindEnabled,
           "explicit blank keybinds remain blank after round-trip");
+    const auto migratedKeybinds = Config::fromJson(JsonValue::parse(
+        R"({"version":7,"sources":[{"muteKeybind":{"modifiers":2,"key":77}},{}],"outputs":[{"deviceId":"output","muteKeybind":{"modifiers":1,"key":120}}]})"));
+    check(migratedKeybinds.sources[0].keybindEnabled &&
+              migratedKeybinds.sources[0].muteKeybind == Keybind{MOD_CONTROL, 'M'} &&
+              !migratedKeybinds.sources[1].keybindEnabled &&
+              migratedKeybinds.output.keybindEnabled &&
+              migratedKeybinds.output.muteKeybind == Keybind{MOD_ALT, VK_F9},
+          "existing assigned source and output shortcuts migrate to selected device cards");
+    auto selectedKeybinds = Config::fromJson(JsonValue::parse(
+        R"({"sources":[{"keybindEnabled":true},{"keybindEnabled":false}],"outputs":[{"deviceId":"output","keybindEnabled":true}]})"));
+    selectedKeybinds = Config::fromJson(JsonValue::parse(selectedKeybinds.toJson().dump()));
+    check(selectedKeybinds.sources[0].keybindEnabled &&
+              selectedKeybinds.sources[0].muteKeybind.empty() &&
+              !selectedKeybinds.sources[1].keybindEnabled &&
+              selectedKeybinds.output.keybindEnabled && selectedKeybinds.output.muteKeybind.empty(),
+          "selected blank source and output cards survive serialization without acquiring a chord");
+    selectedKeybinds.sources[0].keybindEnabled = false;
+    selectedKeybinds.output.keybindEnabled = false;
+    const auto removedKeybinds = Config::fromJson(selectedKeybinds.toJson());
+    check(!removedKeybinds.sources[0].keybindEnabled && !removedKeybinds.output.keybindEnabled,
+          "removed blank shortcut cards stay absent after saving");
     for (const char* chord : {
              "null", "false", "5", "\"Ctrl+M\"", "[]", "{}",
              R"({"modifiers":2})", R"({"key":77})",
@@ -147,7 +172,8 @@ int main() {
         const auto invalidKeybind = Config::fromJson(JsonValue::parse(json));
         check(invalidKeybind.monitoringKeybind == Keybind{} &&
                   invalidKeybind.sources[0].muteKeybind == Keybind{} &&
-                  invalidKeybind.output.muteKeybind == Keybind{},
+                  invalidKeybind.output.muteKeybind == Keybind{} &&
+                  !invalidKeybind.sources[0].keybindEnabled && !invalidKeybind.output.keybindEnabled,
               "malformed keybind objects normalize to unassigned");
     }
     check(Config{}.outputCount() == 1, "bare Config preserves the legacy directly assigned output slot");

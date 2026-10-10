@@ -57,10 +57,14 @@ arrives over HDMI as a single feed.
   Close exits by default; Settings can make Close hide to the tray instead.
   Optional Windows startup and hidden manual launch remain available.
 - **Global keybinds.** In **Settings > Keybinds**, assign a shortcut to Start/Stop
-  Monitoring or to mute/unmute an individual source or output. Every keybind
-  starts blank. Shortcuts work while the app is in the tray and mute only audio
+  Monitoring, or use **Add Device** to choose a configured source or output
+  from a searchable list and give it a mute/unmute shortcut. Only added devices
+  appear as shortcut cards; existing assigned shortcuts carry over automatically.
+  Every new keybind starts blank. Shortcuts work while the app is in the tray and mute only audio
   forwarded by this app; they never change Windows device mute.
-  Use **Clear** to remove a shortcut, then **Save** to apply your changes.
+  Use **Clear** to unassign a shortcut while keeping its card, or the card's **×**
+  to remove it from Keybinds without removing the device from your mix.
+  **Save** applies your changes; **Cancel** discards them.
 
 Application capture requires **Windows build 20348 or later** (Windows 11
 recommended) and a Windows SDK that includes `audioclientactivationparams.h`.

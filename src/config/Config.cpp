@@ -87,6 +87,7 @@ JsonValue channelToJson(const ChannelConfig& c) {
     v.set("volume",     JsonValue(static_cast<double>(c.volume)));
     v.set("muted",      JsonValue(c.muted));
     v.set("muteKeybind", keybindToJson(c.muteKeybind));
+    v.set("keybindEnabled", JsonValue(c.keybindEnabled));
     return v;
 }
 
@@ -115,6 +116,10 @@ ChannelConfig channelFromJson(const JsonValue* v, const ChannelConfig& fallback)
     c.volume = volume ? static_cast<float>(volume->asNumber(fallback.volume)) : fallback.volume;
     c.muted  = mute ? mute->asBool(fallback.muted) : fallback.muted;
     c.muteKeybind = keybindFromJson(v->find("muteKeybind"));
+    if (auto x = v->find("keybindEnabled")) c.keybindEnabled = x->asBool(false);
+    // Existing assigned shortcuts remain visible when upgrading from the
+    // automatic device list. Explicit selection also preserves blank cards.
+    c.keybindEnabled = c.keybindEnabled || !c.muteKeybind.empty();
 
     if (!(c.gain >= 0.0f)) c.gain = 0.0f;      // also catches NaN
     if (c.gain > 4.0f)     c.gain = 4.0f;

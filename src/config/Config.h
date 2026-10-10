@@ -45,6 +45,7 @@ struct ChannelConfig {
     float        volume = 1.0f;    // dashboard volume, 0..1
     bool         muted = false;
     Keybind      muteKeybind;
+    bool         keybindEnabled = false; // include in device shortcuts, even before assigning a chord
 };
 
 inline float effectiveGain(const ChannelConfig& channel) noexcept {

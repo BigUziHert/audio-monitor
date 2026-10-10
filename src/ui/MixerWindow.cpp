@@ -160,10 +160,14 @@ void copyPreferences(Config &destination, const Config &source) {
 // Settings owns shortcuts, but live mute/fader values and resolved endpoint
 // identities may change while the modal is open.
 void copyDeviceKeybinds(Config &destination, const Config &source) {
-    for (size_t i = 0; i < std::min(destination.sources.size(), source.sources.size()); ++i)
+    for (size_t i = 0; i < std::min(destination.sources.size(), source.sources.size()); ++i) {
         destination.sources[i].muteKeybind = source.sources[i].muteKeybind;
-    for (size_t i = 0; i < std::min(destination.outputCount(), source.outputCount()); ++i)
+        destination.sources[i].keybindEnabled = source.sources[i].keybindEnabled;
+    }
+    for (size_t i = 0; i < std::min(destination.outputCount(), source.outputCount()); ++i) {
         destination.outputAt(i).muteKeybind = source.outputAt(i).muteKeybind;
+        destination.outputAt(i).keybindEnabled = source.outputAt(i).keybindEnabled;
+    }
 }
 
 enum Icon {
@@ -193,6 +197,9 @@ enum Icon {
     Info,
     Puzzle,
     Keyboard,
+    Key,
+    Search,
+    Up,
     Dot
 };
 struct IconChoice {
@@ -371,6 +378,21 @@ struct Canvas {
         case Down:
             l(7, 12, 16, 21);
             l(16, 21, 25, 12);
+            break;
+        case Up:
+            l(7, 21, 16, 12);
+            l(16, 12, 25, 21);
+            break;
+        case Search:
+            circle(13, 13, 8);
+            l(19, 19, 28, 28);
+            break;
+        case Key:
+            circle(21, 10, 7);
+            l(16, 15, 4, 27);
+            l(4, 27, 9, 28);
+            l(9, 28, 10, 23);
+            l(10, 23, 14, 23);
             break;
         case Check:
             l(7, 16, 13, 22, 3);
@@ -777,10 +799,12 @@ bool beginBoundedPopup(const char *name, float scale, ImVec2 minSize = {0, 0},
     constrainNextPopup(bounds, minSize, maxSize);
     return ImGui::BeginPopup(name, ImGuiWindowFlags_NoMove);
 }
-bool beginBoundedModal(const char *name, float width, float scale, ImGuiWindowFlags flags = 0) {
+bool beginBoundedModal(const char *name, float width, float scale, ImGuiWindowFlags flags = 0,
+                       bool keepCentered = false) {
     auto bounds = popupBounds(scale);
     ImGui::SetNextWindowSize({width * scale, 0}, ImGuiCond_Always);
-    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {.5f, .5f});
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            keepCentered ? ImGuiCond_Always : ImGuiCond_Appearing, {.5f, .5f});
     constrainNextPopup(bounds, {width * scale, 0}, {width * scale, FLT_MAX});
     return ImGui::BeginPopupModal(name, nullptr, ImGuiWindowFlags_AlwaysAutoResize | flags);
 }
@@ -2345,12 +2369,18 @@ bool MixerWindow::drawDialogs() {
         resetDevicesOnSave_ = false;
         keybindTarget_ = -1;
         captureCancelRequested_ = false;
+        keybindPickerOpen_ = false;
+        keybindSearch_[0] = '\0';
         ImGui::OpenPopup("Settings");
         openSettings_ = false;
     }
-    if (beginBoundedModal("Settings", 770, scale_,
-                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
-        constexpr float dialogW = 722.f, dialogH = 740.f;
+    // The device picker needs a wider workspace; other settings retain their
+    // compact layout. Keep the resized modal centered when switching pages.
+    const bool keybindPage = settingsPage_ == 3;
+    if (beginBoundedModal("Settings", keybindPage ? 1240.f : 770.f, scale_,
+                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove, true)) {
+        const float dialogW = keybindPage ? 1192.f : 722.f;
+        const float dialogH = keybindPage ? 886.f : 740.f;
         const ImVec2 start = ImGui::GetCursorScreenPos();
         Canvas c{ImGui::GetWindowDrawList(), start, scale_};
         ImGui::Dummy({dialogW * scale_, dialogH * scale_});
@@ -2411,16 +2441,19 @@ bool MixerWindow::drawDialogs() {
             const float y = 92 + i * 58.f;
             const bool selected = settingsPage_ == nav[i].page;
             if (selected)
-                c.rect(0, y, 158, 50, accentSurface, 9, false);
+                c.rect(0, y, keybindPage ? 218.f : 158.f, 50, accentSurface, 9, false);
             c.icon(nav[i].icon, 24, y + 25, selected ? purple : gray, 27);
             c.text(51, y + 12, nav[i].label, 19, selected ? accentText : white);
             ImGui::PushID(i + 1200);
-            if (c.hit("Settings page", 0, y, 158, 50))
+            if (c.hit("Settings page", 0, y, keybindPage ? 218.f : 158.f, 50))
                 settingsPage_ = nav[i].page;
             ImGui::PopID();
         }
 
-        c.rect(174, 90, 548, 574, panel, 14);
+        if (keybindPage)
+            c.line(244, 0, 244, 814, border, 1);
+        else
+            c.rect(174, 90, 548, 574, panel, 14);
         const float contentX = 196;
         if (settingsPage_ == 0) {
             c.icon(Wave, contentX + 10, 124, white, 27);
@@ -2528,28 +2561,53 @@ bool MixerWindow::drawDialogs() {
             c.centeredText(448, 327, "Work In Progress", 28, white);
             c.centeredText(448, 365, "Plugin support is currently being built.", 17, gray);
         } else if (settingsPage_ == 3) {
-            c.icon(Keyboard, contentX + 10, 124, white, 27);
-            c.text(contentX + 38, 107, "Keybinds", 21, white, true);
-            c.wrappedText(contentX, 148,
-                          "Shortcuts work in other apps and from the tray.\nAll bindings start unassigned.",
-                          20, gray, 504, 52);
+            constexpr float keybindX = 266, keybindW = 926;
+            c.rect(keybindX, 5, 56, 56, card, 10, false);
+            c.icon(Keyboard, keybindX + 28, 33, white, 31);
+            c.text(keybindX + 78, 4, "Keybinds", 29, white, true);
+            c.text(keybindX + 78, 43, "Shortcuts work in other apps and from the tray.", 20, gray);
             bool openCapture = false;
-            ImGui::SetCursorScreenPos(c.p(contentX, 218));
-            ImGui::BeginChild("Keybind list", {504 * scale_, 352 * scale_},
-                              ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoBackground);
-            const float rowWidth = ImGui::GetContentRegionAvail().x / scale_;
-            auto drawKeybind = [&](int target, const std::string &label, Keybind &binding) {
-                const ImVec2 position = ImGui::GetCursorScreenPos();
-                Canvas row{ImGui::GetWindowDrawList(), position, scale_};
+            auto drawKeybind = [&](const Canvas &row, int target, float x, float y, float width,
+                                   Keybind &binding) {
                 ImGui::PushID(target);
-                row.text(0, 0, label, 20, white, false, rowWidth);
-                if (ImGui::IsMouseHoveringRect(row.p(0, 0), row.p(rowWidth, 28)))
-                    ImGui::SetTooltip("%s", label.c_str());
-                const float fieldWidth = rowWidth - 88;
-                row.rect(0, 34, fieldWidth, 44, card, 8);
-                row.text(12, 45, keybindLabel(binding), 20, white, false, fieldWidth - 24);
-                if (row.hit("Set keybind", 0, 34, fieldWidth, 44,
-                            "Click to assign a shortcut; an empty field is unassigned")) {
+                const float fieldWidth = width - 88;
+                row.rect(x, y, fieldWidth, 46, card, 8);
+                row.icon(binding.empty() ? Key : Keyboard, x + 25, y + 23,
+                         binding.empty() ? gray : purple, 23);
+                const auto label = keybindLabel(binding);
+                if (binding.empty()) {
+                    row.text(x + 48, y + 12, "Set shortcut", 20, gray);
+                } else {
+                    // The chosen chord reads as keyboard keys. Fall back to a
+                    // scrolling label for unusually long/localized key names.
+                    std::vector<std::string> keys;
+                    if (binding.modifiers & MOD_CONTROL) keys.emplace_back("Ctrl");
+                    if (binding.modifiers & MOD_ALT) keys.emplace_back("Alt");
+                    if (binding.modifiers & MOD_SHIFT) keys.emplace_back("Shift");
+                    if (binding.modifiers & MOD_WIN) keys.emplace_back("Win");
+                    keys.push_back(keybindLabel({0, binding.key}));
+                    float totalWidth = 0;
+                    for (const auto &key : keys)
+                        totalWidth += std::max(36.f, row.textSize(key, 20, false).x + 20) + 24;
+                    totalWidth -= 24;
+                    if (totalWidth <= fieldWidth - 62) {
+                        float keyX = x + 48;
+                        for (size_t i = 0; i < keys.size(); ++i) {
+                            const float keyW = std::max(36.f, row.textSize(keys[i], 20, false).x + 20);
+                            row.rect(keyX, y + 6, keyW, 34, accentSurface, 6, false);
+                            row.dl->AddRect(row.p(keyX, y + 6), row.p(keyX + keyW, y + 40),
+                                            purple, 6 * row.s, 0, row.s);
+                            row.centeredText(keyX + keyW / 2, y + 23, keys[i], 20, white);
+                            keyX += keyW;
+                            if (i + 1 < keys.size()) row.centeredText(keyX + 12, y + 23, "+", 20, gray);
+                            keyX += 24;
+                        }
+                    } else {
+                        row.scrollingText(x + 48, y + 12, label, 20, white, false, fieldWidth - 62);
+                    }
+                }
+                if (row.hit("Set keybind", x, y, fieldWidth, 46,
+                            binding.empty() ? "Click to assign a shortcut" : label.c_str())) {
                     keybindTarget_ = target;
                     capturedKeybind_ = binding;
                     captureCancelRequested_ = false;
@@ -2559,37 +2617,165 @@ bool MixerWindow::drawDialogs() {
                     openCapture = true;
                 }
                 ImGui::BeginDisabled(binding.empty());
-                row.rect(fieldWidth + 12, 34, 76, 44, card, 8);
-                row.centeredText(fieldWidth + 50, 56, "Clear", 20, binding.empty() ? gray : white);
-                if (row.hit("Clear keybind", fieldWidth + 12, 34, 76, 44)) {
+                row.rect(x + fieldWidth + 12, y, 76, 46, card, 8);
+                row.centeredText(x + fieldWidth + 50, y + 23, "Clear", 20, binding.empty() ? gray : white);
+                if (row.hit("Clear keybind", x + fieldWidth + 12, y, 76, 46)) {
                     binding = {};
                     keybindError_.clear();
                 }
                 ImGui::EndDisabled();
                 ImGui::PopID();
-                ImGui::SetCursorScreenPos(position);
-                ImGui::Dummy({rowWidth * scale_, 96 * scale_});
             };
-            drawKeybind(0, "Start / Stop Monitoring", settingsDraft_.monitoringKeybind);
+
+            c.rect(keybindX, 94, keybindW, 76, panel, 12);
+            c.text(keybindX + 22, 121, "Start / Stop Monitoring", 22, white, true);
+            drawKeybind(c, 0, keybindX + keybindW - 532, 109, 510, settingsDraft_.monitoringKeybind);
+
+            struct ShortcutDevice {
+                int target;
+                ChannelConfig *channel;
+                std::string name, detail;
+                Icon icon;
+                ImU32 color;
+                bool added() const { return channel->keybindEnabled || !channel->muteKeybind.empty(); }
+            };
+            std::vector<ShortcutDevice> devices;
+            auto deviceDetail = [&](const ChannelConfig &channel, bool output) {
+                std::string detail = toUtf8(channel.deviceNameMatch);
+                const auto &endpoints = channel.kind == SourceKind::Microphone && !output ? microphones_ : playback_;
+                for (const auto &endpoint : endpoints) {
+                    if (!channel.deviceId.empty() && endpoint.id == channel.deviceId) {
+                        detail = toUtf8(endpoint.name);
+                        break;
+                    }
+                }
+                const char *type = output ? "Output" : channel.kind == SourceKind::Microphone ? "Microphone"
+                                   : channel.kind == SourceKind::Application ? "Application" : "Playback source";
+                return detail.empty() ? std::string(type) : detail + " / " + type;
+            };
             for (size_t i = 0; i < settingsDraft_.sources.size(); ++i) {
                 auto &source = settingsDraft_.sources[i];
-                drawKeybind(1 + static_cast<int>(i), "Mute / Unmute source: " + sourceName(source),
-                            source.muteKeybind);
+                devices.push_back({1 + static_cast<int>(i), &source, sourceName(source),
+                                   deviceDetail(source, false), sourceIcon(source, i), sourceColor(source, i)});
             }
             for (size_t i = 0; i < settingsDraft_.outputCount(); ++i) {
                 auto &output = settingsDraft_.outputAt(i);
                 const auto label = output.label.empty() ? toUtf8(output.deviceNameMatch) : output.label;
-                drawKeybind(1 + kMaxSources + static_cast<int>(i),
-                            "Mute / Unmute output: " + (label.empty() ? "Output " + std::to_string(i + 1) : label),
-                            output.muteKeybind);
+                devices.push_back({1 + kMaxSources + static_cast<int>(i), &output,
+                                   label.empty() ? "Output " + std::to_string(i + 1) : label,
+                                   deviceDetail(output, true), iconFromKey(output.icon, Speaker), gray});
             }
+
+            c.rect(keybindX, 186, keybindW, 602, panel, 12);
+            c.text(keybindX + 22, 204, "Device shortcuts", 23, white, true);
+            c.text(keybindX + 22, 238, "Add a device to create a mute / unmute shortcut.", 20, gray);
+            ImGui::SetCursorScreenPos(c.p(keybindX + 22, 270));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+            ImGui::BeginChild("Keybind list", {882 * scale_, 492 * scale_},
+                              ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoBackground);
+            ImGui::PopStyleVar();
+            const float rowWidth = ImGui::GetContentRegionAvail().x / scale_;
+            const ImVec2 listStart = ImGui::GetCursorScreenPos();
+            Canvas list{ImGui::GetWindowDrawList(), listStart, scale_};
+            float y = 0;
+            for (auto &device : devices) {
+                if (!device.added()) continue;
+                // Clearing a migrated chord must retain its explicitly added card.
+                device.channel->keybindEnabled = true;
+                list.rect(0, y, rowWidth, 128, card, 11);
+                list.badge(device.icon, 42, y + 39, device.color);
+                list.scrollingText(88, y + 15, device.name, 22, white, true, rowWidth - 160);
+                list.scrollingText(88, y + 46, device.detail, 20, gray, false, rowWidth - 160);
+                if (ImGui::IsMouseHoveringRect(list.p(88, y + 10), list.p(rowWidth - 64, y + 70)))
+                    ImGui::SetTooltip("%s\n%s", device.name.c_str(), device.detail.c_str());
+                ImGui::PushID(device.target);
+                list.rect(rowWidth - 56, y + 18, 38, 38, panel, 8);
+                list.icon(Close, rowWidth - 37, y + 37, gray, 24);
+                if (list.hit("Remove keybind device", rowWidth - 56, y + 18, 38, 38,
+                             "Remove this shortcut card (keeps the device in your mix)")) {
+                    device.channel->keybindEnabled = false;
+                    device.channel->muteKeybind = {};
+                    keybindError_.clear();
+                }
+                ImGui::PopID();
+                list.text(20, y + 92, "Mute / Unmute", 20, white);
+                drawKeybind(list, device.target, rowWidth - 530, y + 76, 510, device.channel->muteKeybind);
+                y += 140;
+            }
+            if (y == 0) {
+                list.rect(0, 0, rowWidth, 72, card, 10);
+                list.icon(Keyboard, 32, 36, gray, 26);
+                list.text(58, 24, "No device shortcuts yet. Add a device below.", 20, gray);
+                y = 84;
+            }
+            list.rect(0, y, 224, 46, keybindPickerOpen_ ? accentSurface : card, 9, false);
+            list.dl->AddRect(list.p(0, y), list.p(224, y + 46), purple, 9 * scale_, 0, scale_);
+            list.icon(Plus, 26, y + 23, purple, 25);
+            list.text(56, y + 12, "Add Device", 20, accentText);
+            list.icon(keybindPickerOpen_ ? Up : Down, 200, y + 23, purple, 22);
+            if (list.hit("Add keybind device", 0, y, 224, 46)) {
+                keybindPickerOpen_ = !keybindPickerOpen_;
+                keybindSearch_[0] = '\0';
+            }
+            y += 56;
+            if (keybindPickerOpen_) {
+                ImGui::PushID("device-picker");
+                const auto filter = lowerDeviceName(toWide(keybindSearch_));
+                auto matches = [&](const ShortcutDevice &device) {
+                    return lowerDeviceName(toWide(device.name + " " + device.detail)).find(filter) != std::wstring::npos;
+                };
+                const auto matchCount = std::count_if(devices.begin(), devices.end(), matches);
+                const float pickerHeight = 94 + std::max(1.f, static_cast<float>(matchCount)) * 64;
+                list.rect(0, y, rowWidth, pickerHeight, card, 10);
+                list.text(18, y + 12, "Choose a device", 20, white, true);
+                list.rect(16, y + 42, rowWidth - 32, 40, panel, 7);
+                list.icon(Search, 32, y + 62, gray, 23);
+                ImGui::SetCursorScreenPos(list.p(50, y + 42));
+                ImGui::SetNextItemWidth((rowWidth - 68) * scale_);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, {10 * scale_, 10 * scale_});
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(panel));
+                ImGui::InputTextWithHint("##Search keybind devices", "Search devices...", keybindSearch_, sizeof(keybindSearch_));
+                ImGui::PopStyleColor();
+                ImGui::PopStyleVar();
+                float entryY = y + 90;
+                for (auto &device : devices) {
+                    if (!matches(device)) continue;
+                    ImGui::PushID(device.target);
+                    const bool added = device.added();
+                    list.badge(device.icon, 36, entryY + 31, device.color);
+                    list.scrollingText(78, entryY + 7, device.name, 21, white, true, rowWidth - 194);
+                    list.scrollingText(78, entryY + 34, device.detail, 20, gray, false, rowWidth - 194);
+                    if (added) {
+                        list.rect(rowWidth - 100, entryY + 13, 82, 38, controlFill, 7, false);
+                        list.centeredText(rowWidth - 59, entryY + 32, "Added", 20, gray);
+                    } else {
+                        list.icon(Plus, rowWidth - 37, entryY + 32, purple, 24);
+                    }
+                    ImGui::BeginDisabled(added);
+                    if (list.hit("Add device shortcut", 10, entryY, rowWidth - 20, 62,
+                                 device.detail.c_str())) {
+                        device.channel->keybindEnabled = true;
+                        keybindPickerOpen_ = false;
+                        keybindSearch_[0] = '\0';
+                        keybindError_.clear();
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                    entryY += 64;
+                }
+                if (matchCount == 0)
+                    list.text(18, entryY + 14, devices.empty() ? "Add a source or output to your mix first."
+                                                              : "No matching devices.", 20, gray);
+                y += pickerHeight + 2;
+                ImGui::PopID();
+            }
+            ImGui::SetCursorScreenPos(listStart);
+            ImGui::Dummy({rowWidth * scale_, y * scale_});
             ImGui::EndChild();
-            c.wrappedText(contentX, 588,
-                          keybindError_.empty() ? "Click a blank field to set a shortcut.\nMute controls affect your monitored mix."
-                                               : keybindError_,
-                          20, keybindError_.empty() ? gray : red, 504, 66);
+            c.text(keybindX, 798, keybindError_.empty() ? "Mute controls affect your monitored mix." : keybindError_,
+                   20, keybindError_.empty() ? gray : red, false, keybindW);
             if (!keybindError_.empty() &&
-                ImGui::IsMouseHoveringRect(c.p(contentX, 588), c.p(contentX + 504, 654)))
+                ImGui::IsMouseHoveringRect(c.p(keybindX, 794), c.p(keybindX + keybindW, 822)))
                 ImGui::SetTooltip("%s", keybindError_.c_str());
             if (openCapture) ImGui::OpenPopup("Set keybind");
         } else if (settingsPage_ == 4) {
@@ -2684,12 +2870,13 @@ bool MixerWindow::drawDialogs() {
                 exitRequested_ = true;
         }
 
-        if (drawButton("Restore defaults", 0, 691, 166, 49, "Restore Defaults", card,
+        if (keybindPage) c.line(0, 822, dialogW, 822, border, 1);
+        if (drawButton("Restore defaults", 0, dialogH - 49, 166, 49, "Restore Defaults", card,
                        accentText))
             ImGui::OpenPopup("Restore defaults?");
-        if (drawButton("Cancel settings", 378, 691, 150, 49, "Cancel", card))
+        if (drawButton("Cancel settings", dialogW - 344, dialogH - 49, 150, 49, "Cancel", card))
             ImGui::CloseCurrentPopup();
-        if (drawButton("Save settings", 544, 691, 178, 49, "Save", accentButton, onAccent)) {
+        if (drawButton("Save settings", dialogW - 178, dialogH - 49, 178, 49, "Save", accentButton, onAccent)) {
             Config candidate = *config_;
             copyPreferences(candidate, settingsDraft_);
             copyDeviceKeybinds(candidate, settingsDraft_);
