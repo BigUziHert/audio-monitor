@@ -350,8 +350,6 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
         if (shot.scene == Scene::KeybindDevicePicker) {
             config.sources = {config.sources[0], config.sources[2]};
             config.additionalOutputs.clear();
-        } else {
-            config.sources[0].keybindEnabled = true;
         }
     }
     AudioEngineTestAccess::prepareIdleSession(engine, config);
@@ -442,7 +440,8 @@ bool captureShot(HWND window, const std::filesystem::path& directory, const Shot
         rendered = drawFrame();
         for (auto* candidate : ImGui::GetCurrentContext()->Windows)
             if (candidate->Active && std::strstr(candidate->Name, "/Keybind list_")) {
-                ImGui::SetScrollY(candidate, candidate->ScrollMax.y);
+                const float scale = std::min(float(shot.width) / 1600.f, float(shot.height) / 986.f);
+                ImGui::SetScrollY(candidate, 232.f * scale); // Show the picker heading and search field.
                 break;
             }
         if (rendered) rendered = drawFrame();
@@ -527,6 +526,8 @@ int main() {
         {L"settings-keybinds-light-1440x890.bmp", ColorTheme::Light, Scene::KeybindSettings, 1440, 890},
         {L"settings-keybinds-empty-dark-1440x890.bmp", ColorTheme::Dark,
          Scene::KeybindSettingsEmpty, 1440, 890},
+        {L"settings-keybinds-empty-light-1440x890.bmp", ColorTheme::Light,
+         Scene::KeybindSettingsEmpty, 1440, 890},
         {L"settings-keybinds-picker-dark-1440x890.bmp", ColorTheme::Dark,
          Scene::KeybindDevicePicker, 1440, 890},
         {L"settings-keybinds-picker-light-1440x890.bmp", ColorTheme::Light,
@@ -542,6 +543,13 @@ int main() {
         {L"update-downloading-light-960x600.bmp", ColorTheme::Light, Scene::UpdateDownloading, 960, 600},
         {L"update-ready-light-960x600.bmp", ColorTheme::Light, Scene::UpdateDownloaded, 960, 600},
         {L"settings-keybinds-light-960x600.bmp", ColorTheme::Light, Scene::KeybindSettings, 960, 600},
+        {L"settings-keybinds-dark-960x600.bmp", ColorTheme::Dark, Scene::KeybindSettings, 960, 600},
+        {L"settings-keybinds-empty-dark-960x600.bmp", ColorTheme::Dark,
+         Scene::KeybindSettingsEmpty, 960, 600},
+        {L"settings-keybinds-empty-light-960x600.bmp", ColorTheme::Light,
+         Scene::KeybindSettingsEmpty, 960, 600},
+        {L"settings-keybinds-picker-dark-960x600.bmp", ColorTheme::Dark,
+         Scene::KeybindDevicePicker, 960, 600},
         {L"settings-keybinds-picker-light-960x600.bmp", ColorTheme::Light,
          Scene::KeybindDevicePicker, 960, 600},
     };

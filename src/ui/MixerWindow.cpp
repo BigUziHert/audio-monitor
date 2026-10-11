@@ -484,13 +484,32 @@ struct Canvas {
             dl->PathBezierCubicCurveTo(c.p(0, 21), c.p(0, 11), c.p(5, 13));
             dl->PathStroke(color, ImDrawFlags_Closed, 2.3f * c.s);
             break;
-        case Keyboard:
-            dl->AddRect(c.p(2, 6), c.p(30, 26), color, 3 * c.s, 0, 2.2f * c.s);
-            for (int row = 0; row < 2; ++row)
-                for (int key = 0; key < 5; ++key)
-                    c.rect(5 + key * 5.f, 9 + row * 6.f, 3, 3, color, .6f, false);
-            c.rect(8, 21, 16, 2.5f, color, .6f, false);
+        case Keyboard: {
+            // A quiet, legible keyboard silhouette at both sidebar and field
+            // sizes. Pixel-aligned keys keep fractional UI scaling crisp.
+            const float stroke = std::max(1.f, std::round(1.6f * c.s));
+            auto pixel = [&](float a, float b) {
+                const auto point = c.p(a, b);
+                return ImVec2(std::round(point.x), std::round(point.y));
+            };
+            const auto a = pixel(1, 5), b = pixel(31, 27);
+            dl->AddRect({a.x + stroke * .5f, a.y + stroke * .5f},
+                        {b.x - stroke * .5f, b.y - stroke * .5f},
+                        color, 3 * c.s, 0, stroke);
+            auto key = [&](float x, float y, float width) {
+                const auto top = pixel(x, y), bottom = pixel(x + width, y + 3);
+                dl->AddRectFilled(top, {std::max(top.x + 1, bottom.x), std::max(top.y + 1, bottom.y)},
+                                  color, std::max(.5f, c.s));
+            };
+            for (int column = 0; column < 4; ++column) {
+                key(6 + column * 6.f, 10, 3);
+                key(6 + column * 6.f, 15, 3);
+            }
+            key(6, 20, 3);
+            key(11, 20, 10);
+            key(24, 20, 3);
             break;
+        }
         case Dot:
             dl->AddCircleFilled(c.p(16, 16), 16 * c.s, color, 24);
             break;
@@ -2374,13 +2393,11 @@ bool MixerWindow::drawDialogs() {
         ImGui::OpenPopup("Settings");
         openSettings_ = false;
     }
-    // The device picker needs a wider workspace; other settings retain their
-    // compact layout. Keep the resized modal centered when switching pages.
-    const bool keybindPage = settingsPage_ == 3;
-    if (beginBoundedModal("Settings", keybindPage ? 1240.f : 770.f, scale_,
+    // All categories share one fixed shell so navigation never resizes the
+    // window or moves its close/save controls.
+    if (beginBoundedModal("Settings", 770, scale_,
                           ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove, true)) {
-        const float dialogW = keybindPage ? 1192.f : 722.f;
-        const float dialogH = keybindPage ? 886.f : 740.f;
+        constexpr float dialogW = 722.f, dialogH = 740.f;
         const ImVec2 start = ImGui::GetCursorScreenPos();
         Canvas c{ImGui::GetWindowDrawList(), start, scale_};
         ImGui::Dummy({dialogW * scale_, dialogH * scale_});
@@ -2441,19 +2458,16 @@ bool MixerWindow::drawDialogs() {
             const float y = 92 + i * 58.f;
             const bool selected = settingsPage_ == nav[i].page;
             if (selected)
-                c.rect(0, y, keybindPage ? 218.f : 158.f, 50, accentSurface, 9, false);
+                c.rect(0, y, 158, 50, accentSurface, 9, false);
             c.icon(nav[i].icon, 24, y + 25, selected ? purple : gray, 27);
             c.text(51, y + 12, nav[i].label, 19, selected ? accentText : white);
             ImGui::PushID(i + 1200);
-            if (c.hit("Settings page", 0, y, keybindPage ? 218.f : 158.f, 50))
+            if (c.hit("Settings page", 0, y, 158, 50))
                 settingsPage_ = nav[i].page;
             ImGui::PopID();
         }
 
-        if (keybindPage)
-            c.line(244, 0, 244, 814, border, 1);
-        else
-            c.rect(174, 90, 548, 574, panel, 14);
+        c.rect(174, 90, 548, 574, panel, 14);
         const float contentX = 196;
         if (settingsPage_ == 0) {
             c.icon(Wave, contentX + 10, 124, white, 27);
@@ -2561,11 +2575,10 @@ bool MixerWindow::drawDialogs() {
             c.centeredText(448, 327, "Work In Progress", 28, white);
             c.centeredText(448, 365, "Plugin support is currently being built.", 17, gray);
         } else if (settingsPage_ == 3) {
-            constexpr float keybindX = 266, keybindW = 926;
-            c.rect(keybindX, 5, 56, 56, card, 10, false);
-            c.icon(Keyboard, keybindX + 28, 33, white, 31);
-            c.text(keybindX + 78, 4, "Keybinds", 29, white, true);
-            c.text(keybindX + 78, 43, "Shortcuts work in other apps and from the tray.", 20, gray);
+            constexpr float keybindW = 504;
+            c.icon(Keyboard, contentX + 10, 124, white, 27);
+            c.text(contentX + 38, 107, "Keybinds", 21, white, true);
+            c.text(contentX, 148, "Shortcuts work in other apps and from the tray.", 20, gray);
             bool openCapture = false;
             auto drawKeybind = [&](const Canvas &row, int target, float x, float y, float width,
                                    Keybind &binding) {
@@ -2627,9 +2640,9 @@ bool MixerWindow::drawDialogs() {
                 ImGui::PopID();
             };
 
-            c.rect(keybindX, 94, keybindW, 76, panel, 12);
-            c.text(keybindX + 22, 121, "Start / Stop Monitoring", 22, white, true);
-            drawKeybind(c, 0, keybindX + keybindW - 532, 109, 510, settingsDraft_.monitoringKeybind);
+            c.rect(contentX, 184, keybindW, 102, card, 10);
+            c.text(contentX + 16, 198, "Start / Stop Monitoring", 22, white, true);
+            drawKeybind(c, 0, contentX + 16, 232, keybindW - 32, settingsDraft_.monitoringKeybind);
 
             struct ShortcutDevice {
                 int target;
@@ -2666,12 +2679,11 @@ bool MixerWindow::drawDialogs() {
                                    deviceDetail(output, true), iconFromKey(output.icon, Speaker), gray});
             }
 
-            c.rect(keybindX, 186, keybindW, 602, panel, 12);
-            c.text(keybindX + 22, 204, "Device shortcuts", 23, white, true);
-            c.text(keybindX + 22, 238, "Add a device to create a mute / unmute shortcut.", 20, gray);
-            ImGui::SetCursorScreenPos(c.p(keybindX + 22, 270));
+            c.text(contentX, 308, "Device shortcuts", 23, white, true);
+            c.text(contentX, 340, "Add a device to create a mute / unmute shortcut.", 20, gray);
+            ImGui::SetCursorScreenPos(c.p(contentX, 368));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
-            ImGui::BeginChild("Keybind list", {882 * scale_, 492 * scale_},
+            ImGui::BeginChild("Keybind list", {keybindW * scale_, 242 * scale_},
                               ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoBackground);
             ImGui::PopStyleVar();
             const float rowWidth = ImGui::GetContentRegionAvail().x / scale_;
@@ -2682,7 +2694,7 @@ bool MixerWindow::drawDialogs() {
                 if (!device.added()) continue;
                 // Clearing a migrated chord must retain its explicitly added card.
                 device.channel->keybindEnabled = true;
-                list.rect(0, y, rowWidth, 128, card, 11);
+                list.rect(0, y, rowWidth, 164, card, 11);
                 list.badge(device.icon, 42, y + 39, device.color);
                 list.scrollingText(88, y + 15, device.name, 22, white, true, rowWidth - 160);
                 list.scrollingText(88, y + 46, device.detail, 20, gray, false, rowWidth - 160);
@@ -2698,15 +2710,9 @@ bool MixerWindow::drawDialogs() {
                     keybindError_.clear();
                 }
                 ImGui::PopID();
-                list.text(20, y + 92, "Mute / Unmute", 20, white);
-                drawKeybind(list, device.target, rowWidth - 530, y + 76, 510, device.channel->muteKeybind);
-                y += 140;
-            }
-            if (y == 0) {
-                list.rect(0, 0, rowWidth, 72, card, 10);
-                list.icon(Keyboard, 32, 36, gray, 26);
-                list.text(58, 24, "No device shortcuts yet. Add a device below.", 20, gray);
-                y = 84;
+                list.text(16, y + 78, "Mute / Unmute", 20, white);
+                drawKeybind(list, device.target, 16, y + 106, rowWidth - 32, device.channel->muteKeybind);
+                y += 176;
             }
             list.rect(0, y, 224, 46, keybindPickerOpen_ ? accentSurface : card, 9, false);
             list.dl->AddRect(list.p(0, y), list.p(224, y + 46), purple, 9 * scale_, 0, scale_);
@@ -2772,10 +2778,10 @@ bool MixerWindow::drawDialogs() {
             ImGui::SetCursorScreenPos(listStart);
             ImGui::Dummy({rowWidth * scale_, y * scale_});
             ImGui::EndChild();
-            c.text(keybindX, 798, keybindError_.empty() ? "Mute controls affect your monitored mix." : keybindError_,
-                   20, keybindError_.empty() ? gray : red, false, keybindW);
+            c.wrappedText(contentX, 626, keybindError_.empty() ? "Mute controls affect your monitored mix." : keybindError_,
+                          20, keybindError_.empty() ? gray : red, keybindW, 34);
             if (!keybindError_.empty() &&
-                ImGui::IsMouseHoveringRect(c.p(keybindX, 794), c.p(keybindX + keybindW, 822)))
+                ImGui::IsMouseHoveringRect(c.p(contentX, 622), c.p(contentX + keybindW, 662)))
                 ImGui::SetTooltip("%s", keybindError_.c_str());
             if (openCapture) ImGui::OpenPopup("Set keybind");
         } else if (settingsPage_ == 4) {
@@ -2870,7 +2876,6 @@ bool MixerWindow::drawDialogs() {
                 exitRequested_ = true;
         }
 
-        if (keybindPage) c.line(0, 822, dialogW, 822, border, 1);
         if (drawButton("Restore defaults", 0, dialogH - 49, 166, 49, "Restore Defaults", card,
                        accentText))
             ImGui::OpenPopup("Restore defaults?");

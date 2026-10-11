@@ -1659,7 +1659,7 @@ int main() {
             click(670, 900);
             if (auto *settings = popup())
                 click(settings->DC.CursorStartPos.x + 80, settings->DC.CursorStartPos.y + 291);
-            frame(1600, 986); // The Keybinds category has a wider layout.
+            frame(1600, 986);
             expect(popup() && std::strcmp(popup()->Name, "Settings") == 0 &&
                        ui::MixerWindowTestAccess::settingsPage(mixer) == 3,
                    "Could not open Keybinds settings");
@@ -1713,7 +1713,7 @@ int main() {
             expect(found != targets.end(), "Requested shortcut card has not been added");
             if (found == targets.end()) return;
             const float ordinal = static_cast<float>(found - targets.begin());
-            ImGui::SetScrollY(list, std::max(0.f, ordinal * 140.f - 60.f));
+            ImGui::SetScrollY(list, std::max(0.f, ordinal * 176.f - 40.f));
             frame(1600, 986);
             activateKeybindItem(list, ImHashStr(label, 0, list->GetID(target)));
         };
@@ -1750,7 +1750,7 @@ int main() {
                    "Shortcut device picker is not open for mouse selection");
             if (!list) return;
             const size_t cards = visibleKeybindTargets().size();
-            const float pickerY = (cards ? float(cards) * 140.f : 84.f) + 56.f;
+            const float pickerY = float(cards) * 176.f + 56.f;
             const float rowCenter = pickerY + 90.f + float(visibleOrdinal) * 64.f + 31.f;
             ImGui::SetScrollY(list, std::max(0.f, rowCenter - list->InnerRect.GetHeight() * .5f));
             frame(1600, 986);
@@ -1782,10 +1782,73 @@ int main() {
                 activateKeybindItem(settings, ImHashStr(save ? "Save settings" : "Cancel settings", 0,
                                                        settings->GetID("settings-dialog")));
         };
+
+        // Switching categories must not move the modal, navigation targets, or
+        // footer controls. Read their rendered hit bounds instead of assuming
+        // coordinates so this also covers the scaled compact window.
+        click(670, 900);
+        for (const auto size : {ImVec2(1600, 986), ImVec2(960, 600)}) {
+            const int width = static_cast<int>(size.x), height = static_cast<int>(size.y);
+            frame(width, height);
+            frame(width, height);
+            auto *settings = ImGui::FindWindowByName("Settings");
+            expect(settings && settings->Active, "Settings disappeared during category layout test");
+            if (!settings) continue;
+            const auto settingsScope = settings->GetID("settings-dialog");
+            std::vector<ImGuiID> controls;
+            for (int nav = 0; nav < 5; ++nav) {
+                const int scope = 1200 + nav;
+                controls.push_back(ImHashStr("Settings page", 0,
+                                            ImHashData(&scope, sizeof(scope), settingsScope)));
+            }
+            for (const auto label : {"Restore defaults", "Cancel settings", "Save settings"})
+                controls.push_back(ImHashStr(label, 0, settingsScope));
+            auto activateTab = [&](int nav) {
+                ImGui::SetNavWindow(settings);
+                ImGui::ActivateItemByID(controls[nav]);
+                frame(width, height);
+                frame(width, height);
+            };
+            auto renderedBounds = [&](ImGuiID id) {
+                ImGui::SetNavWindow(settings);
+                ImGui::SetNavID(id, ImGuiNavLayer_Main, settings->NavRootFocusScopeId, ImRect());
+                frame(width, height);
+                expect(ImGui::GetCurrentContext()->NavIdIsAlive,
+                       "A shared Settings navigation or footer control was not rendered");
+                auto bounds = settings->NavRectRel[ImGuiNavLayer_Main];
+                bounds.Translate(settings->Pos);
+                return bounds;
+            };
+            auto sameBounds = [](const ImRect &a, const ImRect &b) {
+                return std::abs(a.Min.x - b.Min.x) < .5f && std::abs(a.Min.y - b.Min.y) < .5f &&
+                       std::abs(a.Max.x - b.Max.x) < .5f && std::abs(a.Max.y - b.Max.y) < .5f;
+            };
+            activateTab(0);
+            const auto modalBounds = settings->Rect();
+            std::vector<ImRect> sharedBounds;
+            for (const auto control : controls) sharedBounds.push_back(renderedBounds(control));
+            constexpr int pages[] = {1, 0, 2, 3, 4};
+            for (int nav = 1; nav < 5; ++nav) {
+                activateTab(nav);
+                expect(ui::MixerWindowTestAccess::settingsPage(mixer) == pages[nav],
+                       "Settings category activation opened the wrong page");
+                expect(sameBounds(settings->Rect(), modalBounds),
+                       "Switching Settings categories moved or resized the dialog");
+                for (size_t control = 0; control < controls.size(); ++control)
+                    expect(sameBounds(renderedBounds(controls[control]), sharedBounds[control]),
+                           "Switching Settings categories moved a navigation or footer control");
+            }
+        }
+        frame(1600, 986);
+        closeKeybindSettings(false);
+
         const Keybind monitoringShortcut{MOD_CONTROL | MOD_ALT, 'M'};
         openKeybindSettings();
         expect(visibleKeybindTargets().empty(), "Unselected devices were automatically shown as shortcut cards");
-        openKeybindPicker();
+        if (auto *list = keybindList())
+            click(list->DC.CursorStartPos.x + 100.f, list->DC.CursorStartPos.y + 23.f);
+        expect(ui::MixerWindowTestAccess::keybindPickerOpen(mixer),
+               "Empty shortcut list did not place Add Device at the top without a placeholder box");
         if (auto *list = keybindList()) {
             activateKeybindItem(list, ImHashStr("##Search keybind devices", 0,
                                                list->GetID("device-picker")));
